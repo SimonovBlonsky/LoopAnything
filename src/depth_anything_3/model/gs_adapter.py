@@ -43,9 +43,8 @@ class GaussianAdapter(nn.Module):
         self.gaussian_scale_min = gaussian_scale_min
         self.gaussian_scale_max = gaussian_scale_max
 
-        # Create a mask for the spherical harmonics coefficients. This ensures that at
-        # initialization, the coefficients are biased towards having a large DC
-        # component and small view-dependent components.
+        # 对 SH 系数做一个初始化偏置：
+        # 让 DC 分量更强，高阶视角相关分量更弱，训练更稳。
         if not pred_color:
             self.register_buffer(
                 "sh_mask",
@@ -72,7 +71,8 @@ class GaussianAdapter(nn.Module):
         H, W = image_shape
         b, v = raw_gaussians.shape[:2]
 
-        # get cam2worlds and intr_normed to adapt to 3DGS codebase
+        # 输入的相机是 w2c，这里先转成 c2w；
+        # 同时把内参归一化到 [0,1] 图像坐标，适配后续 3DGS 几何公式。
         cam2worlds = affine_inverse(extrinsics)
         intr_normed = intrinsics.clone().detach()
         intr_normed[..., 0, :] /= W
@@ -81,6 +81,8 @@ class GaussianAdapter(nn.Module):
         # 1. compute 3DGS means
         # 1.1) offset the predicted depth if needed
         if self.pred_offset_depth:
+            # pose-adaptive 版本里可以额外预测 depth offset，
+            # 用来缓解表面几何与渲染质量的冲突。
             gs_depths = depths + raw_gaussians[..., -1]
             raw_gaussians = raw_gaussians[..., :-1]
         else:
@@ -99,16 +101,19 @@ class GaussianAdapter(nn.Module):
                 pose_scales, "b -> b () ()"
             )  # [b, i, j]
             gs_depths = gs_depths * rearrange(pose_scales, "b -> b () () ()")  # [b, v, h, w]
-        # 1.3) casting xy in image space
+        # 在像素网格上为每个位置建立一条相机光线。
         xy_ray, _ = sample_image_grid((H, W), device)
         xy_ray = xy_ray[None, None, ...].expand(b, v, -1, -1, -1)  # b v h w xy
         # offset xy if needed
         if self.pred_offset_xy:
+            # 高斯中心可在像素平面上做细小偏移，提升渲染灵活性。
             pixel_size = 1 / torch.tensor((W, H), dtype=xy_ray.dtype, device=device)
             offset_xy = raw_gaussians[..., :2]
             xy_ray = xy_ray + offset_xy * pixel_size
             raw_gaussians = raw_gaussians[..., 2:]  # skip the offset_xy
         # 1.4) unproject depth + xy to world ray
+        # 论文第 5 节的关键几何步骤：
+        # 用 predicted depth + camera ray 把每个像素对应的高斯均值抬到世界坐标。
         origins, directions = get_world_rays(
             xy_ray,
             repeat(cam2worlds, "b v i j -> b v h w i j", h=H, w=W),
@@ -121,7 +126,8 @@ class GaussianAdapter(nn.Module):
         scales, rotations, sh = raw_gaussians.split((3, 4, 3 * self.d_sh), dim=-1)
 
         # 2.1) 3DGS scales
-        # make the scale invarient to resolution
+        # 让高斯尺度同时受 depth、像素尺寸和焦距影响，
+        # 保持对分辨率变化更稳定。
         scale_min = self.gaussian_scale_min
         scale_max = self.gaussian_scale_max
         scales = scale_min + (scale_max - scale_min) * scales.sigmoid()
@@ -134,7 +140,7 @@ class GaussianAdapter(nn.Module):
         # due to historical issue, assume quaternion in order xyzw, not wxyz
         # Normalize the quaternion features to yield a valid quaternion.
         rotations = rotations / (rotations.norm(dim=-1, keepdim=True) + eps)
-        # rotate them to world space
+        # 网络先预测相机坐标系旋转，这里再乘上 c2w，转成世界坐标系旋转。
         cam_quat_xyzw = rearrange(rotations, "b v h w c -> b (v h w) c")
         c2w_mat = repeat(
             cam2worlds,
@@ -154,6 +160,7 @@ class GaussianAdapter(nn.Module):
             # predict pre-computed color or predict only DC band, no need to transform
             gs_sh_world = sh
         else:
+            # 若预测的是 SH，则需要随相机旋转一起变换到世界系。
             gs_sh_world = rotate_sh(sh, cam2worlds[:, :, None, None, None, :3, :3])
         gs_sh_world = rearrange(gs_sh_world, "b v h w xyz d_sh -> b (v h w) xyz d_sh")
 
@@ -187,7 +194,8 @@ class GaussianAdapter(nn.Module):
 
     @property
     def d_in(self) -> int:
-        # provided as reference to the gs_dpt output dim
+        # 这里定义了 GS-DPT 需要输出的原始通道数，
+        # 供上层自动校验 head 输出维度是否匹配。
         raw_gs_dim = 0
         if self.pred_offset_xy:
             raw_gs_dim += 2

@@ -160,6 +160,8 @@ class DinoVisionTransformer(nn.Module):
         num_patches = self.patch_embed.num_patches
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         if self.alt_start != -1:
+            # DA3 会在进入跨视角建模前注入 camera token。
+            # 这里预留两个模板 token：一个给参考视角，一个给其余视角。
             self.camera_token = nn.Parameter(torch.randn(1, 2, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + self.num_tokens, embed_dim))
         assert num_register_tokens >= 0
@@ -192,10 +194,13 @@ class DinoVisionTransformer(nn.Module):
             raise NotImplementedError
 
         if self.rope_start != -1:
+            # 可选的 2D RoPE：从指定层开始给 patch token 注入更强的空间位置信息。
             self.rope = RotaryPositionEmbedding2D(frequency=rope_freq) if rope_freq > 0 else None
             self.position_getter = PositionGetter() if self.rope is not None else None
         else:
             self.rope = None
+        # 主干本身仍然是“单一 plain transformer”。
+        # 论文的关键不是换 backbone 结构，而是通过 token 重排切换 local/global attention。
         blocks_list = [
             block_fn(
                 dim=embed_dim,
@@ -260,6 +265,7 @@ class DinoVisionTransformer(nn.Module):
 
     def prepare_tokens_with_masks(self, x, masks=None, cls_token=None, **kwargs):
         B, S, nc, w, h = x.shape
+        # 先按视角独立做 patch embedding，再补 cls token 和 2D 位置编码。
         x = rearrange(x, "b s c h w -> (b s) c h w")
         x = self.patch_embed(x)
         if masks is not None:
@@ -283,6 +289,7 @@ class DinoVisionTransformer(nn.Module):
         pos = None
         pos_nodiff = None
         if self.rope is not None:
+            # 为每个 patch token 生成 2D 坐标；special token 位置单独补 0。
             pos = self.position_getter(
                 B * S, H // self.patch_size, W // self.patch_size, device=device
             )
@@ -305,6 +312,8 @@ class DinoVisionTransformer(nn.Module):
         pos, pos_nodiff = self._prepare_rope(B, S, H, W, x.device)
 
         for i, blk in enumerate(self.blocks):
+            # local attention 用真实 patch 坐标；
+            # global attention 时 special token 不区分空间位置，因此用 pos_nodiff。
             if i < self.rope_start or self.rope is None:
                 g_pos, l_pos = None, None
             else:
@@ -312,11 +321,12 @@ class DinoVisionTransformer(nn.Module):
                 l_pos = pos
 
             if self.alt_start != -1 and (i == self.alt_start - 1) and x.shape[1] >= THRESH_FOR_REF_SELECTION and kwargs.get("cam_token", None) is None:
-                # Select reference view using configured strategy
+                # 在进入 camera token / cross-view attention 之前先选参考视角，
+                # 这样后续的“第 0 个视角”就有了稳定语义。
                 strategy = kwargs.get("ref_view_strategy", "saddle_balanced")
                 logger.info(f"Selecting reference view using strategy: {strategy}")
                 b_idx = select_reference_view(x, strategy=strategy)
-                # Reorder views to place reference view first
+                # 把选中的参考视角换到最前面，其余视角保持原相对顺序。
                 x = reorder_by_reference(x, b_idx)
                 local_x = reorder_by_reference(local_x, b_idx)
 
@@ -325,22 +335,27 @@ class DinoVisionTransformer(nn.Module):
                     logger.info("Using camera conditions provided by the user")
                     cam_token = kwargs.get("cam_token")
                 else:
+                    # 无位姿输入时，使用可学习 token 作为 posed / unposed 统一占位符。
                     ref_token = self.camera_token[:, :1].expand(B, -1, -1)
                     src_token = self.camera_token[:, 1:].expand(B, S - 1, -1)
                     cam_token = torch.cat([ref_token, src_token], dim=1)
+                # 每个视角序列的第 0 个 token 位置被 camera token 占据。
                 x[:, :, 0] = cam_token
 
             if self.alt_start != -1 and i >= self.alt_start and i % 2 == 1:
+                # 论文中的 partial alternation：
+                # 进入后半段后，奇数层在所有视角之间做 global attention。
                 x = self.process_attention(
                     x, blk, "global", pos=g_pos, attn_mask=kwargs.get("attn_mask", None)
                 )
             else:
+                # 其余层仍然在每个视角内部做 local attention。
                 x = self.process_attention(x, blk, "local", pos=l_pos)
                 local_x = x
 
             if i in blocks_to_take:
                 out_x = torch.cat([local_x, x], dim=-1) if self.cat_token else x
-                # Restore original view order if reordering was applied
+                # 对外导出特征前，把视角顺序恢复成输入顺序，避免污染下游逻辑。
                 if x.shape[1] >= THRESH_FOR_REF_SELECTION and self.alt_start != -1 and 'b_idx' in locals():
                     out_x = restore_original_order(out_x, b_idx)
                 output.append((out_x[:, :, 0], out_x))
@@ -351,10 +366,12 @@ class DinoVisionTransformer(nn.Module):
     def process_attention(self, x, block, attn_type="global", pos=None, attn_mask=None):
         b, s, n = x.shape[:3]
         if attn_type == "local":
+            # local: 每个视角自己做 attention，不看其它视角 token。
             x = rearrange(x, "b s n c -> (b s) n c")
             if pos is not None:
                 pos = rearrange(pos, "b s n c -> (b s) n c")
         elif attn_type == "global":
+            # global: 把所有视角 token 拼成长序列，一次 attention 完成跨视角信息交换。
             x = rearrange(x, "b s n c -> b (s n) c")
             if pos is not None:
                 pos = rearrange(pos, "b s n c -> b (s n) c")

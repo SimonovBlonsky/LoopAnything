@@ -39,6 +39,9 @@ class GSDPT(DPT):
         norm_type: str = "idt",  # use to match legacy GS-DPT head, "idt" / "layer"
         fusion_block_inplace: bool = False,
     ) -> None:
+        # GS-DPT 是第 5 节 3DGS 扩展的预测头：
+        # 它沿用 DPT 的解码骨架，但输出不再是 depth/ray，
+        # 而是相机坐标系下的高斯原始参数 raw_gs。
         super().__init__(
             dim_in=dim_in,
             patch_size=patch_size,
@@ -61,6 +64,8 @@ class GSDPT(DPT):
             ), "use linear prediction when using view-dependent opacity"
 
         merger_out_dim = features if feature_only else features // 2
+        # 3DGS 对外观细节很敏感，因此这里额外引入一条 image branch，
+        # 在解码末端把 RGB 纹理信息并入特征。
         self.images_merger = nn.Sequential(
             nn.Conv2d(3, merger_out_dim // 4, 3, 1, 1),  # fewer channels first
             nn.GELU(),
@@ -85,6 +90,7 @@ class GSDPT(DPT):
         ph, pw = H // self.patch_size, W // self.patch_size
         resized_feats = []
         for stage_idx, take_idx in enumerate(self.intermediate_layer_idx):
+            # 与普通 DPT 一样，先去掉非 patch token，再还原成 2D feature map。
             x = feats[take_idx][:, patch_start_idx:]  # [B*S, N_patch, C]
             x = self.norm(x)
             x = x.permute(0, 2, 1).reshape(B, C, ph, pw)  # [B*S, C, ph, pw]
@@ -95,7 +101,7 @@ class GSDPT(DPT):
             x = self.resize_layers[stage_idx](x)  # Align scale
             resized_feats.append(x)
 
-        # 2) Fusion pyramid (main branch only)
+        # GS-DPT 沿用普通 DPT 的单分支融合流程。
         fused = self._fuse(resized_feats)
         fused = self.scratch.output_conv1(fused)
 
@@ -105,7 +111,8 @@ class GSDPT(DPT):
 
         fused = custom_interpolate(fused, (h_out, w_out), mode="bilinear", align_corners=True)
 
-        # inject the image information here
+        # 这里把原始图像的局部外观直接并入 decoder 特征，
+        # 提升颜色 / SH / 高斯形状等外观相关预测。
         fused = fused + self.images_merger(images)
 
         if self.pos_embed:
@@ -115,7 +122,8 @@ class GSDPT(DPT):
         # feat = self.scratch.output_conv1(fused)
         feat = fused
 
-        # 5) Main head: logits -> activate_head or single channel activation
+        # 输出经过 activate_head_gs 解释成：
+        # raw gaussian params + opacity/confidence。
         main_logits = self.scratch.output_conv2(feat)
         outs: TyDict[str, torch.Tensor] = {}
         if self.has_conf:

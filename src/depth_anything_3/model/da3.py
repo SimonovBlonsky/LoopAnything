@@ -68,6 +68,9 @@ class DepthAnything3Net(nn.Module):
         Initialize DepthAnything3Net with given yaml-initialized configuration.
         """
         super().__init__()
+        # 这里是论文 Fig.2 的总装配器：
+        # backbone 负责 token 建模，head 负责 depth/ray，
+        # cam_* 负责相机条件注入与相机回归，gs_* 负责 3DGS 扩展。
         self.backbone = net if isinstance(net, nn.Module) else create_object(_wrap_cfg(net))
         self.head = head if isinstance(head, nn.Module) else create_object(_wrap_cfg(head))
         self.cam_dec, self.cam_enc = None, None
@@ -122,29 +125,40 @@ class DepthAnything3Net(nn.Module):
         Returns:
             Dictionary containing predictions and auxiliary features
         """
-        # Extract features using backbone
+        # 如果输入里已经有位姿，就先编码成 camera token 注入 backbone；
+        # 否则 backbone 会走 pose-free 路径，仅依赖视觉 token 推理。
         if extrinsics is not None:
             with torch.autocast(device_type=x.device.type, enabled=False):
                 cam_token = self.cam_enc(extrinsics, intrinsics, x.shape[-2:])
         else:
             cam_token = None
 
+        # backbone 返回两类结果：
+        # 1) 给预测头使用的中间层特征 feats
+        # 2) 用户显式请求导出的辅助特征 aux_feats
         feats, aux_feats = self.backbone(
             x, cam_token=cam_token, export_feat_layers=export_feat_layers, ref_view_strategy=ref_view_strategy
         )
         # feats = [[item for item in feat] for feat in feats]
         H, W = x.shape[-2], x.shape[-1]
 
-        # Process features through depth head
+        # depth/ray head、camera head、GS head 都强制在 autocast=False 下跑，
+        # 避免几何相关计算在半精度下数值不稳定。
         with torch.autocast(device_type=x.device.type, enabled=False):
+            # 论文里的主监督目标是 depth + ray，这一步会产出它们。
             output = self._process_depth_head(feats, H, W)
             if use_ray_pose:
+                # 纯按论文 3.1 的“ray map 反解相机”路径求位姿。
                 output = self._process_ray_pose_estimation(output, H, W)
             else:
+                # 实际部署默认更常用轻量 camera head，速度更稳，代价也很小。
                 output = self._process_camera_estimation(feats, H, W, output)
             if infer_gs:
+                # 第 5 节的扩展：在已有 depth + camera 的基础上生成 3DGS。
                 output = self._process_gs_head(feats, H, W, output, x, extrinsics, intrinsics)
-        
+
+        # 单目 metric 分支会预测 sky，这里把天空区域深度抬到“远处”，
+        # 避免后续对齐或导出时把天空当作近景结构。
         output = self._process_mono_sky_estimation(output)    
 
         # Extract auxiliary features if requested
@@ -183,6 +197,8 @@ class DepthAnything3Net(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Process ray pose estimation if ray pose decoder is available."""
         if "ray" in output and "ray_conf" in output:
+            # 从 depth head 输出的 ray / ray_conf 中恢复相机参数。
+            # 这是论文 3.1 中“由 ray map 反求相机”的工程实现。
             pred_extrinsic, pred_focal_lengths, pred_principal_points = get_extrinsic_from_camray(
                 output.ray,
                 output.ray_conf,
@@ -196,6 +212,7 @@ class DepthAnything3Net(nn.Module):
             pred_intrinsic[:, :, 1, 1] = pred_focal_lengths[:, :, 1] / 2 * height
             pred_intrinsic[:, :, 0, 2] = pred_principal_points[:, :, 0] * width * 0.5
             pred_intrinsic[:, :, 1, 2] = pred_principal_points[:, :, 1] * height * 0.5
+            # 一旦相机已经恢复出来，ray 输出就不再需要继续往后传了。
             del output.ray
             del output.ray_conf
             output.extrinsics = pred_extrinsic
@@ -213,6 +230,8 @@ class DepthAnything3Net(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Process camera pose estimation if camera decoder is available."""
         if self.cam_dec is not None:
+            # feats[-1][1] 是最后一层的 camera token；
+            # cam_dec 只看每个视角这 1 个 token 来回归相机。
             pose_enc = self.cam_dec(feats[-1][1])
             # Remove ray information as it's not needed for pose estimation
             if "ray" in output:
@@ -257,7 +276,8 @@ class DepthAnything3Net(nn.Module):
         if gt_extr is not None:
             gt_extr = as_homogeneous(gt_extr)
 
-        # forward through the gs_dpt head to get 'camera space' parameters
+        # GS-DPT 先预测“相机坐标系”下的高斯属性；
+        # gs_adapter 再结合 depth + pose 把它们抬到世界坐标系。
         gs_outs = self.gs_head(
             feats=feats,
             H=H,
@@ -290,7 +310,8 @@ class DepthAnything3Net(nn.Module):
         aux_features = Dict()
         assert len(feats) == len(feat_layers)
         for feat, feat_layer in zip(feats, feat_layers):
-            # Reshape features to spatial dimensions
+            # backbone 导出的还是 patch token；这里把它重新摊回到二维网格，
+            # 便于外部做特征可视化或下游分析。
             feat_reshaped = feat.reshape(
                 [
                     feat.shape[0],
@@ -402,7 +423,8 @@ class NestedDepthAnything3Net(nn.Module):
             output.depth_conf, non_sky_mask, output.depth, metric_output.depth, median_conf
         )
 
-        # Compute scale factor using least squares
+        # any-view 分支提供相对几何，metric 分支提供绝对尺度；
+        # 这里用最小二乘估一个全局 scale，把两者对齐。
         valid_depth = output.depth[align_mask]
         valid_metric_depth = metric_output.depth[align_mask]
         scale_factor = least_squares_scale_scalar(valid_metric_depth, valid_depth)

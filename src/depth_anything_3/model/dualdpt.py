@@ -76,6 +76,8 @@ class DualDPT(nn.Module):
         self.intermediate_layer_idx: Tuple[int, int, int, int] = (0, 1, 2, 3)
 
         # -------------------- token pre-norm + per-stage projection --------------------
+        # 先把 backbone 不同层级的 token map 投影到统一的通道空间，
+        # 后面才能做和 DPT 一致的金字塔融合。
         self.norm = nn.LayerNorm(dim_in)
         self.projects = nn.ModuleList(
             [nn.Conv2d(dim_in, oc, kernel_size=1, stride=1, padding=0) for oc in out_channels]
@@ -96,7 +98,8 @@ class DualDPT(nn.Module):
             ]
         )
 
-        # -------------------- scratch: stage adapters + fusion (main & aux are separate) --------------------
+        # 对应论文 Fig.3：
+        # reassembly 是共享的，但 depth / ray 的 fusion 分支是拆开的。
         self.scratch = _make_scratch(list(out_channels), features, expand=False)
 
         # Main fusion chain (independent)
@@ -117,7 +120,8 @@ class DualDPT(nn.Module):
             nn.Conv2d(head_features_2, output_dim, kernel_size=1, stride=1, padding=0),
         )
 
-        # Auxiliary fusion chain (completely separate; no sharing, i.e., "fusion_inplace=False")
+        # 辅助分支对应 ray head。它不和 depth 分支共享 fusion block，
+        # 这样既能共享早期表征，又能避免两个目标在后期解码阶段互相牵制。
         self.scratch.refinenet1_aux = _make_fusion_block(features)
         self.scratch.refinenet2_aux = _make_fusion_block(features)
         self.scratch.refinenet3_aux = _make_fusion_block(features)
@@ -179,6 +183,8 @@ class DualDPT(nn.Module):
               aux_cf:  [B, S, 1,       H/down_ratio, W/down_ratio]
         """
         B, S, N, C = feats[0][0].shape
+        # 输入来自 backbone 的 4 个中间层，每层形状大致为 [B, S, Tokens, C]。
+        # 这里先把 batch 和视角维并起来，后续按 2D dense head 的方式处理。
         feats = [feat[0].reshape(B * S, N, C) for feat in feats]
         if chunk_size is None or chunk_size >= S:
             out_dict = self._forward_impl(feats, H, W, patch_start_idx)
@@ -187,6 +193,7 @@ class DualDPT(nn.Module):
         out_dicts = []
         for s0 in range(0, B * S, chunk_size):
             s1 = min(s0 + chunk_size, B * S)
+            # 多视角序列较长时分块解码，避免 decoder 端显存峰值过高。
             out_dict = self._forward_impl(
                 [feat[s0:s1] for feat in feats],
                 H,
@@ -216,6 +223,8 @@ class DualDPT(nn.Module):
         ph, pw = H // self.patch_size, W // self.patch_size
         resized_feats = []
         for stage_idx, take_idx in enumerate(self.intermediate_layer_idx):
+            # patch_start_idx 用来跳过非 patch token（例如 cls/camera token），
+            # Dual-DPT 只对真正的 patch 网格做 dense prediction。
             x = feats[take_idx][:, patch_start_idx:]
             x = self.norm(x)
             x = x.permute(0, 2, 1).reshape(B, C, ph, pw)  # [B*S, C, ph, pw]
@@ -226,7 +235,7 @@ class DualDPT(nn.Module):
             x = self.resize_layers[stage_idx](x)  # align scales
             resized_feats.append(x)
 
-        # 2) Fuse pyramid (main & aux are completely independent)
+        # 共享 reassembly 之后，depth 与 ray 分别走自己的金字塔融合链。
         fused_main, fused_aux_pyr = self._fuse(resized_feats)
 
         # 3) Upsample to target resolution and (optional) add pos-embed again
@@ -239,14 +248,15 @@ class DualDPT(nn.Module):
         if self.pos_embed:
             fused_main = self._add_pos_embed(fused_main, W, H)
 
-        # Primary head: conv1 -> conv2 -> activate
+        # 主分支默认是 depth：输出值通道 + confidence 通道。
         # fused_main = self.scratch.output_conv1(fused_main)
         main_logits = self.scratch.output_conv2(fused_main)
         fmap = main_logits.permute(0, 2, 3, 1)
         main_pred = self._apply_activation_single(fmap[..., :-1], self.activation)
         main_conf = self._apply_activation_single(fmap[..., -1], self.conf_activation)
 
-        # Auxiliary head (multi-level inside) -> only last level returned (after activation)
+        # 辅助分支默认是 ray。内部虽然保留多层 aux 特征，
+        # 但最终只返回最高分辨率那一层，与论文图中的最终输出一致。
         last_aux = fused_aux_pyr[-1]
         if self.pos_embed:
             last_aux = self._add_pos_embed(last_aux, W, H)
@@ -276,6 +286,7 @@ class DualDPT(nn.Module):
         """
         l1, l2, l3, l4 = feats
 
+        # 先把四个尺度都映射到 scratch 空间，再走自顶向下融合。
         l1_rn = self.scratch.layer1_rn(l1)
         l2_rn = self.scratch.layer2_rn(l2)
         l3_rn = self.scratch.layer3_rn(l3)
@@ -305,6 +316,7 @@ class DualDPT(nn.Module):
         aux_out = self.scratch.refinenet1_aux(aux_out, l1_rn)
         aux_list.append(aux_out)
 
+        # 两个分支都在这里进入各自的“输出前颈部”。
         out = self.scratch.output_conv1(out)
         aux_list = [self.scratch.output_conv1_aux[i](aux) for i, aux in enumerate(aux_list)]
 

@@ -85,6 +85,8 @@ class DPT(nn.Module):
         self.intermediate_layer_idx: Tuple[int, int, int, int] = (0, 1, 2, 3)
 
         # -------------------- token pre-norm + per-stage projection --------------------
+        # DPT 解码器的第一步：把 backbone 各层 token 重新整理成 2D 特征图，
+        # 并投影到统一通道数，便于后续做金字塔融合。
         if norm_type == "layer":
             self.norm = nn.LayerNorm(dim_in)
         elif norm_type == "idt":
@@ -95,7 +97,8 @@ class DPT(nn.Module):
             [nn.Conv2d(dim_in, oc, kernel_size=1, stride=1, padding=0) for oc in out_channels]
         )
 
-        # -------------------- Spatial re-size (align to common scale before fusion) --------------------
+        # 四个尺度会先被拉到可对齐的空间分辨率：
+        # 低层上采样，高层保持或轻微下采样，然后统一进入 DPT 式 top-down 融合。
         # Design consistent with original: relative to patch grid (x4, x2, x1, /2)
         self.resize_layers = nn.ModuleList(
             [
@@ -110,7 +113,8 @@ class DPT(nn.Module):
             ]
         )
 
-        # -------------------- scratch: stage adapters + main fusion chain --------------------
+        # scratch + refinenet 是标准 DPT 风格解码器：
+        # 先做每层适配，再从粗到细逐层融合。
         self.scratch = _make_scratch(list(out_channels), features, expand=False)
 
         # Main fusion chain
@@ -121,7 +125,8 @@ class DPT(nn.Module):
             features, has_residual=False, inplace=fusion_block_inplace
         )
 
-        # Heads (shared neck1; then split into two heads)
+        # 这里是最普通的单头 DPT：
+        # 主头负责 depth / 其它 dense map，可选再接一个 sky head。
         head_features_1 = features
         head_features_2 = 32
         self.scratch.output_conv1 = nn.Conv2d(
@@ -176,6 +181,8 @@ class DPT(nn.Module):
             Dict[str, Tensor]
         """
         B, S, N, C = feats[0][0].shape
+        # 输入来自 backbone 的四个中间层，每层都带有 [batch, views] 维。
+        # 这里先把它们并起来，用标准 dense decoder 的方式逐视角处理。
         feats = [feat[0].reshape(B * S, N, C) for feat in feats]
 
         # update image info, used by the GS-DPT head
@@ -194,6 +201,7 @@ class DPT(nn.Module):
             kw = {}
             if "images" in extra_kwargs:
                 kw.update({"images": extra_kwargs["images"][s0:s1]})
+            # 解码阶段允许按视角分块，避免多视角时 head 端显存过高。
             out_dicts.append(
                 self._forward_impl([f[s0:s1] for f in feats], H, W, patch_start_idx, **kw)
             )
@@ -215,6 +223,8 @@ class DPT(nn.Module):
         ph, pw = H // self.patch_size, W // self.patch_size
         resized_feats = []
         for stage_idx, take_idx in enumerate(self.intermediate_layer_idx):
+            # patch_start_idx 用于跳过 cls/camera token；
+            # dense prediction 只依赖 patch token 网格。
             x = feats[take_idx][:, patch_start_idx:]  # [B*S, N_patch, C]
             x = self.norm(x)
             # permute -> contiguous before reshape to keep conv input contiguous
@@ -226,10 +236,10 @@ class DPT(nn.Module):
             x = self.resize_layers[stage_idx](x)  # Align scale
             resized_feats.append(x)
 
-        # 2) Fusion pyramid (main branch only)
+        # 经过 reassembly 后，四个尺度进入 DPT 的自顶向下融合链。
         fused = self._fuse(resized_feats)
 
-        # 3) Upsample to target resolution, optionally add position encoding again
+        # 融合完成后恢复到目标输出分辨率。
         h_out = int(ph * self.patch_size / self.down_ratio)
         w_out = int(pw * self.patch_size / self.down_ratio)
 
@@ -241,7 +251,7 @@ class DPT(nn.Module):
         # 4) Shared neck1
         feat = fused
 
-        # 5) Main head: logits -> activation
+        # 主头默认可以输出“值 + 置信度”，例如 depth 和 depth_conf。
         main_logits = self.scratch.output_conv2(feat)
         outs: TyDict[str, torch.Tensor] = {}
         if self.has_conf:
@@ -255,7 +265,8 @@ class DPT(nn.Module):
                 main_logits, self.activation
             ).squeeze(1)
 
-        # 6) Sky head (fixed 1 channel)
+        # metric / mono 分支会用 sky head 预测天空区域，
+        # 后续可把天空深度抬远，减少无意义几何。
         if self.use_sky_head:
             sky_logits = self.scratch.sky_output_conv2(feat)
             outs[self.sky_name] = self._apply_sky_activation(sky_logits).squeeze(1)
@@ -271,6 +282,7 @@ class DPT(nn.Module):
         """
         l1, l2, l3, l4 = feats
 
+        # 每一层先映射到 scratch 空间，再按照 4 -> 3 -> 2 -> 1 的顺序融合。
         l1_rn = self.scratch.layer1_rn(l1)
         l2_rn = self.scratch.layer2_rn(l2)
         l3_rn = self.scratch.layer3_rn(l3)
