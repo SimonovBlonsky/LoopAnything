@@ -17,18 +17,20 @@ The evaluator matches `reloc3r/eval_relpose.py` exactly for metrics:
 
 For each image pair `(I1, I2)`:
 
-1. preprocess the two images with DA3's official `InputProcessor`
-2. run DA3's pose path through `DepthAnything3.forward(...)`
-3. read the predicted per-view extrinsics
-4. form the relative pose as `T_2to1 = E1 @ inv(E2)`
+1. load the pair through the shared reloc3r-style dataset crop in `/home/chenguyuan/code/NeurIPS26/datasets`
+2. run DA3's official `InputProcessor` on the shared crop output
+3. run DA3's pose path through `DepthAnything3.forward(...)`
+4. read the predicted per-view extrinsics
+5. form the relative pose as `T_2to1 = E1 @ inv(E2)`
 
 Here `E1` and `E2` are the per-view extrinsics predicted by DA3.
 
 ## Files
 
 - `eval_relpose.py`: main entry point for both datasets
-- `datasets.py`: lightweight readers for ScanNet1500 and MegaDepth1500
-- `metrics.py`: reloc3r-compatible metrics
+- `/home/chenguyuan/code/NeurIPS26/datasets/scannet1500.py`: shared ScanNet1500 reader
+- `/home/chenguyuan/code/NeurIPS26/datasets/megadepth_valid.py`: shared MegaDepth1500 reader
+- `/home/chenguyuan/code/NeurIPS26/eval/utils/metric.py`: shared reloc3r-compatible metrics
 - `eval_scannet1500.sh`: convenience wrapper for ScanNet1500
 - `eval_megadepth1500.sh`: convenience wrapper for MegaDepth1500
 
