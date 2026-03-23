@@ -37,46 +37,18 @@ from loop_utils.alignment_torch import (
 )
 from loop_utils.config_utils import load_config
 from loop_utils.da3_loop_detector import DA3LoopDetector
-try:
-    from loop_utils.loop_detector import LoopDetector
-    LOOP_DETECTOR_IMPORT_ERROR = None
-except ModuleNotFoundError as exc:
-    LoopDetector = None
-    LOOP_DETECTOR_IMPORT_ERROR = exc
-try:
-    from loop_utils.sim3loop import Sim3LoopOptimizer
-    SIM3LOOP_IMPORT_ERROR = None
-except ModuleNotFoundError as exc:
-    Sim3LoopOptimizer = None
-    SIM3LOOP_IMPORT_ERROR = exc
-try:
-    from loop_utils.sim3utils import (
-        accumulate_sim3_transforms,
-        compute_sim3_ab,
-        merge_ply_files,
-        precompute_scale_chunks_with_depth,
-        process_loop_list,
-        save_confident_pointcloud_batch,
-        warmup_numba,
-        weighted_align_point_maps,
-    )
-    SIM3UTILS_IMPORT_ERROR = None
-except ModuleNotFoundError as exc:
-    SIM3UTILS_IMPORT_ERROR = exc
-
-    def _missing_sim3utils(*args, **kwargs):
-        raise ModuleNotFoundError(
-            "Sim3 utilities require optional dependencies such as 'numba'."
-        ) from SIM3UTILS_IMPORT_ERROR
-
-    accumulate_sim3_transforms = _missing_sim3utils
-    compute_sim3_ab = _missing_sim3utils
-    merge_ply_files = _missing_sim3utils
-    precompute_scale_chunks_with_depth = _missing_sim3utils
-    process_loop_list = _missing_sim3utils
-    save_confident_pointcloud_batch = _missing_sim3utils
-    warmup_numba = _missing_sim3utils
-    weighted_align_point_maps = _missing_sim3utils
+from loop_utils.loop_detector import LoopDetector
+from loop_utils.sim3loop import Sim3LoopOptimizer
+from loop_utils.sim3utils import (
+    accumulate_sim3_transforms,
+    compute_sim3_ab,
+    merge_ply_files,
+    precompute_scale_chunks_with_depth,
+    process_loop_list,
+    save_confident_pointcloud_batch,
+    warmup_numba,
+    weighted_align_point_maps,
+)
 from safetensors.torch import load_file
 
 from depth_anything_3.api import DepthAnything3
@@ -217,10 +189,6 @@ class DA3_Streaming:
 
         self.loop_list = []  # e.g. [(1584, 139), ...]
 
-        if Sim3LoopOptimizer is None:
-            raise ModuleNotFoundError(
-                "Sim3 loop optimization requires optional dependency 'pypose'."
-            ) from SIM3LOOP_IMPORT_ERROR
         self.loop_optimizer = Sim3LoopOptimizer(self.config)
 
         self.sim3_list = []  # [(s [1,], R [3,3], T [3,]), ...]
@@ -242,10 +210,6 @@ class DA3_Streaming:
                     da3_model=self.model,
                 )
             elif self.loop_backend == "salad":
-                if LoopDetector is None:
-                    raise ModuleNotFoundError(
-                        "SALAD loop detector backend requires optional dependency 'faiss'."
-                    ) from LOOP_DETECTOR_IMPORT_ERROR
                 self.loop_detector = LoopDetector(
                     image_dir=image_dir, output=loop_info_save_path, config=self.config
                 )

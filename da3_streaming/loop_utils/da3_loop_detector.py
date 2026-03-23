@@ -2,11 +2,7 @@ import json
 import time
 from pathlib import Path
 
-try:
-    import faiss
-except ImportError:  # pragma: no cover - exercised only in minimal environments.
-    faiss = None
-
+import faiss
 import torch
 from safetensors.torch import load_file
 
@@ -190,15 +186,9 @@ class DA3LoopDetector:
         return [(max(a, b), min(a, b), score) for a, b, score in tuples_list]
 
     def _search_descriptors(self, descriptors, k):
-        if faiss is not None:
-            index = faiss.IndexFlatIP(descriptors.shape[1])
-            index.add(descriptors)
-            return index.search(descriptors, k)
-
-        desc_tensor = torch.from_numpy(descriptors)
-        similarities = desc_tensor @ desc_tensor.T
-        topk = torch.topk(similarities, k=k, dim=1)
-        return topk.values.numpy(), topk.indices.numpy()
+        index = faiss.IndexFlatIP(descriptors.shape[1])
+        index.add(descriptors)
+        return index.search(descriptors, k)
 
     def find_loop_closures(self):
         if self.descriptors is None:

@@ -110,6 +110,39 @@ def test_find_loop_closures_applies_threshold_gap_and_topk(tmp_path):
     assert any({a, b} == {0, 2} or {a, b} == {1, 3} for a, b, _ in loops)
 
 
+def test_search_descriptors_uses_faiss_index(monkeypatch, tmp_path):
+    calls = {}
+
+    class StubFaissIndex:
+        def __init__(self, dim):
+            calls['dim'] = dim
+
+        def add(self, descriptors):
+            calls['added'] = descriptors.copy()
+
+        def search(self, descriptors, k):
+            calls['searched'] = (descriptors.copy(), k)
+            return (
+                torch.tensor([[1.0, 0.8], [1.0, 0.8]], dtype=torch.float32).numpy(),
+                torch.tensor([[0, 1], [1, 0]], dtype=torch.int64).numpy(),
+            )
+
+    monkeypatch.setattr(da3_loop_detector_module.faiss, 'IndexFlatIP', StubFaissIndex)
+
+    detector = DA3LoopDetector(image_dir=str(tmp_path), config={})
+    descriptors = torch.tensor([[1.0, 0.0], [0.0, 1.0]], dtype=torch.float32).numpy()
+
+    similarities, indices = detector._search_descriptors(descriptors, 2)
+
+    assert calls['dim'] == 2
+    assert (calls['added'] == descriptors).all()
+    searched_descriptors, searched_k = calls['searched']
+    assert (searched_descriptors == descriptors).all()
+    assert searched_k == 2
+    assert similarities.shape == (2, 2)
+    assert indices.tolist() == [[0, 1], [1, 0]]
+
+
 def test_extract_descriptors_uses_injected_da3_components_and_populates_timing(tmp_path, monkeypatch):
     autocast_recorder = _AutocastRecorder()
     monkeypatch.setattr(da3_loop_detector_module.torch, "autocast", autocast_recorder)
