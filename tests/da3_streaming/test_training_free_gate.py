@@ -24,6 +24,21 @@ def test_relative_pose_from_extrinsics_matches_manual_transform():
     assert np.allclose(rel[:3, 3], np.array([-2.0, 0.0, 0.0]), atol=1e-6)
 
 
+def test_relative_pose_from_extrinsics_supports_3x4_inputs():
+    a = np.eye(4, dtype=np.float32)[:3, :]
+    b = np.eye(4, dtype=np.float32)[:3, :]
+    b[0, 3] = 2.0
+    rel = relative_pose_from_extrinsics(a, b)
+    expected = np.eye(4, dtype=np.float32)
+    expected[0, 3] = -2.0
+    assert np.allclose(rel, expected, atol=1e-6)
+
+
+def test_combine_loop_scores_matches_default_weights_exact_value():
+    score = combine_loop_scores(desc_sim=0.75, pair_sim=0.5, overlap=0.25)
+    assert score == 0.5625
+
+
 def test_combine_loop_scores_is_monotonic_in_overlap():
     low = combine_loop_scores(desc_sim=0.9, pair_sim=0.8, overlap=0.1)
     high = combine_loop_scores(desc_sim=0.9, pair_sim=0.8, overlap=0.8)

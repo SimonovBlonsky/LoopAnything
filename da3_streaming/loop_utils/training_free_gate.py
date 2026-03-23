@@ -7,13 +7,22 @@ from typing import Sequence
 import numpy as np
 
 
+def _as_homogeneous_extrinsics(extrinsics: np.ndarray, name: str) -> np.ndarray:
+    extrinsics = np.asarray(extrinsics, dtype=np.float32)
+    if extrinsics.shape == (4, 4):
+        return extrinsics
+    if extrinsics.shape == (3, 4):
+        homogeneous = np.eye(4, dtype=np.float32)
+        homogeneous[:3, :] = extrinsics
+        return homogeneous
+    raise ValueError(f"{name} must have shape (4, 4) or (3, 4)")
+
+
 def relative_pose_from_extrinsics(extrinsics_a: np.ndarray, extrinsics_b: np.ndarray) -> np.ndarray:
     """Return the relative pose that maps coordinates from ``b`` into ``a`` space."""
 
-    extrinsics_a = np.asarray(extrinsics_a, dtype=np.float32)
-    extrinsics_b = np.asarray(extrinsics_b, dtype=np.float32)
-    if extrinsics_a.shape != (4, 4) or extrinsics_b.shape != (4, 4):
-        raise ValueError("extrinsics_a and extrinsics_b must both have shape (4, 4)")
+    extrinsics_a = _as_homogeneous_extrinsics(extrinsics_a, "extrinsics_a")
+    extrinsics_b = _as_homogeneous_extrinsics(extrinsics_b, "extrinsics_b")
     return extrinsics_a @ np.linalg.inv(extrinsics_b)
 
 
