@@ -239,15 +239,14 @@ class DA3_Streaming:
 
         self.loop_list = []  # e.g. [(1584, 139), ...]
 
-        self.loop_optimizer = _build_loop_optimizer(self.config)
+        self.loop_enable = self.config["Model"]["loop_enable"]
+        self.loop_optimizer = _build_loop_optimizer(self.config) if self.loop_enable else None
 
         self.sim3_list = []  # [(s [1,], R [3,3], T [3,]), ...]
 
         self.loop_sim3_list = []  # [(chunk_idx_a, chunk_idx_b, s [1,], R [3,3], T [3,]), ...]
 
         self.loop_predict_list = []
-
-        self.loop_enable = self.config["Model"]["loop_enable"]
 
         if self.loop_enable:
             loop_info_save_path = os.path.join(save_dir, "loop_closures.txt")

@@ -165,3 +165,47 @@ def test_da3_streaming_selects_salad_detector(monkeypatch, tmp_path):
     assert streaming.loop_detector.load_model_called is True
     assert streaming.loop_detector.kwargs['image_dir'] == str(tmp_path / 'images')
     assert len(salad_build_calls) == 1
+
+
+def test_da3_streaming_skips_loop_optimizer_when_loop_disabled(monkeypatch, tmp_path):
+    module = importlib.import_module('da3_streaming.da3_streaming')
+
+    class DummyModel:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def load_state_dict(self, state_dict, strict=False):
+            self.loaded = (state_dict, strict)
+
+        def eval(self):
+            return self
+
+        def to(self, device):
+            self.device = device
+            return self
+
+    def fail_if_loop_optimizer_built(config):
+        raise AssertionError('loop optimizer should not be built when loop_enable is False')
+
+    monkeypatch.setattr(module, 'DepthAnything3', DummyModel)
+    monkeypatch.setattr(module, 'load_file', lambda path: {'weights': path})
+    monkeypatch.setattr(module, '_build_loop_optimizer', fail_if_loop_optimizer_built, raising=False)
+    monkeypatch.setattr(module.torch.cuda, 'is_available', lambda: False)
+    monkeypatch.setattr(module.torch.cuda, 'get_device_capability', lambda *args, **kwargs: (0, 0))
+
+    config_path = tmp_path / 'config.json'
+    config_path.write_text(json.dumps({}), encoding='utf-8')
+
+    config = _build_base_config(tmp_path, backend='da3')
+    config['Weights']['DA3_CONFIG'] = str(config_path)
+    config['Model']['loop_enable'] = False
+
+    streaming = module.DA3_Streaming(
+        image_dir=str(tmp_path / 'images'),
+        save_dir=str(tmp_path / 'workspace'),
+        config=config,
+    )
+
+    assert streaming.loop_enable is False
+    assert streaming.loop_optimizer is None
+    assert not hasattr(streaming, 'loop_detector')
