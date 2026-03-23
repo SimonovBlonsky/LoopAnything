@@ -24,9 +24,7 @@ def _flatten_patch_tokens(
     if patch_tokens.ndim == 4:
         batch, views, tokens, channels = patch_tokens.shape
         return patch_tokens.reshape(batch * views, tokens, channels), (batch, views)
-    raise ValueError(
-        "patch_tokens must have shape [B, N, C] or [B, S, N, C]"
-    )
+    raise ValueError("patch_tokens must have shape [B, N, C] or [B, S, N, C]")
 
 
 def _prepare_weights(
@@ -42,9 +40,7 @@ def _prepare_weights(
             raise ValueError("weights must have shape [B, N] for patch_tokens shaped [B, N, C]")
         return weights
     if weights.ndim != 3 or weights.shape != patch_tokens.shape[:3]:
-        raise ValueError(
-            "weights must have shape [B, S, N] for patch_tokens shaped [B, S, N, C]"
-        )
+        raise ValueError("weights must have shape [B, S, N] for patch_tokens shaped [B, S, N, C]")
     batch, views, tokens = weights.shape
     return weights.reshape(batch * views, tokens)
 
@@ -94,22 +90,30 @@ def generalized_mean_pool(
 def confidence_map_to_token_weights(
     confidence_map: torch.Tensor,
     token_hw: Optional[Union[int, Sequence[int]]] = None,
-    eps: float = 1e-8,
 ) -> torch.Tensor:
-    if confidence_map.ndim == 4 and confidence_map.shape[1] == 1:
-        confidence_map = confidence_map.squeeze(1)
-    if confidence_map.ndim == 2:
-        weights = confidence_map
-    elif confidence_map.ndim == 3:
+    if confidence_map.ndim == 5 and confidence_map.shape[2] == 1:
+        confidence_map = confidence_map.squeeze(2)
+    if confidence_map.ndim == 4:
+        batch, views, height, width = confidence_map.shape
         if token_hw is None:
-            weights = confidence_map.flatten(1)
-        else:
-            if isinstance(token_hw, int):
-                token_hw = (token_hw, token_hw)
-            weights = F.adaptive_avg_pool2d(confidence_map.unsqueeze(1), tuple(token_hw)).flatten(1)
-    else:
-        raise ValueError("confidence_map must have shape [B, N], [B, H, W], or [B, 1, H, W]")
-    return weights.clamp_min(0.0)
+            return confidence_map.flatten(2).clamp_min(0.0)
+        if isinstance(token_hw, int):
+            token_hw = (token_hw, token_hw)
+        pooled = F.adaptive_avg_pool2d(
+            confidence_map.reshape(batch * views, 1, height, width), tuple(token_hw)
+        )
+        return pooled.flatten(1).reshape(batch, views, -1).clamp_min(0.0)
+    if confidence_map.ndim == 3:
+        if token_hw is None:
+            return confidence_map.flatten(1).clamp_min(0.0)
+        if isinstance(token_hw, int):
+            token_hw = (token_hw, token_hw)
+        return F.adaptive_avg_pool2d(confidence_map.unsqueeze(1), tuple(token_hw)).flatten(1).clamp_min(0.0)
+    if confidence_map.ndim == 2:
+        return confidence_map.clamp_min(0.0)
+    raise ValueError(
+        "confidence_map must have shape [B, N], [B, H, W], [B, S, H, W], [B, 1, H, W], or [B, S, 1, H, W]"
+    )
 
 
 def build_loop_descriptor(
