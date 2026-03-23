@@ -7,6 +7,11 @@ from pathlib import Path
 
 import torch
 
+try:
+    from da3_streaming.loop_utils.salad.utils.validation import get_validation_recalls
+except ModuleNotFoundError:
+    from loop_utils.salad.utils.validation import get_validation_recalls
+
 CURRENT_DIR = Path(__file__).resolve().parent
 if __package__ in {None, ""}:
     from loop_utils.da3_loop_detector import DA3LoopDetector
@@ -35,13 +40,12 @@ def load_sped_components():
         import importlib
 
         sped_module = importlib.import_module("dataloaders.val.SPEDDataset")
-        validation_module = importlib.import_module("utils.validation")
 
     dataset_root = (SALAD_ROOT / sped_module.DATASET_ROOT).resolve()
     gt_root = (SALAD_ROOT / sped_module.GT_ROOT).resolve()
     sped_module.DATASET_ROOT = f"{dataset_root}{os.sep}"
     sped_module.GT_ROOT = f"{gt_root}{os.sep}"
-    return sped_module.SPEDDataset, validation_module.get_validation_recalls, dataset_root
+    return sped_module.SPEDDataset, dataset_root
 
 
 def build_sped_image_paths(dataset_root, image_names):
@@ -49,10 +53,8 @@ def build_sped_image_paths(dataset_root, image_names):
     return [str(dataset_root / image_name) for image_name in image_names]
 
 
-
 def split_reference_and_query(descriptors: torch.Tensor, num_references: int):
     return descriptors[:num_references], descriptors[num_references:]
-
 
 
 def move_model_to_available_device(model):
@@ -61,6 +63,7 @@ def move_model_to_available_device(model):
 
 
 def _compute_exact_validation_recalls(r_list, q_list, k_values, gt, print_results, dataset_name):
+    """Emergency fallback for offline use; not used by the default evaluator path."""
     distances = np.sum((q_list[:, None, :] - r_list[None, :, :]) ** 2, axis=-1)
     predictions = np.argsort(distances, axis=1)[:, : max(k_values)]
 
@@ -83,28 +86,15 @@ def _compute_exact_validation_recalls(r_list, q_list, k_values, gt, print_result
 
 
 def compute_validation_recalls(validator, r_list, q_list, k_values, gt, dataset_name, print_results):
-    try:
-        return validator(
-            r_list=r_list,
-            q_list=q_list,
-            k_values=k_values,
-            gt=gt,
-            print_results=print_results,
-            dataset_name=dataset_name,
-            faiss_gpu=False,
-        )
-    except ModuleNotFoundError as exc:
-        missing_module = exc.name or str(exc)
-        if "faiss" not in missing_module:
-            raise
-        return _compute_exact_validation_recalls(
-            r_list=r_list,
-            q_list=q_list,
-            k_values=k_values,
-            gt=gt,
-            print_results=print_results,
-            dataset_name=dataset_name,
-        )
+    return validator(
+        r_list=r_list,
+        q_list=q_list,
+        k_values=k_values,
+        gt=gt,
+        print_results=print_results,
+        dataset_name=dataset_name,
+        faiss_gpu=False,
+    )
 
 
 def parse_args():
@@ -157,14 +147,12 @@ def parse_args():
     return parser.parse_args()
 
 
-
 def load_da3_model(model_name_or_path: str):
     from depth_anything_3.api import DepthAnything3
 
     print(f"Loading DA3 model from: {model_name_or_path}")
     model = DepthAnything3.from_pretrained(model_name_or_path)
     return move_model_to_available_device(model)
-
 
 
 def build_detector_config(args):
@@ -182,9 +170,8 @@ def build_detector_config(args):
     }
 
 
-
 def evaluate_spedtest(args):
-    SPEDDataset, get_validation_recalls, dataset_root = load_sped_components()
+    SPEDDataset, dataset_root = load_sped_components()
     dataset = SPEDDataset(input_transform=None)
 
     da3_model = load_da3_model(args.model_name_or_path)
