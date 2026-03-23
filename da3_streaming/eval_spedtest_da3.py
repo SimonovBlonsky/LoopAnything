@@ -1,5 +1,4 @@
 import argparse
-import numpy as np
 import os
 import sys
 from contextlib import contextmanager
@@ -61,40 +60,6 @@ def move_model_to_available_device(model):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     return model.eval().to(device)
 
-
-def _compute_exact_validation_recalls(r_list, q_list, k_values, gt, print_results, dataset_name):
-    """Emergency fallback for offline use; not used by the default evaluator path."""
-    distances = np.sum((q_list[:, None, :] - r_list[None, :, :]) ** 2, axis=-1)
-    predictions = np.argsort(distances, axis=1)[:, : max(k_values)]
-
-    correct_at_k = np.zeros(len(k_values), dtype=np.float32)
-    for q_idx, pred in enumerate(predictions):
-        for i, n in enumerate(k_values):
-            if np.any(np.in1d(pred[:n], gt[q_idx])):
-                correct_at_k[i:] += 1
-                break
-
-    correct_at_k = correct_at_k / len(predictions)
-    recalls = {k: float(v) for k, v in zip(k_values, correct_at_k)}
-
-    if print_results:
-        print()
-        print(f"Performances on {dataset_name}")
-        print("Recall@K", " ".join(f"{k}:{100 * recalls[k]:.2f}" for k in k_values))
-
-    return recalls
-
-
-def compute_validation_recalls(validator, r_list, q_list, k_values, gt, dataset_name, print_results):
-    return validator(
-        r_list=r_list,
-        q_list=q_list,
-        k_values=k_values,
-        gt=gt,
-        print_results=print_results,
-        dataset_name=dataset_name,
-        faiss_gpu=False,
-    )
 
 
 def parse_args():
@@ -193,8 +158,7 @@ def evaluate_spedtest(args):
     print(f"images_per_sec {detector.extract_images_per_sec:.2f}")
     print(f"ms_per_image {detector.extract_ms_per_image:.2f}")
 
-    recalls = compute_validation_recalls(
-        validator=get_validation_recalls,
+    recalls = get_validation_recalls(
         r_list=refs.detach().cpu().float().numpy(),
         q_list=queries.detach().cpu().float().numpy(),
         k_values=args.k_values,

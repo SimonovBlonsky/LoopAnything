@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+
 import numpy as np
 import torch
 
@@ -47,6 +48,24 @@ def test_move_model_to_available_device_uses_available_runtime(monkeypatch):
     assert model is stub
     assert stub.eval_called is True
     assert stub.moved_to == torch.device("cpu")
+
+
+def test_real_salad_validation_recalls_on_tiny_synthetic_data():
+    refs = np.array([[0.0, 0.0], [10.0, 10.0]], dtype=np.float32)
+    queries = np.array([[0.1, 0.1], [9.9, 9.9]], dtype=np.float32)
+    ground_truth = [np.array([0], dtype=np.int64), np.array([1], dtype=np.int64)]
+
+    recalls = eval_spedtest_da3.get_validation_recalls(
+        r_list=refs,
+        q_list=queries,
+        k_values=[1, 2],
+        gt=ground_truth,
+        print_results=False,
+        faiss_gpu=False,
+        dataset_name="SPED",
+    )
+
+    assert recalls == {1: 1.0, 2: 1.0}
 
 
 def test_evaluate_spedtest_uses_salad_validator_with_expected_arguments(monkeypatch, tmp_path):
@@ -124,4 +143,4 @@ def test_evaluate_spedtest_uses_salad_validator_with_expected_arguments(monkeypa
     np.testing.assert_array_equal(captured["gt"][0], np.array([0], dtype=np.int64))
     assert captured["dataset_name"] == "SPED"
     assert captured["print_results"] is True
-    assert captured["faiss_gpu"] is False
+    assert set(captured) == {"r_list", "q_list", "k_values", "gt", "print_results", "dataset_name"}
