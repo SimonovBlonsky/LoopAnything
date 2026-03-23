@@ -37,23 +37,73 @@ from loop_utils.alignment_torch import (
 )
 from loop_utils.config_utils import load_config
 from loop_utils.da3_loop_detector import DA3LoopDetector
-from loop_utils.loop_detector import LoopDetector
-from loop_utils.sim3loop import Sim3LoopOptimizer
-from loop_utils.sim3utils import (
-    accumulate_sim3_transforms,
-    compute_sim3_ab,
-    merge_ply_files,
-    precompute_scale_chunks_with_depth,
-    process_loop_list,
-    save_confident_pointcloud_batch,
-    warmup_numba,
-    weighted_align_point_maps,
-)
 from safetensors.torch import load_file
 
 from depth_anything_3.api import DepthAnything3
 
 matplotlib.use("Agg")
+
+
+def _load_salad_loop_detector_class():
+    from loop_utils.loop_detector import LoopDetector
+
+    return LoopDetector
+
+
+def _build_salad_loop_detector(*, image_dir, output, config):
+    detector_cls = _load_salad_loop_detector_class()
+    detector = detector_cls(image_dir=image_dir, output=output, config=config)
+    detector.load_model()
+    return detector
+
+
+def _load_sim3loop_optimizer_class():
+    from loop_utils.sim3loop import Sim3LoopOptimizer
+
+    return Sim3LoopOptimizer
+
+
+def _build_loop_optimizer(config):
+    optimizer_cls = _load_sim3loop_optimizer_class()
+    return optimizer_cls(config)
+
+
+def _load_sim3utils_module():
+    from loop_utils import sim3utils
+
+    return sim3utils
+
+
+def accumulate_sim3_transforms(*args, **kwargs):
+    return _load_sim3utils_module().accumulate_sim3_transforms(*args, **kwargs)
+
+
+def compute_sim3_ab(*args, **kwargs):
+    return _load_sim3utils_module().compute_sim3_ab(*args, **kwargs)
+
+
+def merge_ply_files(*args, **kwargs):
+    return _load_sim3utils_module().merge_ply_files(*args, **kwargs)
+
+
+def precompute_scale_chunks_with_depth(*args, **kwargs):
+    return _load_sim3utils_module().precompute_scale_chunks_with_depth(*args, **kwargs)
+
+
+def process_loop_list(*args, **kwargs):
+    return _load_sim3utils_module().process_loop_list(*args, **kwargs)
+
+
+def save_confident_pointcloud_batch(*args, **kwargs):
+    return _load_sim3utils_module().save_confident_pointcloud_batch(*args, **kwargs)
+
+
+def warmup_numba(*args, **kwargs):
+    return _load_sim3utils_module().warmup_numba(*args, **kwargs)
+
+
+def weighted_align_point_maps(*args, **kwargs):
+    return _load_sim3utils_module().weighted_align_point_maps(*args, **kwargs)
 
 
 def depth_to_point_cloud_vectorized(depth, intrinsics, extrinsics, device=None):
@@ -189,7 +239,7 @@ class DA3_Streaming:
 
         self.loop_list = []  # e.g. [(1584, 139), ...]
 
-        self.loop_optimizer = Sim3LoopOptimizer(self.config)
+        self.loop_optimizer = _build_loop_optimizer(self.config)
 
         self.sim3_list = []  # [(s [1,], R [3,3], T [3,]), ...]
 
@@ -210,10 +260,9 @@ class DA3_Streaming:
                     da3_model=self.model,
                 )
             elif self.loop_backend == "salad":
-                self.loop_detector = LoopDetector(
+                self.loop_detector = _build_salad_loop_detector(
                     image_dir=image_dir, output=loop_info_save_path, config=self.config
                 )
-                self.loop_detector.load_model()
             else:
                 raise ValueError(f"Unsupported loop backend: {self.loop_backend}")
 

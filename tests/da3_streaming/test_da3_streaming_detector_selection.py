@@ -67,13 +67,20 @@ def test_da3_streaming_selects_da3_detector(monkeypatch, tmp_path):
         def __init__(self, config):
             self.config = config
 
+    salad_loader_called = False
+
+    def fail_if_salad_loader_used():
+        nonlocal salad_loader_called
+        salad_loader_called = True
+        raise AssertionError('SALAD detector import helper should not run for DA3 backend')
+
     monkeypatch.setattr(module, "DepthAnything3", DummyModel)
     monkeypatch.setattr(module, "load_file", lambda path: {"weights": path})
-    monkeypatch.setattr(module, "Sim3LoopOptimizer", DummyOptimizer)
+    monkeypatch.setattr(module, "_build_loop_optimizer", lambda config: DummyOptimizer(config), raising=False)
     monkeypatch.setattr(module.torch.cuda, "is_available", lambda: False)
     monkeypatch.setattr(module.torch.cuda, "get_device_capability", lambda *args, **kwargs: (0, 0))
     monkeypatch.setattr(module, "DA3LoopDetector", DummyDetector, raising=False)
-    monkeypatch.setattr(module, "LoopDetector", DummyDetector, raising=False)
+    monkeypatch.setattr(module, "_build_salad_loop_detector", lambda *args, **kwargs: fail_if_salad_loader_used(), raising=False)
 
     config_path = tmp_path / "config.json"
     config_path.write_text(json.dumps({}), encoding="utf-8")
@@ -90,6 +97,7 @@ def test_da3_streaming_selects_da3_detector(monkeypatch, tmp_path):
     assert isinstance(streaming.loop_detector, DummyDetector)
     assert streaming.loop_detector.kwargs["da3_model"] is streaming.model
     assert streaming.loop_detector.load_model_called is False
+    assert salad_loader_called is False
 
 
 def test_da3_streaming_selects_salad_detector(monkeypatch, tmp_path):
@@ -125,13 +133,21 @@ def test_da3_streaming_selects_salad_detector(monkeypatch, tmp_path):
         def __init__(self, config):
             self.config = config
 
+    salad_build_calls = []
+
+    def build_salad_detector(*args, **kwargs):
+        salad_build_calls.append(kwargs)
+        detector = DummySaladDetector(*args, **kwargs)
+        detector.load_model()
+        return detector
+
     monkeypatch.setattr(module, 'DepthAnything3', DummyModel)
     monkeypatch.setattr(module, 'load_file', lambda path: {'weights': path})
-    monkeypatch.setattr(module, 'Sim3LoopOptimizer', DummyOptimizer)
+    monkeypatch.setattr(module, '_build_loop_optimizer', lambda config: DummyOptimizer(config), raising=False)
     monkeypatch.setattr(module.torch.cuda, 'is_available', lambda: False)
     monkeypatch.setattr(module.torch.cuda, 'get_device_capability', lambda *args, **kwargs: (0, 0))
     monkeypatch.setattr(module, 'DA3LoopDetector', DummyDA3Detector, raising=False)
-    monkeypatch.setattr(module, 'LoopDetector', DummySaladDetector, raising=False)
+    monkeypatch.setattr(module, '_build_salad_loop_detector', build_salad_detector, raising=False)
 
     config_path = tmp_path / 'config.json'
     config_path.write_text(json.dumps({}), encoding='utf-8')
@@ -148,3 +164,4 @@ def test_da3_streaming_selects_salad_detector(monkeypatch, tmp_path):
     assert isinstance(streaming.loop_detector, DummySaladDetector)
     assert streaming.loop_detector.load_model_called is True
     assert streaming.loop_detector.kwargs['image_dir'] == str(tmp_path / 'images')
+    assert len(salad_build_calls) == 1

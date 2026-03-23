@@ -1,5 +1,6 @@
 import json
 
+import numpy as np
 import torch
 from torch import nn
 
@@ -135,11 +136,17 @@ def test_search_descriptors_uses_faiss_index(monkeypatch, tmp_path):
     similarities, indices = detector._search_descriptors(descriptors, 2)
 
     assert calls['dim'] == 2
+    assert calls['added'].shape == (2, 2)
+    assert calls['added'].dtype == np.float32
+    assert descriptors.dtype == np.float32
     assert (calls['added'] == descriptors).all()
     searched_descriptors, searched_k = calls['searched']
+    assert searched_descriptors.shape == (2, 2)
+    assert searched_descriptors.dtype == descriptors.dtype
     assert (searched_descriptors == descriptors).all()
     assert searched_k == 2
     assert similarities.shape == (2, 2)
+    assert similarities.dtype == descriptors.dtype
     assert indices.tolist() == [[0, 1], [1, 0]]
 
 
