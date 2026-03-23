@@ -36,6 +36,19 @@ Model:
     conf_threshold_coef: 0.75 # conf_threshold = np.mean(confs) * conf_threshold_coef
 
 Loop:
+  backend: 'salad'
+
+  DA3:
+    batch_size: 16
+    process_res: 504
+    process_res_method: 'upper_bound_resize'
+    pooling: 'mean'
+    gem_p: 3.0
+    similarity_threshold: 0.85
+    top_k: 5
+    use_nms: True
+    nms_threshold: 25
+
   SALAD:
     image_size: [336, 336]
     batch_size: 32

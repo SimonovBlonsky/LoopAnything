@@ -80,6 +80,33 @@ ffmpeg -i your_video.mp4 -vf "fps=5,scale=640:-1" ./extract_images/frame_%06d.pn
 ```
 
 
+### 3.1 - Loop Backend Selection
+
+`DA3-Streaming` now supports two loop-retrieval backends through `configs/base_config.yaml`:
+
+```yaml
+Loop:
+  backend: "salad"  # or "da3"
+```
+
+- `salad`: original DINOv2 + SALAD retrieval path. This remains the default.
+- `da3`: training-free prototype that reuses frozen `Depth Anything 3` backbone features for descriptor extraction.
+
+When `Loop.backend` is set to `da3`, the streaming pipeline keeps the geometry path unchanged and only swaps the loop detector frontend.
+
+### 3.2 - SPEDTEST Benchmark for the DA3 Backend
+
+You can benchmark the frozen DA3 descriptor path on SPEDTEST with:
+
+```cmd
+PYTHONPATH=src python da3_streaming/eval_spedtest_da3.py \
+  --model-name-or-path /path/to/da3-snapshot-or-hf-model \
+  --batch-size 8 \
+  --process-res 504
+```
+
+The evaluator reuses the vendored SALAD SPEDTEST dataset and recall computation. If `faiss` is unavailable in the active environment, it falls back to an exact L2 search so the benchmark still runs.
+
 ### 4 - Outputs
 
 #### Basic Outputs

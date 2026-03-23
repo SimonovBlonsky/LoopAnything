@@ -26,23 +26,57 @@ import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+if CURRENT_DIR not in sys.path:
+    sys.path.insert(0, CURRENT_DIR)
+
 from loop_utils.alignment_torch import (
     apply_sim3_direct_torch,
     depth_to_point_cloud_optimized_torch,
 )
 from loop_utils.config_utils import load_config
-from loop_utils.loop_detector import LoopDetector
-from loop_utils.sim3loop import Sim3LoopOptimizer
-from loop_utils.sim3utils import (
-    accumulate_sim3_transforms,
-    compute_sim3_ab,
-    merge_ply_files,
-    precompute_scale_chunks_with_depth,
-    process_loop_list,
-    save_confident_pointcloud_batch,
-    warmup_numba,
-    weighted_align_point_maps,
-)
+from loop_utils.da3_loop_detector import DA3LoopDetector
+try:
+    from loop_utils.loop_detector import LoopDetector
+    LOOP_DETECTOR_IMPORT_ERROR = None
+except ModuleNotFoundError as exc:
+    LoopDetector = None
+    LOOP_DETECTOR_IMPORT_ERROR = exc
+try:
+    from loop_utils.sim3loop import Sim3LoopOptimizer
+    SIM3LOOP_IMPORT_ERROR = None
+except ModuleNotFoundError as exc:
+    Sim3LoopOptimizer = None
+    SIM3LOOP_IMPORT_ERROR = exc
+try:
+    from loop_utils.sim3utils import (
+        accumulate_sim3_transforms,
+        compute_sim3_ab,
+        merge_ply_files,
+        precompute_scale_chunks_with_depth,
+        process_loop_list,
+        save_confident_pointcloud_batch,
+        warmup_numba,
+        weighted_align_point_maps,
+    )
+    SIM3UTILS_IMPORT_ERROR = None
+except ModuleNotFoundError as exc:
+    SIM3UTILS_IMPORT_ERROR = exc
+
+    def _missing_sim3utils(*args, **kwargs):
+        raise ModuleNotFoundError(
+            "Sim3 utilities require optional dependencies such as 'numba'."
+        ) from SIM3UTILS_IMPORT_ERROR
+
+    accumulate_sim3_transforms = _missing_sim3utils
+    compute_sim3_ab = _missing_sim3utils
+    merge_ply_files = _missing_sim3utils
+    precompute_scale_chunks_with_depth = _missing_sim3utils
+    process_loop_list = _missing_sim3utils
+    save_confident_pointcloud_batch = _missing_sim3utils
+    warmup_numba = _missing_sim3utils
+    weighted_align_point_maps = _missing_sim3utils
 from safetensors.torch import load_file
 
 from depth_anything_3.api import DepthAnything3
@@ -140,9 +174,12 @@ class DA3_Streaming:
         self.conf_threshold = 1.5
         self.seed = 42
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.dtype = (
-            torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-        )
+        if torch.cuda.is_available():
+            self.dtype = (
+                torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+            )
+        else:
+            self.dtype = torch.float32
 
         self.img_dir = image_dir
         self.img_list = None
@@ -180,6 +217,10 @@ class DA3_Streaming:
 
         self.loop_list = []  # e.g. [(1584, 139), ...]
 
+        if Sim3LoopOptimizer is None:
+            raise ModuleNotFoundError(
+                "Sim3 loop optimization requires optional dependency 'pypose'."
+            ) from SIM3LOOP_IMPORT_ERROR
         self.loop_optimizer = Sim3LoopOptimizer(self.config)
 
         self.sim3_list = []  # [(s [1,], R [3,3], T [3,]), ...]
@@ -192,10 +233,25 @@ class DA3_Streaming:
 
         if self.loop_enable:
             loop_info_save_path = os.path.join(save_dir, "loop_closures.txt")
-            self.loop_detector = LoopDetector(
-                image_dir=image_dir, output=loop_info_save_path, config=self.config
-            )
-            self.loop_detector.load_model()
+            self.loop_backend = self.config["Loop"].get("backend", "salad").lower()
+            if self.loop_backend == "da3":
+                self.loop_detector = DA3LoopDetector(
+                    image_dir=image_dir,
+                    output=loop_info_save_path,
+                    config=self.config,
+                    da3_model=self.model,
+                )
+            elif self.loop_backend == "salad":
+                if LoopDetector is None:
+                    raise ModuleNotFoundError(
+                        "SALAD loop detector backend requires optional dependency 'faiss'."
+                    ) from LOOP_DETECTOR_IMPORT_ERROR
+                self.loop_detector = LoopDetector(
+                    image_dir=image_dir, output=loop_info_save_path, config=self.config
+                )
+                self.loop_detector.load_model()
+            else:
+                raise ValueError(f"Unsupported loop backend: {self.loop_backend}")
 
         print("init done.")
 
