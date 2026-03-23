@@ -33,7 +33,7 @@ def generalized_mean_pool(
     p: float = 3.0,
     eps: float = 1e-6,
 ) -> torch.Tensor:
-    tokens = patch_tokens.clamp_min(eps)
+    tokens = patch_tokens.abs().clamp_min(eps)
     if weights is None:
         pooled = tokens.pow(p).mean(dim=1)
     else:
