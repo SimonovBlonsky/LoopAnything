@@ -112,8 +112,7 @@ class DA3LoopDetector:
             if need_sync:
                 torch.cuda.synchronize(self.device)
 
-            camera_tokens, all_tokens = feats[-1]
-            patch_tokens = all_tokens[:, :, 1:, :]
+            patch_tokens, camera_tokens = feats[-1]
             batch_descriptors = build_loop_descriptor(
                 camera_tokens,
                 patch_tokens,
