@@ -1,6 +1,9 @@
+import json
+
 import torch
 from torch import nn
 
+import da3_streaming.loop_utils.da3_loop_detector as da3_loop_detector_module
 from da3_streaming.loop_utils.da3_loop_detector import DA3LoopDetector
 from depth_anything_3.model.loop_descriptor import build_loop_descriptor
 
@@ -38,6 +41,44 @@ class _StubDA3(nn.Module):
         return batch, None, None
 
 
+class _AutocastRecorder:
+    def __init__(self):
+        self.calls = []
+
+    def __call__(self, device_type, dtype, enabled=True):
+        self.calls.append((device_type, dtype, enabled))
+
+        class _Context:
+            def __enter__(self_inner):
+                return None
+
+            def __exit__(self_inner, exc_type, exc, tb):
+                return False
+
+        return _Context()
+
+
+class _LoadableStubDA3(nn.Module):
+    def __init__(self, **model_config):
+        super().__init__()
+        self.anchor = nn.Parameter(torch.zeros(1))
+        self.model_config = model_config
+        self.loaded_state = None
+        self.eval_called = False
+        self.moved_to = None
+
+    def load_state_dict(self, state_dict, strict=False):
+        self.loaded_state = (state_dict, strict)
+
+    def eval(self):
+        self.eval_called = True
+        return self
+
+    def to(self, device):
+        self.moved_to = torch.device(device)
+        return self
+
+
 def test_find_loop_closures_applies_threshold_gap_and_topk(tmp_path):
     detector = DA3LoopDetector(
         image_dir=str(tmp_path),
@@ -69,7 +110,10 @@ def test_find_loop_closures_applies_threshold_gap_and_topk(tmp_path):
     assert any({a, b} == {0, 2} or {a, b} == {1, 3} for a, b, _ in loops)
 
 
-def test_extract_descriptors_uses_injected_da3_components_and_populates_timing(tmp_path):
+def test_extract_descriptors_uses_injected_da3_components_and_populates_timing(tmp_path, monkeypatch):
+    autocast_recorder = _AutocastRecorder()
+    monkeypatch.setattr(da3_loop_detector_module.torch, "autocast", autocast_recorder)
+
     patch_tokens = torch.tensor(
         [
             [[[1.0, 0.0], [0.0, 1.0]]],
@@ -118,6 +162,36 @@ def test_extract_descriptors_uses_injected_da3_components_and_populates_timing(t
     assert backbone_input.shape == (2, 1, 3, 14, 14)
     assert ref_view_strategy == "middle"
     assert torch.allclose(descriptors, expected, atol=1e-6)
+    assert autocast_recorder.calls == [("cpu", torch.float16, False)]
     assert detector.extract_time_s >= 0.0
     assert detector.extract_images_per_sec > 0.0
     assert detector.extract_ms_per_image >= 0.0
+
+
+def test_load_model_builds_da3_from_config_when_not_injected(tmp_path, monkeypatch):
+    config_path = tmp_path / 'config.json'
+    config_path.write_text(json.dumps({'encoder': 'stub'}), encoding='utf-8')
+
+    monkeypatch.setattr(da3_loop_detector_module, 'DepthAnything3', _LoadableStubDA3)
+    monkeypatch.setattr(
+        da3_loop_detector_module,
+        'load_file',
+        lambda path: {'weight': torch.tensor([1.0]), 'path': str(path)},
+    )
+
+    detector = DA3LoopDetector(
+        image_dir=str(tmp_path),
+        config={'Weights': {'DA3_CONFIG': str(config_path), 'DA3': str(tmp_path / 'model.safetensors')}},
+    )
+
+    model, device = detector.load_model()
+
+    assert isinstance(model, _LoadableStubDA3)
+    assert model.model_config == {'encoder': 'stub'}
+    assert model.eval_called is True
+    assert model.loaded_state[1] is False
+    assert torch.equal(model.loaded_state[0]['weight'], torch.tensor([1.0]))
+    assert model.loaded_state[0]['path'] == str(tmp_path / 'model.safetensors')
+    assert model.moved_to == device
+    assert detector.da3_model is model
+    assert detector.device == device

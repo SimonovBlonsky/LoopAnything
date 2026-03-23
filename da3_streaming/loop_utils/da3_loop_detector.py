@@ -1,3 +1,4 @@
+import json
 import time
 from pathlib import Path
 
@@ -7,7 +8,9 @@ except ImportError:  # pragma: no cover - exercised only in minimal environments
     faiss = None
 
 import torch
+from safetensors.torch import load_file
 
+from depth_anything_3.api import DepthAnything3
 from depth_anything_3.model.loop_descriptor import build_loop_descriptor
 
 
@@ -51,10 +54,27 @@ class DA3LoopDetector:
 
     def load_model(self):
         if self.da3_model is None:
-            raise ValueError(
-                "DA3LoopDetector.load_model() requires an injected da3_model for v0"
-            )
+            weights_cfg = self.config.get("Weights", {})
+            config_path = weights_cfg.get("DA3_CONFIG")
+            weight_path = weights_cfg.get("DA3")
+            if not config_path or not weight_path:
+                raise ValueError(
+                    "DA3LoopDetector.load_model() requires either an injected da3_model "
+                    "or config['Weights']['DA3_CONFIG'] and config['Weights']['DA3']"
+                )
 
+            with open(config_path, encoding="utf-8") as handle:
+                model_config = json.load(handle)
+
+            self.da3_model = DepthAnything3(**model_config)
+            weight = load_file(weight_path)
+            self.da3_model.load_state_dict(weight, strict=False)
+            self.da3_model = self.da3_model.eval()
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.da3_model = self.da3_model.to(self.device)
+            return self.da3_model, self.device
+
+        self.da3_model = self.da3_model.eval()
         if hasattr(self.da3_model, "_get_model_device"):
             self.device = self.da3_model._get_model_device()
         elif getattr(self.da3_model, "device", None) is not None:
@@ -102,13 +122,21 @@ class DA3LoopDetector:
             batch_tensor = batch_tensor.to(self.device).unsqueeze(1)
 
             need_sync = self.device.type == "cuda"
+            autocast_dtype = (
+                torch.bfloat16 if need_sync and torch.cuda.is_bf16_supported() else torch.float16
+            )
             if need_sync:
                 torch.cuda.synchronize(self.device)
             with torch.no_grad():
-                feats, _ = self.da3_model.model.backbone(
-                    batch_tensor,
-                    ref_view_strategy=self.ref_view_strategy,
-                )
+                with torch.autocast(
+                    device_type=self.device.type,
+                    dtype=autocast_dtype,
+                    enabled=need_sync,
+                ):
+                    feats, _ = self.da3_model.model.backbone(
+                        batch_tensor,
+                        ref_view_strategy=self.ref_view_strategy,
+                    )
             if need_sync:
                 torch.cuda.synchronize(self.device)
 
