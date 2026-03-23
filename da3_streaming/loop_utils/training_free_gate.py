@@ -19,7 +19,11 @@ def _as_homogeneous_extrinsics(extrinsics: np.ndarray, name: str) -> np.ndarray:
 
 
 def relative_pose_from_extrinsics(extrinsics_a: np.ndarray, extrinsics_b: np.ndarray) -> np.ndarray:
-    """Return the relative pose that maps coordinates from ``b`` into ``a`` space."""
+    """Return the relative pose from camera ``b`` into camera ``a`` space.
+
+    The inputs are world-to-camera extrinsics, accepted as either ``(4, 4)`` or
+    ``(3, 4)`` matrices.
+    """
 
     extrinsics_a = _as_homogeneous_extrinsics(extrinsics_a, "extrinsics_a")
     extrinsics_b = _as_homogeneous_extrinsics(extrinsics_b, "extrinsics_b")
@@ -48,7 +52,11 @@ def estimate_overlap_score(
     rel_pose: np.ndarray,
     stride: int = 16,
 ) -> float:
-    """Estimate geometric overlap with a cheap sampled reprojection consistency ratio."""
+    """Estimate geometric overlap using a sampled reprojection consistency ratio.
+
+    ``rel_pose`` must map points from camera ``b`` into camera ``a`` space, matching
+    :func:`relative_pose_from_extrinsics`.
+    """
 
     depth_a = np.asarray(depth_a, dtype=np.float32)
     depth_b = np.asarray(depth_b, dtype=np.float32)
@@ -65,10 +73,10 @@ def estimate_overlap_score(
     if stride <= 0:
         raise ValueError("stride must be positive")
 
-    score_ab = _sampled_reprojection_ratio(depth_a, depth_b, intr_a, intr_b, rel_pose, stride)
-    score_ba = _sampled_reprojection_ratio(
-        depth_b, depth_a, intr_b, intr_a, np.linalg.inv(rel_pose), stride
-    )
+    pose_b_to_a = rel_pose
+    pose_a_to_b = np.linalg.inv(rel_pose)
+    score_ab = _sampled_reprojection_ratio(depth_a, depth_b, intr_a, intr_b, pose_a_to_b, stride)
+    score_ba = _sampled_reprojection_ratio(depth_b, depth_a, intr_b, intr_a, pose_b_to_a, stride)
     return float(np.clip(0.5 * (score_ab + score_ba), 0.0, 1.0))
 
 
