@@ -220,7 +220,20 @@ Build and wire the model from DA3 and SALAD sources.
 def build_da3_model(...)
 def build_da3_encoder_adapter(...)
 def build_aggregator(agg_arch, agg_config)
-def build_vpr_model(...)
+def build_vpr_model(
+    *,
+    da3_model=None,
+    da3_config_path=None,
+    da3_weight_path=None,
+    da3_model_name_or_path=None,
+    agg_arch,
+    agg_config=None,
+    aggregator_ckpt_path=None,
+    strict=True,
+    feat_layer=-1,
+    ref_view_strategy="saddle_balanced",
+    patch_size=14,
+)
 ```
 
 #### Checkpoint functions
@@ -243,6 +256,8 @@ build_vpr_model(
 )
 ```
 
+This is the highest-priority DA3 source. If `da3_model` is provided, helper code must use it directly and ignore DA3 construction arguments.
+
 2. DA3 config + DA3 weights
 
 ```python
@@ -255,6 +270,8 @@ build_vpr_model(
 )
 ```
 
+This mode is valid only when `da3_model` is not provided. `da3_config_path` and `da3_weight_path` must be provided together.
+
 3. DA3 HF/local model name or path if already supported by the local DA3 API wrapper
 
 ```python
@@ -266,6 +283,18 @@ build_vpr_model(
 )
 ```
 
+This is the fallback mode. It is valid only when `da3_model` is absent and `da3_config_path` / `da3_weight_path` are absent.
+
+#### DA3 source precedence and exclusivity
+
+The helper must resolve DA3 sources in this order:
+
+1. `da3_model`
+2. `da3_config_path` + `da3_weight_path`
+3. `da3_model_name_or_path`
+
+Valid calls must provide exactly one DA3 source mode. If arguments from multiple modes are mixed, helper code should raise a clear `ValueError` instead of silently choosing one.
+
 #### Aggregator checkpoint extraction
 
 The helper must support common prefixes such as:
@@ -275,6 +304,14 @@ The helper must support common prefixes such as:
 - `module.aggregator.`
 
 It should strip the prefix and load only that sub-state into the chosen aggregator.
+
+Before prefix extraction, the helper should unwrap common trainer checkpoint containers by checking, in order:
+
+1. a top-level `state_dict` field
+2. a top-level `model` field if it already looks like a flat parameter dictionary
+3. the checkpoint object itself if it is already a flat parameter dictionary
+
+If no recognized aggregator-prefixed keys are found after unwrapping, the helper must raise a clear error rather than partially loading or silently continuing.
 
 This is the core mechanism that allows DA3 encoder + SALAD aggregator composition.
 
