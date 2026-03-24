@@ -31,7 +31,10 @@ class DA3EncoderAdapter(nn.Module):
             export_feat_layers=[],
             ref_view_strategy=self.ref_view_strategy,
         )
-        patch_tokens, camera_tokens = feats[self.feat_layer]
+        selected_feat = feats[self.feat_layer]
+        if not isinstance(selected_feat, (tuple, list)) or len(selected_feat) != 2:
+            raise ValueError("DA3EncoderAdapter expected (patch_tokens, camera_tokens) from backbone")
+        patch_tokens, camera_tokens = selected_feat
         patch_tokens = patch_tokens[:, 0]
         global_token = camera_tokens[:, 0]
         hp, wp = x.shape[-2] // self.patch_size, x.shape[-1] // self.patch_size

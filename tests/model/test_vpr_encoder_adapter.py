@@ -17,10 +17,25 @@ class StubBackbone(torch.nn.Module):
         return ((self.feat, camera_tokens),), []
 
 
+class StubMalformedBackbone(torch.nn.Module):
+    def __init__(self, feat):
+        super().__init__()
+        self.feat = feat
+
+    def forward(self, x, **kwargs):
+        return ((self.feat,),), []
+
+
 class StubDA3Net(torch.nn.Module):
     def __init__(self, feat, camera_feat=None):
         super().__init__()
         self.backbone = StubBackbone(feat, camera_feat=camera_feat)
+
+
+class StubMalformedDA3Net(torch.nn.Module):
+    def __init__(self, feat):
+        super().__init__()
+        self.backbone = StubMalformedBackbone(feat)
 
 
 class StubDA3Wrapper:
@@ -101,4 +116,12 @@ def test_adapter_rejects_non_finite_global_token():
     adapter = DA3EncoderAdapter(StubDA3Net(feat, camera_feat=camera_feat), patch_size=2)
 
     with pytest.raises(ValueError, match="global_token contains non-finite values"):
+        adapter(torch.randn(1, 3, 4, 4))
+
+
+def test_adapter_rejects_malformed_backbone_output():
+    feat = torch.randn(1, 1, 4, 16)
+    adapter = DA3EncoderAdapter(StubMalformedDA3Net(feat), patch_size=2)
+
+    with pytest.raises(ValueError, match=r"expected \(patch_tokens, camera_tokens\) from backbone"):
         adapter(torch.randn(1, 3, 4, 4))
