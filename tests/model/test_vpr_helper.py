@@ -295,3 +295,34 @@ def test_build_vpr_model_returns_eval_mode_model(monkeypatch):
     assert model.training is False
     assert model.aggregator.training is False
     assert model.aggregator.dropout.training is False
+
+
+def test_end_to_end_descriptor_is_finite_with_stub_da3_and_salad():
+    class StubBackbone(torch.nn.Module):
+        def forward(self, x, **kwargs):
+            feat = torch.randn(x.shape[0], 1, 9, 1536)
+            camera = feat[:, :, 0]
+            return ((feat, camera),), []
+
+    class StubDA3(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = StubBackbone()
+
+    model = vpr_helper.build_vpr_model(
+        da3_model=StubDA3(),
+        agg_arch="SALAD",
+        agg_config={
+            "num_channels": 1536,
+            "num_clusters": 8,
+            "cluster_dim": 16,
+            "token_dim": 32,
+            "dropout": 0.0,
+        },
+        patch_size=2,
+    )
+
+    descriptor = model(torch.randn(2, 3, 6, 6))
+
+    assert descriptor.shape == (2, 8 * 16 + 32)
+    assert torch.isfinite(descriptor).all()
