@@ -40,7 +40,7 @@ class DA3EncoderAdapter(nn.Module):
         hp, wp = x.shape[-2] // self.patch_size, x.shape[-1] // self.patch_size
         if patch_tokens.shape[1] != hp * wp:
             raise ValueError("Cannot reshape patch tokens into a valid spatial map")
-        feature_map = patch_tokens.view(x.shape[0], hp, wp, patch_tokens.shape[-1]).permute(0, 3, 1, 2)
+        feature_map = patch_tokens.reshape(x.shape[0], hp, wp, patch_tokens.shape[-1]).permute(0, 3, 1, 2)
         if not torch.isfinite(feature_map).all():
             raise ValueError("feature_map contains non-finite values")
         if not torch.isfinite(global_token).all():

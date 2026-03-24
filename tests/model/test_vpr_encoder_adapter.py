@@ -125,3 +125,14 @@ def test_adapter_rejects_malformed_backbone_output():
 
     with pytest.raises(ValueError, match=r"expected \(patch_tokens, camera_tokens\) from backbone"):
         adapter(torch.randn(1, 3, 4, 4))
+
+
+def test_adapter_handles_non_contiguous_patch_tokens():
+    feat = torch.randn(1, 1, 8, 16)[:, :, ::2]
+    adapter = DA3EncoderAdapter(StubDA3Net(feat), patch_size=2)
+
+    out = adapter(torch.randn(1, 3, 4, 4))
+
+    assert not feat[:, 0].is_contiguous()
+    assert out["patch_tokens"].shape == (1, 4, 16)
+    assert out["feature_map"].shape == (1, 16, 2, 2)
