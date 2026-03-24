@@ -155,16 +155,24 @@ def test_build_vpr_model_with_existing_da3_model(monkeypatch):
     class StubDA3(torch.nn.Module):
         pass
 
+    class RecordingVPRModel(torch.nn.Module):
+        def __init__(self, encoder, aggregator, agg_arch):
+            super().__init__()
+            self.encoder = encoder
+            self.aggregator = aggregator
+            self.agg_arch = agg_arch
+
     monkeypatch.setattr(vpr_helper, "build_aggregator", lambda *args, **kwargs: torch.nn.Identity())
     monkeypatch.setattr(vpr_helper, "build_da3_encoder_adapter", lambda model, **kwargs: torch.nn.Identity())
-    monkeypatch.setattr(vpr_helper, "VPRModel", lambda encoder, aggregator, agg_arch: (encoder, aggregator, agg_arch))
+    monkeypatch.setattr(vpr_helper, "VPRModel", RecordingVPRModel)
 
     result = vpr_helper.build_vpr_model(
         da3_model=StubDA3(),
         agg_arch="GeM",
         agg_config={"p": 3},
     )
-    assert result[2] == "GeM"
+    assert result.agg_arch == "GeM"
+    assert result.training is False
 
 
 def test_build_da3_model_from_config_and_weight_paths(monkeypatch):
@@ -203,9 +211,16 @@ def test_build_vpr_model_threads_aggregator_ckpt_and_strict(monkeypatch):
     class StubDA3(torch.nn.Module):
         pass
 
+    class RecordingVPRModel(torch.nn.Module):
+        def __init__(self, encoder, aggregator, agg_arch):
+            super().__init__()
+            self.encoder = encoder
+            self.aggregator = aggregator
+            self.agg_arch = agg_arch
+
     monkeypatch.setattr(vpr_helper, "build_aggregator", lambda *args, **kwargs: torch.nn.Identity())
     monkeypatch.setattr(vpr_helper, "build_da3_encoder_adapter", lambda model, **kwargs: torch.nn.Identity())
-    monkeypatch.setattr(vpr_helper, "VPRModel", lambda encoder, aggregator, agg_arch: (encoder, aggregator, agg_arch))
+    monkeypatch.setattr(vpr_helper, "VPRModel", RecordingVPRModel)
 
     def fake_load_aggregator_weights(aggregator, ckpt_path, strict=True):
         calls["ckpt_path"] = ckpt_path
@@ -221,3 +236,26 @@ def test_build_vpr_model_threads_aggregator_ckpt_and_strict(monkeypatch):
         strict=False,
     )
     assert calls == {"ckpt_path": "/tmp/agg.ckpt", "strict": False}
+
+
+def test_build_vpr_model_returns_eval_mode_model(monkeypatch):
+    class StubDA3(torch.nn.Module):
+        pass
+
+    class DropoutAggregator(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.dropout = torch.nn.Dropout(p=0.5)
+
+    monkeypatch.setattr(vpr_helper, "build_da3_encoder_adapter", lambda model, **kwargs: torch.nn.Identity())
+    monkeypatch.setattr(vpr_helper, "build_aggregator", lambda *args, **kwargs: DropoutAggregator())
+
+    model = vpr_helper.build_vpr_model(
+        da3_model=StubDA3(),
+        agg_arch="SALAD",
+        agg_config={"num_channels": 4, "num_clusters": 2, "cluster_dim": 2, "token_dim": 2},
+    )
+
+    assert model.training is False
+    assert model.aggregator.training is False
+    assert model.aggregator.dropout.training is False

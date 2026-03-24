@@ -132,7 +132,9 @@ def build_vpr_model(
     aggregator = build_aggregator(agg_arch, agg_config=agg_config)
     if aggregator_ckpt_path is not None:
         load_aggregator_weights_from_salad_ckpt(aggregator, aggregator_ckpt_path, strict=strict)
-    return VPRModel(encoder=encoder, aggregator=aggregator, agg_arch=agg_arch)
+    model = VPRModel(encoder=encoder, aggregator=aggregator, agg_arch=agg_arch)
+    model.eval()
+    return model
 
 
 get_aggregator = build_aggregator
