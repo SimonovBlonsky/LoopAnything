@@ -1,3 +1,5 @@
+import json
+
 import pytest
 import torch
 
@@ -103,6 +105,40 @@ def test_build_vpr_model_rejects_missing_da3_source():
 def test_build_da3_model_rejects_partial_config_weight_pair():
     with pytest.raises(ValueError, match="provided together"):
         vpr_helper.build_da3_model(da3_config_path="/tmp/fake.yaml")
+
+
+def test_build_da3_model_from_json_and_safetensors_paths(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.json"
+    weight_path = tmp_path / "model.safetensors"
+    config = {"model_name": "da3-large", "image_size": 1024}
+    config_path.write_text(json.dumps(config))
+    weight_path.write_text("stub")
+
+    calls = {}
+
+    class StubModel(torch.nn.Module):
+        def __init__(self, **kwargs):
+            super().__init__()
+            calls["config"] = kwargs
+
+        def load_state_dict(self, state_dict, strict=True):
+            calls["state_dict"] = state_dict
+            calls["strict"] = strict
+
+        def eval(self):
+            calls["eval_called"] = True
+            return self
+
+    monkeypatch.setattr(vpr_helper, "DepthAnything3", StubModel)
+    monkeypatch.setattr(vpr_helper, "load_file", lambda path: {"dummy": torch.tensor(1.0), "path": str(path)})
+
+    model = vpr_helper.build_da3_model(da3_config_path=config_path, da3_weight_path=weight_path)
+
+    assert isinstance(model, StubModel)
+    assert calls["config"] == config
+    assert calls["state_dict"] == {"dummy": torch.tensor(1.0), "path": str(weight_path)}
+    assert calls["strict"] is False
+    assert calls["eval_called"] is True
 
 
 def test_build_da3_model_from_model_name_or_path(monkeypatch):

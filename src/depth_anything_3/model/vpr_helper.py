@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Iterable, Mapping
 
 import torch
+from safetensors.torch import load_file
 
 from depth_anything_3.api import DepthAnything3
 from depth_anything_3.cfg import create_object, load_config
@@ -56,6 +58,16 @@ def _unwrap_checkpoint_state_dict(checkpoint):
     return checkpoint
 
 
+def _load_da3_from_local_artifacts(da3_config_path, da3_weight_path):
+    with Path(da3_config_path).open() as f:
+        config = json.load(f)
+    model = DepthAnything3(**config)
+    checkpoint = load_file(da3_weight_path)
+    model.load_state_dict(checkpoint, strict=False)
+    model.eval()
+    return model
+
+
 def load_aggregator_weights_from_salad_ckpt(aggregator, ckpt_path, strict=True):
     checkpoint = torch.load(Path(ckpt_path), map_location="cpu")
     state_dict = _unwrap_checkpoint_state_dict(checkpoint)
@@ -74,6 +86,8 @@ def build_da3_model(*, da3_config_path=None, da3_weight_path=None, da3_model_nam
     if has_config_mode:
         if not (da3_config_path and da3_weight_path):
             raise ValueError("da3_config_path and da3_weight_path must be provided together")
+        if Path(da3_config_path).suffix == ".json" and Path(da3_weight_path).suffix == ".safetensors":
+            return _load_da3_from_local_artifacts(da3_config_path, da3_weight_path)
         cfg = load_config(da3_config_path)
         model = create_object(cfg)
         checkpoint = torch.load(da3_weight_path, map_location="cpu")
