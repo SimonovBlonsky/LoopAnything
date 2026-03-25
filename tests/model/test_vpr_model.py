@@ -26,11 +26,14 @@ class RecordingAggregator(torch.nn.Module):
         return x.flatten(1)
 
 
-def test_salad_aggregator_receives_tuple():
+def test_salad_aggregator_receives_tuple_with_zero_global_token():
     aggregator = RecordingAggregator()
     model = VPRModel(encoder=StubEncoder(), aggregator=aggregator, agg_arch="SALAD")
     descriptor = model(torch.randn(2, 3, 28, 28))
     assert isinstance(aggregator.last_input, tuple)
+    feature_map, global_token = aggregator.last_input
+    assert feature_map.shape == (2, 8, 2, 2)
+    assert torch.count_nonzero(global_token) == 0
     assert descriptor.shape[0] == 2
 
 

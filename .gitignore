@@ -37,3 +37,6 @@ temp*.png
 AGENTS.md
 DepthAnything3.md
 dev*.md
+docs/superpowers
+tests/
+log*.md

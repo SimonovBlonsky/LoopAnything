@@ -14,7 +14,10 @@ class VPRModel(nn.Module):
 
     def aggregate(self, features):
         if self.agg_arch == "salad":
-            return self.aggregator((features["feature_map"], features["global_token"]))
+            # 032626: ablation, unify setting to exclude global tokens
+            zero_token = torch.zeros_like(features["global_token"])
+            # return self.aggregator((features["feature_map"], features["global_token"]))
+            return self.aggregator((features["feature_map"], zero_token))
         return self.aggregator(features["feature_map"])
 
     def forward(self, x, return_features=False, **kwargs):
