@@ -103,17 +103,38 @@ def load_model(args):
     if hasattr(model, "encoder"):
         model.encoder.feature_source = args.feature_source
         model.encoder.aux_layer = args.aux_layer
+        model.encoder.aux_layers = args.aux_layers
+        model.encoder.layer_combine = args.layer_combine
+        model.encoder.layer_weights = args.layer_weights
+        model.encoder.layer_scale = args.layer_scale
+        model.encoder.post_fusion_norm = args.post_fusion_norm
     model = model.to(args.device)
     print(f"Loaded DA3 VPR model on {args.device}")
     print(f"  DA3 source: {args.da3_model_name_or_path or (args.da3_config_path, args.da3_weight_path)}")
     print(f"  Aggregator checkpoint: {args.agg_ckpt_path}")
     print(f"  Feature source: {args.feature_source}")
     if args.feature_source == "aux":
-        print(f"  Aux layer: {args.aux_layer}")
+        if args.aux_layers is None:
+            print(f"  Aux layer: {args.aux_layer}")
+        else:
+            print(f"  Aux layers: {args.aux_layers}")
+        print(f"  Layer combine: {args.layer_combine}")
+        print(f"  Layer scale: {args.layer_scale}")
+        print(f"  Post-fusion norm: {args.post_fusion_norm}")
     return model
 
 
+def _argv_has_flag(argv, flag_name):
+    for idx, token in enumerate(argv):
+        if token == flag_name:
+            return True
+        if token.startswith(f"{flag_name}="):
+            return True
+    return False
+
+
 def parse_args(argv=None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(
         description="Evaluate DA3 encoder + VPR aggregator on retrieval benchmarks",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -143,6 +164,11 @@ def parse_args(argv=None):
     parser.add_argument("--feat-layer", type=int, default=-1)
     parser.add_argument("--feature-source", choices=["final", "aux"], default="final")
     parser.add_argument("--aux-layer", type=int, default=3)
+    parser.add_argument("--aux-layers", nargs="+", type=int, default=None)
+    parser.add_argument("--layer-combine", type=str, default="single")
+    parser.add_argument("--layer-weights", nargs="+", type=float, default=None)
+    parser.add_argument("--layer-scale", type=float, default=1.0)
+    parser.add_argument("--post-fusion-norm", type=str, default="none")
     parser.add_argument("--ref-view-strategy", type=str, default="saddle_balanced")
     parser.add_argument("--patch-size", type=int, default=14)
 
@@ -151,7 +177,7 @@ def parse_args(argv=None):
     group.add_argument("--da3-config-path", type=str, default=None)
     parser.add_argument("--da3-weight-path", type=str, default=None)
 
-    args = parser.parse_args(argv)
+    args = parser.parse_args(raw_argv)
 
     if args.image_size:
         if len(args.image_size) == 1:
@@ -165,8 +191,45 @@ def parse_args(argv=None):
         parser.error("--da3-weight-path is required when --da3-config-path is used")
     if args.da3_config_path is None and args.da3_weight_path is not None:
         parser.error("--da3-config-path is required when --da3-weight-path is used")
+
+    args.layer_combine = args.layer_combine.lower()
+    if args.layer_combine not in {"single", "avg", "sum", "weighted_avg"}:
+        parser.error(f"Unsupported --layer-combine value: {args.layer_combine}")
+
+    args.post_fusion_norm = args.post_fusion_norm.lower()
+    if args.post_fusion_norm not in {"none", "token_l2", "feature_layernorm"}:
+        parser.error(f"Unsupported --post-fusion-norm value: {args.post_fusion_norm}")
+
+    layer_combine_explicit = _argv_has_flag(raw_argv, "--layer-combine")
+    layer_scale_explicit = _argv_has_flag(raw_argv, "--layer-scale")
+    post_fusion_norm_explicit = _argv_has_flag(raw_argv, "--post-fusion-norm")
+    explicit_aux_fusion_args = (
+        args.aux_layers is not None
+        or args.layer_weights is not None
+        or layer_combine_explicit
+        or args.layer_combine != "single"
+        or layer_scale_explicit
+        or args.layer_scale != 1.0
+        or post_fusion_norm_explicit
+        or args.post_fusion_norm != "none"
+    )
+    if args.feature_source == "final" and explicit_aux_fusion_args:
+        parser.error("--feature-source final does not accept explicit AUX fusion args")
+
     if args.feature_source == "aux" and args.aux_layer < 0:
         parser.error("--aux-layer must be non-negative when --feature-source aux is used")
+    if args.feature_source == "aux":
+        if args.aux_layers is None:
+            if args.layer_combine != "single":
+                parser.error("--feature-source aux without --aux-layers only supports --layer-combine single")
+            if args.layer_weights is not None:
+                parser.error("--layer-weights requires --aux-layers")
+        elif args.layer_combine == "single" and len(args.aux_layers) != 1:
+            parser.error("single layer_combine requires exactly one aux layer")
+        elif args.layer_combine == "weighted_avg" and args.layer_weights is None:
+            parser.error("weighted_avg requires layer_weights to match aux_layers")
+        elif args.layer_combine == "weighted_avg" and len(args.layer_weights) != len(args.aux_layers):
+            parser.error("weighted_avg requires layer_weights to match aux_layers")
 
     return args
 
