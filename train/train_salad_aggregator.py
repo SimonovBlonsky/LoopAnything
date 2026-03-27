@@ -20,6 +20,7 @@ from da3_streaming.loop_utils.salad import utils as salad_utils
 from dataloaders.GSVCitiesDataloader import GSVCitiesDataModule
 from depth_anything_3.api import DepthAnything3
 from depth_anything_3.model.VPRaggregators import SALAD
+from depth_anything_3.model.vpr_helper import load_aggregator_weights_from_salad_ckpt
 from depth_anything_3.model.vpr_model import VPRModel
 
 
@@ -175,28 +176,17 @@ class DA3SALADLightningModule(pl.LightningModule):
                 "faiss_gpu": faiss_gpu,
                 "encoder_arch": self.encoder_arch,
                 "agg_arch": self.agg_arch,
+                "agg_config": self.agg_config,
                 "aggregator_config": self.agg_config,
             }
         )
 
     def _load_aggregator_weights(self, aggregator: SALAD) -> None:
-        checkpoint = torch.load(self.AGGREGATOR_WEIGHTS, map_location="cpu")
-        state_dict = checkpoint.get("state_dict", checkpoint)
-        aggregator_state = {
-            key.removeprefix("aggregator."): value
-            for key, value in state_dict.items()
-            if key.startswith("aggregator.")
-        }
-        if not aggregator_state:
-            raise ValueError(
-                f"No aggregator-prefixed weights found in checkpoint: {self.AGGREGATOR_WEIGHTS}"
-            )
-        missing_keys, unexpected_keys = aggregator.load_state_dict(aggregator_state, strict=True)
-        if missing_keys or unexpected_keys:
-            raise ValueError(
-                f"Unexpected aggregator checkpoint load result: missing={missing_keys}, "
-                f"unexpected={unexpected_keys}"
-            )
+        load_aggregator_weights_from_salad_ckpt(
+            aggregator,
+            self.AGGREGATOR_WEIGHTS,
+            strict=True,
+        )
 
     def _loss_function(self, descriptors: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         if self.miner is not None:
