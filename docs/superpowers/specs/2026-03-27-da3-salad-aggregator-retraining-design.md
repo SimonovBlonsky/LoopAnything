@@ -15,12 +15,13 @@ The objective is to answer a narrow question: can a retrained SALAD aggregator a
 
 ## Fixed Experimental Definition
 The training setup is fixed as follows:
-- Backbone: `DA3-BASE`
+- Backbone: `DA3-BASE` loaded via `DepthAnything3.from_pretrained("depth-anything/DA3-BASE")`
 - Backbone weights: frozen for the entire run
 - Retrieval feature source: DA3 transformer `aux layer 5`
-- Local branch input: layer-5 patch tokens reshaped into a SALAD feature map
-- Token branch input: DA3 `cam_token` from the same layer, used in place of DINO CLS token
+- Local branch input: normalized layer-5 AUX patch tokens reshaped into a `768`-channel SALAD feature map
+- Token branch input: normalized layer-5 DA3 `cam_token` from the same layer, used in place of DINO CLS token
 - Aggregator initialization: `da3_streaming/loop_utils/salad/weights/dino_salad_512_32.ckpt`
+- Aggregator config: `num_channels=768`, `num_clusters=16`, `cluster_dim=32`, `token_dim=32` to match `dino_salad_512_32.ckpt`
 - Validation sets: `pitts30k_val`, `pitts30k_test`
 - Data module: `GSVCitiesDataModule` with its existing hard-coded paths
 
@@ -35,15 +36,15 @@ A lightweight `nn.Module` used only inside the training script.
 Responsibilities:
 - load `DA3-BASE`
 - freeze all DA3 parameters
-- run the DA3 backbone and export the full token sequence for `aux layer 5`
-- apply the same `norm` behavior as DA3 before feature extraction
-- split layer-5 output into:
+- call the DA3 transformer path that exposes the full normalized token sequence for `aux layer 5` before special-token removal
+- explicitly avoid the DA3 final exported feature path with `cat_token=True`, because that path produces `1536`-dim features and would not match the chosen SALAD checkpoint
+- split the normalized layer-5 sequence into:
   - `global_token = token[:, 0]` which is DA3 `cam_token`
   - `patch_tokens = token[:, 1:]`
 - reshape patch tokens into `[B, C, H/14, W/14]`
 - return a feature dictionary compatible with `src/depth_anything_3/model/vpr_model.py`
 
-The encoder must not use the current `DA3EncoderAdapter` because that adapter discards special tokens in AUX mode and replaces the token branch with patch-token mean pooling, which does not match this experiment.
+The encoder must not use the current `DA3EncoderAdapter` because that adapter discards special tokens in AUX mode and replaces the token branch with patch-token mean pooling, which does not match this experiment. The encoder must consume the `768`-dim AUX representation, not the `1536`-dim concatenated final export.
 
 ### 2. `DA3SALADLightningModule`
 A lightweight `pl.LightningModule` wrapper defined in the training script.
@@ -89,7 +90,7 @@ This keeps the comparison focused on backbone-feature replacement rather than hy
 ## Initialization Rules
 Aggregator initialization will load only aggregator-prefixed weights from the existing SALAD checkpoint. Backbone weights from the SALAD checkpoint are ignored.
 
-The DA3 backbone comes only from the DA3 pretrained checkpoint. There is no weight sharing or checkpoint merging between DA3 and original SALAD backbone weights.
+The DA3 backbone comes only from `DepthAnything3.from_pretrained("depth-anything/DA3-BASE")`. A local Hugging Face snapshot path is acceptable only if it resolves to the same pretrained model through the same API. There is no weight sharing or checkpoint merging between DA3 and original SALAD backbone weights.
 
 ## Freezing Rules
 All parameters under the DA3 encoder are frozen.
