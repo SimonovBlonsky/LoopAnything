@@ -33,6 +33,11 @@ class DA3Layer5CamTokenEncoder(nn.Module):
             parameter.requires_grad = False
         self.da3.eval()
 
+    def train(self, mode: bool = True) -> DA3Layer5CamTokenEncoder:
+        super().train(mode)
+        self.da3.eval()
+        return self
+
     def forward(self, images: torch.Tensor) -> dict[str, Any]:
         if images.ndim != 4:
             raise ValueError(f"Expected images with shape [B, 3, H, W], got {tuple(images.shape)}")
@@ -45,10 +50,15 @@ class DA3Layer5CamTokenEncoder(nn.Module):
                 f"Input spatial size must be divisible by {self.PATCH_SIZE}, got {(height, width)}"
             )
 
+        da3_device = next(self.da3.parameters()).device
+        if da3_device != images.device:
+            raise RuntimeError(
+                f"DA3 device mismatch: encoder is on {da3_device}, inputs are on {images.device}. "
+                "Move the parent module onto the input device before calling forward."
+            )
+
         hp = height // self.PATCH_SIZE
         wp = width // self.PATCH_SIZE
-        if next(self.da3.parameters()).device != images.device:
-            self.da3.to(images.device)
 
         transformer = self.da3.model.backbone.pretrained
         views = images.unsqueeze(1)
