@@ -127,9 +127,9 @@ class DA3SALADLightningModule(pl.LightningModule):
 
     def __init__(
         self,
-        lr: float = 0.03,
-        optimizer_name: str = "sgd",
-        weight_decay: float = 1e-3,
+        lr: float = 6e-5,
+        optimizer_name: str = "adamw",
+        weight_decay: float = 9.5e-9,
         momentum: float = 0.9,
         lr_sched: str = "linear",
         lr_sched_args: dict[str, Any] | None = None,
@@ -150,6 +150,9 @@ class DA3SALADLightningModule(pl.LightningModule):
         self.lr_sched = lr_sched
         self.lr_sched_args = lr_sched_args
         self.faiss_gpu = faiss_gpu
+        self.encoder_arch = DA3Layer5CamTokenEncoder.__name__
+        self.agg_arch = "SALAD"
+        self.agg_config = dict(self.AGGREGATOR_CONFIG)
 
         encoder = DA3Layer5CamTokenEncoder()
         aggregator = SALAD(**self.AGGREGATOR_CONFIG)
@@ -170,7 +173,9 @@ class DA3SALADLightningModule(pl.LightningModule):
                 "lr_sched": lr_sched,
                 "lr_sched_args": lr_sched_args,
                 "faiss_gpu": faiss_gpu,
-                "aggregator_config": self.AGGREGATOR_CONFIG,
+                "encoder_arch": self.encoder_arch,
+                "agg_arch": self.agg_arch,
+                "aggregator_config": self.agg_config,
             }
         )
 
@@ -350,7 +355,14 @@ class DA3SALADLightningModule(pl.LightningModule):
         else:
             raise ValueError(f"Unsupported lr scheduler: {self.lr_sched}")
 
-        return [optimizer], [scheduler]
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }
 
     def optimizer_step(
         self,
@@ -361,9 +373,6 @@ class DA3SALADLightningModule(pl.LightningModule):
     ) -> None:
         del epoch, batch_idx
         optimizer.step(closure=optimizer_closure)
-        scheduler = self.lr_schedulers()
-        if scheduler is not None:
-            scheduler.step()
 
 
 def build_datamodule() -> GSVCitiesDataModule:
