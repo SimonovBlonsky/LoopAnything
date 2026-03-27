@@ -62,18 +62,18 @@ def sanitize_unsupported_proxy_env_vars() -> None:
     if _PROXY_ENV_SANITIZED:
         return
 
-    removed_proxy_vars: list[tuple[str, str]] = []
+    removed_proxy_vars: list[str] = []
     for env_key in PROXY_ENV_KEYS:
         env_value = os.environ.get(env_key)
         if not env_value:
             continue
         scheme = env_value.split("://", 1)[0].lower()
         if scheme == "socks":
-            removed_proxy_vars.append((env_key, env_value))
+            removed_proxy_vars.append(env_key)
             os.environ.pop(env_key, None)
 
     if removed_proxy_vars:
-        formatted = ", ".join(f"{key}={value}" for key, value in removed_proxy_vars)
+        formatted = ", ".join(removed_proxy_vars)
         startup_log(
             "Sanitized unsupported proxy env vars with socks:// scheme for httpx compatibility: "
             f"{formatted}"
@@ -158,7 +158,7 @@ class DA3Layer5CamTokenEncoder(nn.Module):
 
         transformer = self.da3.model.backbone.pretrained
         views = images.unsqueeze(1)
-        with torch.inference_mode():
+        with torch.no_grad():
             _, aux_outputs = transformer._get_intermediate_layers_not_chunked(
                 views,
                 n=[],
