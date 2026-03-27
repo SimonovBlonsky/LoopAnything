@@ -6,7 +6,8 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
-for path in (PROJECT_ROOT, SRC_ROOT):
+SALAD_ROOT = PROJECT_ROOT / "da3_streaming" / "loop_utils" / "salad"
+for path in (PROJECT_ROOT, SRC_ROOT, SALAD_ROOT):
     if str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
@@ -14,7 +15,7 @@ import pytorch_lightning as pl
 import torch.nn as nn
 
 from da3_streaming.loop_utils.salad import utils as salad_utils
-from da3_streaming.loop_utils.salad.dataloaders.GSVCitiesDataloader import GSVCitiesDataModule
+from dataloaders.GSVCitiesDataloader import GSVCitiesDataModule
 from depth_anything_3.api import DepthAnything3
 from depth_anything_3.model.vpr_model import VPRModel
 
@@ -42,7 +43,7 @@ class DA3SALADLightningModule(pl.LightningModule):
 
 
 def build_datamodule() -> GSVCitiesDataModule:
-    return GSVCitiesDataModule()
+    raise NotImplementedError("Task 1 scaffold only; datamodule wiring is not implemented yet.")
 
 
 def build_trainer(model: pl.LightningModule) -> pl.Trainer:
