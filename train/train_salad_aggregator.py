@@ -14,10 +14,12 @@ for path in (PROJECT_ROOT, SRC_ROOT, SALAD_ROOT):
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
+from torch.optim import lr_scheduler
 
 from da3_streaming.loop_utils.salad import utils as salad_utils
 from dataloaders.GSVCitiesDataloader import GSVCitiesDataModule
 from depth_anything_3.api import DepthAnything3
+from depth_anything_3.model.VPRaggregators import SALAD
 from depth_anything_3.model.vpr_model import VPRModel
 
 
@@ -113,17 +115,255 @@ class DA3Layer5CamTokenEncoder(nn.Module):
 
 
 class DA3SALADLightningModule(pl.LightningModule):
-    def __init__(self) -> None:
+    AGGREGATOR_CONFIG = {
+        "num_channels": 768,
+        "num_clusters": 16,
+        "cluster_dim": 32,
+        "token_dim": 32,
+    }
+    AGGREGATOR_WEIGHTS = (
+        PROJECT_ROOT / "da3_streaming" / "loop_utils" / "salad" / "weights" / "dino_salad_512_32.ckpt"
+    )
+
+    def __init__(
+        self,
+        lr: float = 0.03,
+        optimizer_name: str = "sgd",
+        weight_decay: float = 1e-3,
+        momentum: float = 0.9,
+        lr_sched: str = "linear",
+        lr_sched_args: dict[str, Any] | None = None,
+        faiss_gpu: bool = False,
+    ) -> None:
         super().__init__()
+        if lr_sched_args is None:
+            lr_sched_args = {
+                "start_factor": 1.0,
+                "end_factor": 0.2,
+                "total_iters": 4000,
+            }
 
-    def forward(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError("Task 1 scaffold only; model logic is not implemented yet.")
+        self.lr = lr
+        self.optimizer_name = optimizer_name
+        self.weight_decay = weight_decay
+        self.momentum = momentum
+        self.lr_sched = lr_sched
+        self.lr_sched_args = lr_sched_args
+        self.faiss_gpu = faiss_gpu
 
-    def training_step(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError("Task 1 scaffold only; training logic is not implemented yet.")
+        encoder = DA3Layer5CamTokenEncoder()
+        aggregator = SALAD(**self.AGGREGATOR_CONFIG)
+        self._load_aggregator_weights(aggregator)
+
+        self.vpr_model = VPRModel(encoder=encoder, aggregator=aggregator, agg_arch="SALAD")
+        self.loss_fn = salad_utils.get_loss("MultiSimilarityLoss")
+        self.miner = salad_utils.get_miner("MultiSimilarityMiner", 0.1)
+        self.batch_acc: list[float] = []
+        self.val_outputs: list[list[torch.Tensor]] = []
+
+        self.save_hyperparameters(
+            {
+                "lr": lr,
+                "optimizer_name": optimizer_name,
+                "weight_decay": weight_decay,
+                "momentum": momentum,
+                "lr_sched": lr_sched,
+                "lr_sched_args": lr_sched_args,
+                "faiss_gpu": faiss_gpu,
+                "aggregator_config": self.AGGREGATOR_CONFIG,
+            }
+        )
+
+    def _load_aggregator_weights(self, aggregator: SALAD) -> None:
+        checkpoint = torch.load(self.AGGREGATOR_WEIGHTS, map_location="cpu")
+        state_dict = checkpoint.get("state_dict", checkpoint)
+        aggregator_state = {
+            key.removeprefix("aggregator."): value
+            for key, value in state_dict.items()
+            if key.startswith("aggregator.")
+        }
+        if not aggregator_state:
+            raise ValueError(
+                f"No aggregator-prefixed weights found in checkpoint: {self.AGGREGATOR_WEIGHTS}"
+            )
+        missing_keys, unexpected_keys = aggregator.load_state_dict(aggregator_state, strict=True)
+        if missing_keys or unexpected_keys:
+            raise ValueError(
+                f"Unexpected aggregator checkpoint load result: missing={missing_keys}, "
+                f"unexpected={unexpected_keys}"
+            )
+
+    def _loss_function(self, descriptors: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        if self.miner is not None:
+            miner_outputs = self.miner(descriptors, labels)
+            loss = self.loss_fn(descriptors, labels, miner_outputs)
+            num_samples = descriptors.shape[0]
+            mined_indices = miner_outputs[0].detach().cpu().tolist()
+            batch_acc = 1.0 - (len(set(mined_indices)) / num_samples if num_samples else 0.0)
+        else:
+            loss = self.loss_fn(descriptors, labels)
+            batch_acc = 0.0
+            if isinstance(loss, tuple):
+                loss, batch_acc = loss
+
+        self.batch_acc.append(float(batch_acc))
+        self.log(
+            "b_acc",
+            sum(self.batch_acc) / len(self.batch_acc),
+            prog_bar=True,
+            logger=True,
+            on_step=True,
+            on_epoch=False,
+        )
+        return loss
+
+    def forward(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
+        return self.vpr_model(x, **kwargs)
+
+    def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        del batch_idx
+        places, labels = batch
+        if places.ndim != 5:
+            raise ValueError(
+                f"Expected training batch places with shape [B, N, C, H, W], got {tuple(places.shape)}"
+            )
+
+        batch_size, num_views, channels, height, width = places.shape
+        images = places.reshape(batch_size * num_views, channels, height, width)
+        labels = labels.reshape(-1)
+
+        descriptors = self(images)
+        if torch.isnan(descriptors).any():
+            raise ValueError("NaNs in descriptors")
+
+        loss = self._loss_function(descriptors, labels)
+        self.log("loss", loss, logger=True, prog_bar=True, on_step=True, on_epoch=False)
+        return loss
+
+    def on_train_epoch_end(self) -> None:
+        self.batch_acc = []
+
+    def validation_step(
+        self,
+        batch: tuple[torch.Tensor, torch.Tensor],
+        batch_idx: int,
+        dataloader_idx: int | None = None,
+    ) -> torch.Tensor:
+        del batch_idx
+        places, _ = batch
+        if dataloader_idx is None:
+            dataloader_idx = 0
+
+        descriptors = self(places)
+        self.val_outputs[dataloader_idx].append(descriptors.detach().cpu())
+        return descriptors.detach().cpu()
+
+    def on_validation_epoch_start(self) -> None:
+        val_datasets = getattr(self.trainer.datamodule, "val_datasets", [])
+        self.val_outputs = [[] for _ in range(len(val_datasets))]
+
+    def on_validation_epoch_end(self) -> None:
+        dm = self.trainer.datamodule
+        val_step_outputs = self.val_outputs
+        if len(dm.val_datasets) == 1:
+            val_step_outputs = [val_step_outputs[0]]
+
+        for i, (val_set_name, val_dataset) in enumerate(zip(dm.val_set_names, dm.val_datasets)):
+            feats = torch.concat(val_step_outputs[i], dim=0)
+
+            if "pitts" in val_set_name:
+                num_references = val_dataset.dbStruct.numDb
+                positives = val_dataset.getPositives()
+            elif "msls" in val_set_name:
+                num_references = val_dataset.num_references
+                positives = val_dataset.pIdx
+            else:
+                raise NotImplementedError(
+                    f"Validation splitting is only implemented for Pitts/MSLS datasets, got {val_set_name}"
+                )
+
+            reference_descriptors = feats[:num_references]
+            query_descriptors = feats[num_references:]
+            recalls = salad_utils.get_validation_recalls(
+                r_list=reference_descriptors,
+                q_list=query_descriptors,
+                k_values=[1, 5, 10, 15, 20, 50, 100],
+                gt=positives,
+                print_results=True,
+                dataset_name=val_set_name,
+                faiss_gpu=self.faiss_gpu,
+            )
+
+            self.log(f"{val_set_name}/R1", recalls[1], prog_bar=False, logger=True)
+            self.log(f"{val_set_name}/R5", recalls[5], prog_bar=False, logger=True)
+            self.log(f"{val_set_name}/R10", recalls[10], prog_bar=False, logger=True)
+
+        print("\n\n")
+        self.val_outputs = []
 
     def configure_optimizers(self) -> Any:
-        raise NotImplementedError("Task 1 scaffold only; optimization is not implemented yet.")
+        trainable_parameters = [
+            parameter for parameter in self.vpr_model.aggregator.parameters() if parameter.requires_grad
+        ]
+        if not trainable_parameters:
+            raise ValueError("No trainable aggregator parameters found for optimization")
+
+        optimizer_name = self.optimizer_name.lower()
+        if optimizer_name == "sgd":
+            optimizer = torch.optim.SGD(
+                trainable_parameters,
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+                momentum=self.momentum,
+            )
+        elif optimizer_name == "adamw":
+            optimizer = torch.optim.AdamW(
+                trainable_parameters,
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+            )
+        elif optimizer_name == "adam":
+            optimizer = torch.optim.Adam(
+                trainable_parameters,
+                lr=self.lr,
+                weight_decay=self.weight_decay,
+            )
+        else:
+            raise ValueError(f"Unsupported optimizer: {self.optimizer_name}")
+
+        scheduler_name = self.lr_sched.lower()
+        if scheduler_name == "multistep":
+            scheduler = lr_scheduler.MultiStepLR(
+                optimizer,
+                milestones=self.lr_sched_args["milestones"],
+                gamma=self.lr_sched_args["gamma"],
+            )
+        elif scheduler_name == "cosine":
+            scheduler = lr_scheduler.CosineAnnealingLR(optimizer, self.lr_sched_args["T_max"])
+        elif scheduler_name == "linear":
+            scheduler = lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=self.lr_sched_args["start_factor"],
+                end_factor=self.lr_sched_args["end_factor"],
+                total_iters=self.lr_sched_args["total_iters"],
+            )
+        else:
+            raise ValueError(f"Unsupported lr scheduler: {self.lr_sched}")
+
+        return [optimizer], [scheduler]
+
+    def optimizer_step(
+        self,
+        epoch: int,
+        batch_idx: int,
+        optimizer: torch.optim.Optimizer,
+        optimizer_closure: Any,
+    ) -> None:
+        del epoch, batch_idx
+        optimizer.step(closure=optimizer_closure)
+        scheduler = self.lr_schedulers()
+        if scheduler is not None:
+            scheduler.step()
 
 
 def build_datamodule() -> GSVCitiesDataModule:
