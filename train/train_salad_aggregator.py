@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -20,18 +22,109 @@ from da3_streaming.loop_utils.salad import utils as salad_utils
 from dataloaders.GSVCitiesDataloader import GSVCitiesDataModule
 from depth_anything_3.api import DepthAnything3
 from depth_anything_3.model.VPRaggregators import SALAD
-from depth_anything_3.model.vpr_helper import load_aggregator_weights_from_salad_ckpt
 from depth_anything_3.model.vpr_model import VPRModel
 
 
+AGGREGATOR_STATE_PREFIXES = (
+    "aggregator.",
+    "model.aggregator.",
+    "module.aggregator.",
+)
+LAUNCH_COMMAND = (
+    "cd /home/chenguyuan/code/NeurIPS26/LoopAnything && "
+    "PYTHONPATH=src conda run -n da3 python train/train_salad_aggregator.py"
+)
+METRICS_TO_WATCH = (
+    "pitts30k_val/R1",
+    "pitts30k_val/R5",
+    "pitts30k_val/R10",
+    "pitts30k_test/R1",
+    "pitts30k_test/R5",
+    "pitts30k_test/R10",
+)
+PROXY_ENV_KEYS = (
+    "ALL_PROXY",
+    "all_proxy",
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+)
+_PROXY_ENV_SANITIZED = False
+
+
+def startup_log(message: str) -> None:
+    print(f"[startup] {message}", flush=True)
+
+
+def sanitize_unsupported_proxy_env_vars() -> None:
+    global _PROXY_ENV_SANITIZED
+    if _PROXY_ENV_SANITIZED:
+        return
+
+    removed_proxy_vars: list[tuple[str, str]] = []
+    for env_key in PROXY_ENV_KEYS:
+        env_value = os.environ.get(env_key)
+        if not env_value:
+            continue
+        scheme = env_value.split("://", 1)[0].lower()
+        if scheme == "socks":
+            removed_proxy_vars.append((env_key, env_value))
+            os.environ.pop(env_key, None)
+
+    if removed_proxy_vars:
+        formatted = ", ".join(f"{key}={value}" for key, value in removed_proxy_vars)
+        startup_log(
+            "Sanitized unsupported proxy env vars with socks:// scheme for httpx compatibility: "
+            f"{formatted}"
+        )
+        startup_log("Left all remaining proxy environment variables unchanged.")
+
+    _PROXY_ENV_SANITIZED = True
+
+
+def unwrap_checkpoint_state_dict(checkpoint: Any) -> Mapping[str, Any]:
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("Expected checkpoint to contain a mapping of parameters")
+    if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], Mapping):
+        return checkpoint["state_dict"]
+    if "model" in checkpoint and isinstance(checkpoint["model"], Mapping):
+        return checkpoint["model"]
+    return checkpoint
+
+
+def extract_prefixed_state_dict(
+    state_dict: Mapping[str, Any],
+    prefixes: tuple[str, ...] = AGGREGATOR_STATE_PREFIXES,
+) -> dict[str, Any]:
+    extracted: dict[str, Any] = {}
+    for key, value in state_dict.items():
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                extracted[key[len(prefix) :]] = value
+                break
+    return extracted
+
+
 class DA3Layer5CamTokenEncoder(nn.Module):
+    MODEL_NAME_OR_PATH = "depth-anything/DA3-BASE"
     PATCH_SIZE = 14
     AUX_LAYER = 5
     AUX_DIM = 768
 
     def __init__(self) -> None:
         super().__init__()
-        self.da3 = DepthAnything3.from_pretrained("depth-anything/DA3-BASE")
+        sanitize_unsupported_proxy_env_vars()
+        try:
+            da3_model = DepthAnything3.from_pretrained(self.MODEL_NAME_OR_PATH)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load DA3 model '{self.MODEL_NAME_OR_PATH}'. "
+                "Ensure the checkpoint is available and that proxy/network settings are valid."
+            ) from exc
+        if da3_model is None:
+            raise RuntimeError(f"DA3 model load returned None for '{self.MODEL_NAME_OR_PATH}'")
+        self.da3 = da3_model
         for parameter in self.da3.parameters():
             parameter.requires_grad = False
         self.da3.eval()
@@ -72,31 +165,37 @@ class DA3Layer5CamTokenEncoder(nn.Module):
                 export_feat_layers=[self.AUX_LAYER],
             )
 
-        assert len(aux_outputs) == 1, (
-            f"Expected one aux output for layer {self.AUX_LAYER}, got {len(aux_outputs)}"
-        )
+        assert (
+            len(aux_outputs) == 1
+        ), f"Expected one aux output for layer {self.AUX_LAYER}, got {len(aux_outputs)}"
         tokens = transformer.norm(aux_outputs[0])[:, 0]
-        assert tokens.ndim == 3, (
-            f"Expected normalized tokens with shape [B, T, C], got {tuple(tokens.shape)}"
-        )
-        assert tokens.shape[0] == batch_size, f"Expected batch size {batch_size}, got {tokens.shape[0]}"
-        assert tokens.shape[-1] == self.AUX_DIM, (
-            f"Expected aux token dim {self.AUX_DIM}, got {tokens.shape[-1]}"
-        )
+        assert (
+            tokens.ndim == 3
+        ), f"Expected normalized tokens with shape [B, T, C], got {tuple(tokens.shape)}"
+        assert (
+            tokens.shape[0] == batch_size
+        ), f"Expected batch size {batch_size}, got {tokens.shape[0]}"
+        assert (
+            tokens.shape[-1] == self.AUX_DIM
+        ), f"Expected aux token dim {self.AUX_DIM}, got {tokens.shape[-1]}"
 
         global_token = tokens[:, 0]
         patch_tokens = tokens[:, 1:]
-        assert patch_tokens.shape[1] == hp * wp, (
-            f"Expected {hp * wp} patch tokens from spatial shape {(hp, wp)}, got {patch_tokens.shape[1]}"
-        )
+        assert (
+            patch_tokens.shape[1] == hp * wp
+        ), f"Expected {hp * wp} patch tokens from spatial shape {(hp, wp)}, got {patch_tokens.shape[1]}"
 
         feature_map = patch_tokens.transpose(1, 2).reshape(batch_size, self.AUX_DIM, hp, wp)
-        assert feature_map.shape == (batch_size, self.AUX_DIM, hp, wp), (
-            f"Unexpected feature map shape {tuple(feature_map.shape)}"
-        )
-        assert global_token.shape == (batch_size, self.AUX_DIM), (
-            f"Unexpected global token shape {tuple(global_token.shape)}"
-        )
+        assert feature_map.shape == (
+            batch_size,
+            self.AUX_DIM,
+            hp,
+            wp,
+        ), f"Unexpected feature map shape {tuple(feature_map.shape)}"
+        assert global_token.shape == (
+            batch_size,
+            self.AUX_DIM,
+        ), f"Unexpected global token shape {tuple(global_token.shape)}"
 
         if not torch.isfinite(tokens).all():
             raise ValueError("Non-finite normalized DA3 aux tokens")
@@ -123,7 +222,12 @@ class DA3SALADLightningModule(pl.LightningModule):
         "token_dim": 32,
     }
     AGGREGATOR_WEIGHTS = (
-        PROJECT_ROOT / "da3_streaming" / "loop_utils" / "salad" / "weights" / "dino_salad_512_32.ckpt"
+        PROJECT_ROOT
+        / "da3_streaming"
+        / "loop_utils"
+        / "salad"
+        / "weights"
+        / "dino_salad_512_32.ckpt"
     )
 
     def __init__(
@@ -164,6 +268,8 @@ class DA3SALADLightningModule(pl.LightningModule):
         self.miner = salad_utils.get_miner("MultiSimilarityMiner", 0.1)
         self.batch_acc: list[float] = []
         self.val_outputs: list[list[torch.Tensor]] = []
+        self._validate_startup_state()
+        self._print_startup_diagnostics()
 
         self.save_hyperparameters(
             {
@@ -182,11 +288,80 @@ class DA3SALADLightningModule(pl.LightningModule):
         )
 
     def _load_aggregator_weights(self, aggregator: SALAD) -> None:
-        load_aggregator_weights_from_salad_ckpt(
-            aggregator,
-            self.AGGREGATOR_WEIGHTS,
-            strict=True,
+        if not self.AGGREGATOR_WEIGHTS.is_file():
+            raise FileNotFoundError(
+                f"Missing SALAD checkpoint at {self.AGGREGATOR_WEIGHTS}. "
+                "Expected local pretrained SALAD weights before training startup."
+            )
+        try:
+            checkpoint = torch.load(self.AGGREGATOR_WEIGHTS, map_location="cpu")
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load SALAD checkpoint from {self.AGGREGATOR_WEIGHTS}"
+            ) from exc
+
+        state_dict = unwrap_checkpoint_state_dict(checkpoint)
+        aggregator_state_dict = extract_prefixed_state_dict(state_dict)
+        if not aggregator_state_dict:
+            raise ValueError(
+                f"No aggregator-prefixed weights found in SALAD checkpoint: "
+                f"{self.AGGREGATOR_WEIGHTS}"
+            )
+
+        try:
+            aggregator.load_state_dict(aggregator_state_dict, strict=True)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Failed to load aggregator weights from {self.AGGREGATOR_WEIGHTS}"
+            ) from exc
+
+    def _named_trainable_parameters(self) -> list[tuple[str, nn.Parameter]]:
+        return [
+            (name, parameter)
+            for name, parameter in self.named_parameters()
+            if parameter.requires_grad
+        ]
+
+    def _validate_startup_state(self) -> None:
+        trainable_parameters = self._named_trainable_parameters()
+        if not trainable_parameters:
+            raise ValueError(
+                "Empty trainable-parameter list: expected SALAD aggregator parameters to remain trainable."
+            )
+
+        non_aggregator_trainable = [
+            name
+            for name, _ in trainable_parameters
+            if not name.startswith("vpr_model.aggregator.")
+        ]
+        if non_aggregator_trainable:
+            preview = ", ".join(non_aggregator_trainable[:5])
+            raise ValueError(
+                "Only the aggregator should be trainable, but found non-aggregator "
+                f"trainable parameters: {preview}"
+            )
+
+    def _print_startup_diagnostics(self) -> None:
+        total_parameters = sum(parameter.numel() for parameter in self.parameters())
+        trainable_parameters = sum(
+            parameter.numel() for _, parameter in self._named_trainable_parameters()
         )
+        startup_log(
+            "DA3 feature contract: aux layer "
+            f"{DA3Layer5CamTokenEncoder.AUX_LAYER}, "
+            f"{DA3Layer5CamTokenEncoder.AUX_DIM}-dim, cam_token"
+        )
+        startup_log(f"Total parameters: {total_parameters:,}")
+        startup_log(f"Trainable parameters: {trainable_parameters:,}")
+        startup_log("Trainable summary: only the SALAD aggregator is trainable; DA3 stays frozen.")
+        startup_log(f"SALAD checkpoint: {self.AGGREGATOR_WEIGHTS}")
+
+    @staticmethod
+    def _ensure_finite_descriptors(descriptors: torch.Tensor, stage: str) -> None:
+        if not torch.isfinite(descriptors).all():
+            raise ValueError(
+                f"Non-finite descriptors detected during {stage} with shape {tuple(descriptors.shape)}"
+            )
 
     def _loss_function(self, descriptors: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         if self.miner is not None:
@@ -215,7 +390,9 @@ class DA3SALADLightningModule(pl.LightningModule):
     def forward(self, x: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         return self.vpr_model(x, **kwargs)
 
-    def training_step(self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
+    def training_step(
+        self, batch: tuple[torch.Tensor, torch.Tensor], batch_idx: int
+    ) -> torch.Tensor:
         del batch_idx
         places, labels = batch
         if places.ndim != 5:
@@ -228,8 +405,7 @@ class DA3SALADLightningModule(pl.LightningModule):
         labels = labels.reshape(-1)
 
         descriptors = self(images)
-        if torch.isnan(descriptors).any():
-            raise ValueError("NaNs in descriptors")
+        self._ensure_finite_descriptors(descriptors, "training")
 
         loss = self._loss_function(descriptors, labels)
         self.log("loss", loss, logger=True, prog_bar=True, on_step=True, on_epoch=False)
@@ -250,6 +426,7 @@ class DA3SALADLightningModule(pl.LightningModule):
             dataloader_idx = 0
 
         descriptors = self(places)
+        self._ensure_finite_descriptors(descriptors, f"validation dataloader {dataloader_idx}")
         self.val_outputs[dataloader_idx].append(descriptors.detach().cpu())
         return descriptors.detach().cpu()
 
@@ -298,7 +475,9 @@ class DA3SALADLightningModule(pl.LightningModule):
 
     def configure_optimizers(self) -> Any:
         trainable_parameters = [
-            parameter for parameter in self.vpr_model.aggregator.parameters() if parameter.requires_grad
+            parameter
+            for parameter in self.vpr_model.aggregator.parameters()
+            if parameter.requires_grad
         ]
         if not trainable_parameters:
             raise ValueError("No trainable aggregator parameters found for optimization")
@@ -379,7 +558,7 @@ def build_datamodule() -> GSVCitiesDataModule:
     )
 
 
-def build_trainer(model: pl.LightningModule) -> pl.Trainer:
+def build_trainer(model: DA3SALADLightningModule) -> pl.Trainer:
     checkpoint_cb = pl.callbacks.ModelCheckpoint(
         monitor="pitts30k_val/R1",
         filename=(
@@ -409,9 +588,24 @@ def build_trainer(model: pl.LightningModule) -> pl.Trainer:
 
 
 def main() -> None:
-    raise SystemExit(
-        "Task 1 scaffold only: train/train_salad_aggregator.py is import-safe, but execution is not implemented yet."
+    startup_log(f"Launch command: {LAUNCH_COMMAND}")
+    startup_log(f"Validation metrics to watch: {', '.join(METRICS_TO_WATCH)}")
+
+    datamodule = build_datamodule()
+    startup_log(
+        "Datamodule ready: "
+        f"{datamodule.__class__.__name__} with validation sets {datamodule.val_set_names}"
     )
+
+    model = DA3SALADLightningModule()
+    trainer = build_trainer(model)
+    startup_log(
+        "Trainer ready: "
+        f"accelerator={trainer.accelerator.__class__.__name__}, "
+        f"devices={trainer.num_devices}, precision={trainer.precision}"
+    )
+    startup_log("Starting trainer.fit(...)")
+    trainer.fit(model=model, datamodule=datamodule)
 
 
 if __name__ == "__main__":
