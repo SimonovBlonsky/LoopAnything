@@ -366,11 +366,46 @@ class DA3SALADLightningModule(pl.LightningModule):
 
 
 def build_datamodule() -> GSVCitiesDataModule:
-    raise NotImplementedError("Task 1 scaffold only; datamodule wiring is not implemented yet.")
+    return GSVCitiesDataModule(
+        batch_size=60,
+        img_per_place=4,
+        min_img_per_place=4,
+        shuffle_all=False,
+        random_sample_from_each_place=True,
+        image_size=(224, 224),
+        num_workers=10,
+        show_data_stats=True,
+        val_set_names=["pitts30k_val", "pitts30k_test"],
+    )
 
 
 def build_trainer(model: pl.LightningModule) -> pl.Trainer:
-    raise NotImplementedError("Task 1 scaffold only; trainer wiring is not implemented yet.")
+    checkpoint_cb = pl.callbacks.ModelCheckpoint(
+        monitor="pitts30k_val/R1",
+        filename=(
+            f"{model.encoder_arch}" + "_({epoch:02d})_R1[{pitts30k_val/R1:.4f}]"
+            "_R5[{pitts30k_val/R5:.4f}]"
+        ),
+        auto_insert_metric_name=False,
+        save_weights_only=True,
+        save_top_k=3,
+        save_last=True,
+        mode="max",
+    )
+
+    return pl.Trainer(
+        accelerator="gpu",
+        devices=1,
+        default_root_dir="./logs/",
+        num_nodes=1,
+        num_sanity_val_steps=0,
+        precision="16-mixed",
+        max_epochs=4,
+        check_val_every_n_epoch=1,
+        callbacks=[checkpoint_cb],
+        reload_dataloaders_every_n_epochs=1,
+        log_every_n_steps=20,
+    )
 
 
 def main() -> None:
