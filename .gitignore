@@ -41,3 +41,4 @@ docs/superpowers
 tests/
 log*.md
 logs/
+.worktrees/
