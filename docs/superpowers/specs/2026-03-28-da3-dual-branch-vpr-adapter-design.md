@@ -150,6 +150,14 @@ Input:
 - original `global_token`
 - global average pooled adapted local map
 
+Canonical token contract for this experiment:
+
+- `global_token` must be taken explicitly from the normalized layer-5 auxiliary token sequence as `tokens[:, 0]`
+- `patch_tokens` must be taken from `tokens[:, 1:]`
+- this experiment must not use `patch_tokens.mean(dim=1)` as the canonical layer-5 global token
+
+This is required for reproducibility and comparability with the previous `train_salad_aggregator.py` DA3 layer-5 baseline. If the generic DA3 aux retrieval path currently synthesizes the token by averaging patches, the adapter experiment should introduce or reuse a retrieval path that exposes the explicit auxiliary token instead.
+
 The branch should concatenate these two signals and learn a token correction.
 
 Recommended structure:
@@ -248,9 +256,23 @@ The first default run should be:
   - aggregator
 - frozen modules:
   - full DA3 backbone
+- seeds:
+  - `0`
+  - `1`
+  - `2`
+- batch size:
+  - `60`
+- images per place:
+  - `4`
+- max epochs:
+  - `4`
+- validation cadence:
+  - every epoch
+- checkpoint selection metric:
+  - `pitts30k_val/R1`
 
 ### 2. Optimization
-Recommended defaults:
+Required defaults:
 
 - optimizer: `AdamW`
 - adapter learning rate: `1e-4`
@@ -261,8 +283,10 @@ Recommended defaults:
   - `start_factor=1.0`
   - `end_factor=0.2`
   - `total_iters=4000`
+- precision:
+  - mixed precision, matching the current training pipeline
 
-If per-module learning rates are inconvenient in the first implementation, a single shared learning rate may be used initially, but separate parameter groups are preferred.
+The adapter and aggregator should use separate optimizer parameter groups. This is part of the experiment definition, not an optional simplification.
 
 ### 3. Initialization
 Recommended adapter initialization:
@@ -286,8 +310,7 @@ The new training script should expose at least:
 - `--agg-cluster-dim`
 - `--agg-token-dim`
 - `--aggregator-ckpt-path`
-- `--train-aggregator-only`
-- `--train-adapter-only`
+- `--seed`
 
 The script should print startup diagnostics including:
 
@@ -314,40 +337,71 @@ The main model-selection metric should remain:
 
 - `pitts30k_val/R1`
 
+`pitts30k_test` may still be evaluated every epoch for monitoring, but:
+
+- it must never be used for checkpoint selection
+- it must never override `pitts30k_val/R1` as the model-selection criterion
+- all headline test numbers must come from the checkpoint selected by `pitts30k_val/R1`
+
 ## Ablations
 The following experiment table is recommended.
 
 ### Core Ablations
 1. `DA3 layer-5 + SALAD`
    - no adapter
+   - SALAD warm start
 
-2. `DA3 layer-5 + Patch-Only Adapter + SALAD`
-   - local branch only
-
-3. `DA3 layer-5 + Dual-Branch Adapter + SALAD`
+2. `DA3 layer-5 + Dual-Branch Adapter + SALAD`
    - recommended main experiment
+   - SALAD warm start
 
-4. `DA3 layer-5 + Dual-Branch Adapter + SALAD (no SALAD warm start)`
-   - tests how much gain comes specifically from the adapter versus pretrained SALAD initialization
+3. `DA3 layer-5 + SALAD`
+   - no adapter
+   - no SALAD warm start
+
+4. `DA3 layer-5 + Dual-Branch Adapter + SALAD`
+   - no SALAD warm start
+
+This pair of controls is required to separate:
+
+- adapter gain
+- SALAD warm-start gain
+
+5. `DA3 layer-5 + Patch-Only Adapter + SALAD`
+   - local branch only
+   - SALAD warm start
+   - must be approximately parameter-matched to the dual-branch adapter, within `+/-10%` trainable adapter parameters
 
 ### Optional Token Ablations
-5. `Dual-Branch Adapter` with global branch using only original `global_token`
-6. `Dual-Branch Adapter` with global branch using `concat(global_token, pooled_local)`
+6. `Dual-Branch Adapter` with global branch using only original `global_token`
+7. `Dual-Branch Adapter` with global branch using `concat(global_token, pooled_local)`
 
 The second of these should be treated as the recommended default.
 
 ## Success Criteria
-The experiment should be considered successful if it shows a meaningful improvement over:
+Primary success criterion:
 
-- the current `DA3 layer-5 + SALAD` frozen-backbone baseline
+- the arithmetic mean `Recall@1` across fixed seeds `{0, 1, 2}` must exceed `90.74`
 
-without:
+This threshold is a hard experiment gate, not a qualitative aspiration.
 
-- unfreezing DA3
-- changing the backbone feature source
-- changing the SALAD architecture itself
+For each seed:
 
-The main empirical question is whether this adapter closes a substantial portion of the frozen-protocol gap while preserving the unified DA3 trunk.
+- train with identical protocol
+- select the checkpoint using `pitts30k_val/R1`
+- report the corresponding held-out `Recall@1`
+
+Required reporting:
+
+- per-seed `Recall@1`
+- mean `Recall@1`
+- standard deviation across the three seeds
+
+Secondary comparison metrics:
+
+- delta versus the current `DA3 layer-5 + SALAD` frozen-backbone baseline
+- delta between warm-start and no-warm-start conditions
+- delta between patch-only and dual-branch adapters
 
 ## Error Handling
 The new training path should fail early for:
