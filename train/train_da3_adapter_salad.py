@@ -9,7 +9,7 @@ from typing import Any
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 SALAD_ROOT = PROJECT_ROOT / "da3_streaming" / "loop_utils" / "salad"
-for path in (PROJECT_ROOT, SRC_ROOT):
+for path in (PROJECT_ROOT, SRC_ROOT, SALAD_ROOT):
     if path.exists() and str(path) not in sys.path:
         sys.path.insert(0, str(path))
 

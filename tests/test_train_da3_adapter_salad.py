@@ -16,6 +16,16 @@ def import_trainer_module():
     return importlib.import_module("train.train_da3_adapter_salad")
 
 
+def test_import_adds_salad_root_to_sys_path_for_legacy_salad_absolute_imports():
+    project_root = Path(__file__).resolve().parents[1]
+    salad_root = project_root / "da3_streaming" / "loop_utils" / "salad"
+    sys.path[:] = [path for path in sys.path if path != str(salad_root)]
+
+    trainer_module = import_trainer_module()
+
+    assert str(trainer_module.SALAD_ROOT) in sys.path
+
+
 class TinyEncoder(torch.nn.Module):
     def __init__(self, requires_grad=True):
         super().__init__()
