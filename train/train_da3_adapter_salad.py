@@ -116,6 +116,20 @@ def _validate_local_aggregator_ckpt_path(path: str | None) -> str | None:
     )
 
 
+def _is_default_aggregator_shape(args) -> bool:
+    return (
+        args.agg_num_clusters == DEFAULT_AGGREGATOR_CONFIG["num_clusters"]
+        and args.agg_cluster_dim == DEFAULT_AGGREGATOR_CONFIG["cluster_dim"]
+        and args.agg_token_dim == DEFAULT_AGGREGATOR_CONFIG["token_dim"]
+    )
+
+
+def _is_pinned_default_aggregator_ckpt_path(path: str | None) -> bool:
+    if path is None:
+        return False
+    return Path(path).resolve(strict=False) == DEFAULT_AGGREGATOR_CKPT_PATH.resolve(strict=False)
+
+
 def _count_parameters(module: nn.Module, *, trainable_only: bool = False) -> int:
     parameters = module.parameters()
     if trainable_only:
@@ -349,6 +363,15 @@ class DA3AdapterSALADLightningModule(pl.LightningModule):
         self.aggregator_ckpt_path = _validate_local_aggregator_ckpt_path(
             _normalize_aggregator_ckpt_path(args.aggregator_ckpt_path)
         )
+        if not _is_default_aggregator_shape(args) and _is_pinned_default_aggregator_ckpt_path(
+            self.aggregator_ckpt_path
+        ):
+            raise ValueError(
+                "Non-default SALAD aggregator shapes are not compatible with the pinned default "
+                f"warm-start checkpoint at {DEFAULT_AGGREGATOR_CKPT_PATH}. Provide a compatible "
+                "checkpoint for the overridden aggregator shape or disable warm-start with "
+                "--aggregator-ckpt-path none / an empty string."
+            )
 
         self.vpr_model = build_vpr_model(
             da3_model_name_or_path=self.da3_model_name_or_path,

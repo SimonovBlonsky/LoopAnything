@@ -267,6 +267,37 @@ def test_parse_args_supports_disabling_aggregator_warm_start(monkeypatch):
     assert calls["aggregator_ckpt_path"] is None
 
 
+def test_default_aggregator_shape_keeps_default_warm_start_enabled(monkeypatch, tmp_path):
+    trainer_module = import_trainer_module()
+    expected_ckpt_path = set_existing_default_checkpoint(monkeypatch, trainer_module, tmp_path)
+    calls, _ = patch_model_construction(monkeypatch, trainer_module)
+
+    module = trainer_module.DA3AdapterSALADLightningModule(args=trainer_module.parse_args([]))
+
+    assert module is not None
+    assert calls["aggregator_ckpt_path"] == str(expected_ckpt_path)
+
+
+def test_non_default_aggregator_shape_rejects_default_warm_start(monkeypatch, tmp_path):
+    trainer_module = import_trainer_module()
+    set_existing_default_checkpoint(monkeypatch, trainer_module, tmp_path)
+    patch_model_construction(monkeypatch, trainer_module)
+
+    with pytest.raises(ValueError, match="compatible checkpoint"):
+        trainer_module.DA3AdapterSALADLightningModule(
+            args=trainer_module.parse_args(
+                [
+                    "--agg-num-clusters",
+                    "24",
+                    "--agg-cluster-dim",
+                    "48",
+                    "--agg-token-dim",
+                    "64",
+                ]
+            )
+        )
+
+
 def test_default_local_warm_start_requires_explicit_local_checkpoint(monkeypatch, tmp_path):
     trainer_module = import_trainer_module()
     missing_local_ckpt = tmp_path / "missing_dino_salad_512_32.ckpt"
@@ -390,7 +421,9 @@ def test_patch_only_default_build_vpr_model_config_uses_pinned_640_bottleneck(mo
     assert calls["feature_adapter_config"] == {"bottleneck": 640}
 
 
-def test_build_vpr_model_receives_overridden_salad_shape_config(monkeypatch, tmp_path):
+def test_build_vpr_model_receives_overridden_salad_shape_config_without_warm_start(
+    monkeypatch, tmp_path
+):
     trainer_module = import_trainer_module()
     set_existing_default_checkpoint(monkeypatch, trainer_module, tmp_path)
     calls, _ = patch_model_construction(monkeypatch, trainer_module)
@@ -404,6 +437,8 @@ def test_build_vpr_model_receives_overridden_salad_shape_config(monkeypatch, tmp
                 "48",
                 "--agg-token-dim",
                 "64",
+                "--aggregator-ckpt-path",
+                "none",
             ]
         )
     )
@@ -412,6 +447,7 @@ def test_build_vpr_model_receives_overridden_salad_shape_config(monkeypatch, tmp
     assert calls["agg_config"]["num_clusters"] == 24
     assert calls["agg_config"]["cluster_dim"] == 48
     assert calls["agg_config"]["token_dim"] == 64
+    assert calls["aggregator_ckpt_path"] is None
 
 
 def test_build_datamodule_uses_package_qualified_import_path(monkeypatch):
