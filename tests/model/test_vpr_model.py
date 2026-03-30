@@ -84,6 +84,22 @@ def test_vpr_model_routes_features_through_feature_adapter_before_aggregation():
     assert torch.equal(aggregator.last_input, original_features["feature_map"] + 5)
 
 
+def test_salad_routing_uses_adapter_mutated_feature_map_and_global_token():
+    aggregator = RecordingAggregator()
+    adapter = RecordingFeatureAdapter()
+    model = VPRModel(encoder=StubEncoder(), aggregator=aggregator, agg_arch="SALAD", feature_adapter=adapter)
+
+    input_tensor = torch.randn(2, 3, 28, 28)
+    original_features = model.encoder(input_tensor)
+
+    model(input_tensor)
+
+    assert isinstance(aggregator.last_input, tuple)
+    feature_map, global_token = aggregator.last_input
+    assert torch.equal(feature_map, original_features["feature_map"] + 5)
+    assert torch.equal(global_token, original_features["global_token"] + 7)
+
+
 def test_return_features_returns_adapted_feature_dict():
     aggregator = RecordingAggregator()
     adapter = PatchOnlyFeatureAdapter(channels=8, bottleneck=4)
