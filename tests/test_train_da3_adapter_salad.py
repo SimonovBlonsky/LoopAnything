@@ -92,6 +92,9 @@ def test_parse_args_defaults_match_dual_branch_protocol():
     assert args.adapter_local_bottleneck == 256
     assert args.adapter_global_hidden_dim == 256
     assert args.agg_arch == "salad"
+    assert args.agg_num_clusters == 16
+    assert args.agg_cluster_dim == 32
+    assert args.agg_token_dim == 32
     assert args.aggregator_ckpt_path == str(trainer_module.DEFAULT_AGGREGATOR_CKPT_PATH)
 
 
@@ -385,6 +388,30 @@ def test_patch_only_default_build_vpr_model_config_uses_pinned_640_bottleneck(mo
 
     assert calls["feature_adapter_arch"] == "patch_only"
     assert calls["feature_adapter_config"] == {"bottleneck": 640}
+
+
+def test_build_vpr_model_receives_overridden_salad_shape_config(monkeypatch, tmp_path):
+    trainer_module = import_trainer_module()
+    set_existing_default_checkpoint(monkeypatch, trainer_module, tmp_path)
+    calls, _ = patch_model_construction(monkeypatch, trainer_module)
+
+    trainer_module.DA3AdapterSALADLightningModule(
+        args=trainer_module.parse_args(
+            [
+                "--agg-num-clusters",
+                "24",
+                "--agg-cluster-dim",
+                "48",
+                "--agg-token-dim",
+                "64",
+            ]
+        )
+    )
+
+    assert calls["agg_config"]["num_channels"] == 768
+    assert calls["agg_config"]["num_clusters"] == 24
+    assert calls["agg_config"]["cluster_dim"] == 48
+    assert calls["agg_config"]["token_dim"] == 64
 
 
 def test_build_datamodule_uses_package_qualified_import_path(monkeypatch):

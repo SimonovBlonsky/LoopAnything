@@ -219,6 +219,24 @@ def parse_args(argv=None):
         help="VPR aggregator architecture.",
     )
     parser.add_argument(
+        "--agg-num-clusters",
+        type=int,
+        default=DEFAULT_AGGREGATOR_CONFIG["num_clusters"],
+        help="SALAD aggregator number of clusters.",
+    )
+    parser.add_argument(
+        "--agg-cluster-dim",
+        type=int,
+        default=DEFAULT_AGGREGATOR_CONFIG["cluster_dim"],
+        help="SALAD aggregator cluster embedding dimension.",
+    )
+    parser.add_argument(
+        "--agg-token-dim",
+        type=int,
+        default=DEFAULT_AGGREGATOR_CONFIG["token_dim"],
+        help="SALAD aggregator token embedding dimension.",
+    )
+    parser.add_argument(
         "--aggregator-ckpt-path",
         type=str,
         default=str(DEFAULT_AGGREGATOR_CKPT_PATH),
@@ -321,6 +339,13 @@ class DA3AdapterSALADLightningModule(pl.LightningModule):
         self.adapter_global_hidden_dim = args.adapter_global_hidden_dim
         self.agg_arch = args.agg_arch.lower()
         self.agg_config = dict(DEFAULT_AGGREGATOR_CONFIG)
+        self.agg_config.update(
+            {
+                "num_clusters": args.agg_num_clusters,
+                "cluster_dim": args.agg_cluster_dim,
+                "token_dim": args.agg_token_dim,
+            }
+        )
         self.aggregator_ckpt_path = _validate_local_aggregator_ckpt_path(
             _normalize_aggregator_ckpt_path(args.aggregator_ckpt_path)
         )
