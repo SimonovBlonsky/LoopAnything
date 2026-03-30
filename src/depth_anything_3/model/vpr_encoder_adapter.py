@@ -189,11 +189,24 @@ class DA3EncoderAdapter(nn.Module):
                 raise ValueError("Malformed/incompatible AUX features returned by the backbone")
         return self._combine_aux_token_list(patch_tokens_list)
 
+    def _resolve_aux_transformer(self, da3_net):
+        backbone = getattr(da3_net, "backbone", None)
+        if backbone is None:
+            return None
+        if hasattr(backbone, "_get_intermediate_layers_not_chunked") and hasattr(backbone, "norm"):
+            return backbone
+        pretrained = getattr(backbone, "pretrained", None)
+        if (
+            pretrained is not None
+            and hasattr(pretrained, "_get_intermediate_layers_not_chunked")
+            and hasattr(pretrained, "norm")
+        ):
+            return pretrained
+        return None
+
     def _extract_aux_tokens_with_cls(self, da3_net, x, requested_aux_layers):
-        transformer = getattr(da3_net, "backbone", None)
+        transformer = self._resolve_aux_transformer(da3_net)
         if transformer is None:
-            raise ValueError("cls_token mode requires access to the underlying transformer backbone")
-        if not hasattr(transformer, "_get_intermediate_layers_not_chunked") or not hasattr(transformer, "norm"):
             raise ValueError("cls_token mode requires access to the underlying transformer backbone")
 
         _, aux_outputs = transformer._get_intermediate_layers_not_chunked(

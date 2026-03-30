@@ -45,6 +45,15 @@ class StubClsTokenBackbone(torch.nn.Module):
         return self.normalized_tokens
 
 
+class StubBackboneWithPretrained(torch.nn.Module):
+    def __init__(self, pretrained):
+        super().__init__()
+        self.pretrained = pretrained
+
+    def forward(self, x, **kwargs):
+        raise AssertionError("cls_token mode must resolve backbone.pretrained directly")
+
+
 class StubMalformedBackbone(torch.nn.Module):
     def __init__(self, feat):
         super().__init__()
@@ -143,8 +152,9 @@ def test_aux_cls_token_mode_uses_normalized_cls_token():
         dtype=torch.float32,
     )
     normalized_tokens = raw_tokens + 100.0
+    transformer = StubClsTokenBackbone(raw_tokens=raw_tokens, normalized_tokens=normalized_tokens)
     model = StubDA3Wrapper(StubDA3Net(feat))
-    model.model.backbone = StubClsTokenBackbone(raw_tokens=raw_tokens, normalized_tokens=normalized_tokens)
+    model.model.backbone = StubBackboneWithPretrained(transformer)
     adapter = DA3EncoderAdapter(
         model,
         patch_size=2,
@@ -155,10 +165,10 @@ def test_aux_cls_token_mode_uses_normalized_cls_token():
 
     out = adapter(torch.randn(1, 3, 4, 4))
 
-    assert len(model.model.backbone.intermediate_calls) == 1
-    assert len(model.model.backbone.norm_calls) == 1
-    assert model.model.backbone.intermediate_calls[0]["export_feat_layers"] == [3]
-    assert torch.allclose(model.model.backbone.norm_calls[0], raw_tokens)
+    assert len(transformer.intermediate_calls) == 1
+    assert len(transformer.norm_calls) == 1
+    assert transformer.intermediate_calls[0]["export_feat_layers"] == [3]
+    assert torch.allclose(transformer.norm_calls[0], raw_tokens)
     assert torch.allclose(out["global_token"], normalized_tokens[:, 0])
     assert torch.allclose(out["patch_tokens"], normalized_tokens[:, 1:])
     assert out["feature_map"].shape == (1, 2, 2, 2)
