@@ -7,11 +7,9 @@ from pathlib import Path
 from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SOURCE_REPO_ROOT = PROJECT_ROOT.parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 SALAD_ROOT = PROJECT_ROOT / "da3_streaming" / "loop_utils" / "salad"
-SOURCE_SALAD_ROOT = SOURCE_REPO_ROOT / "da3_streaming" / "loop_utils" / "salad"
-for path in (PROJECT_ROOT, SRC_ROOT, SOURCE_REPO_ROOT, SALAD_ROOT, SOURCE_SALAD_ROOT):
+for path in (PROJECT_ROOT, SRC_ROOT):
     if path.exists() and str(path) not in sys.path:
         sys.path.insert(0, str(path))
 
@@ -20,17 +18,10 @@ import torch
 import torch.nn as nn
 from torch.optim import lr_scheduler
 
-from da3_streaming.loop_utils.salad import utils as salad_utils
 from depth_anything_3.model.vpr_helper import build_vpr_model
 
 
-WORKTREE_AGGREGATOR_CKPT_PATH = SALAD_ROOT / "weights" / "dino_salad_512_32.ckpt"
-SOURCE_AGGREGATOR_CKPT_PATH = SOURCE_SALAD_ROOT / "weights" / "dino_salad_512_32.ckpt"
-DEFAULT_AGGREGATOR_CKPT_PATH = (
-    WORKTREE_AGGREGATOR_CKPT_PATH
-    if WORKTREE_AGGREGATOR_CKPT_PATH.is_file()
-    else SOURCE_AGGREGATOR_CKPT_PATH
-)
+DEFAULT_AGGREGATOR_CKPT_PATH = SALAD_ROOT / "weights" / "dino_salad_512_32.ckpt"
 DEFAULT_AGGREGATOR_CONFIG = {
     "num_channels": 768,
     "num_clusters": 16,
@@ -38,6 +29,20 @@ DEFAULT_AGGREGATOR_CONFIG = {
     "token_dim": 32,
 }
 DEFAULT_VAL_SET_NAMES = ["pitts30k_val", "pitts30k_test"]
+PROTOCOL_SEEDS = (0, 1, 2)
+PINNED_ADAPTER_LR = 1e-4
+PINNED_AGGREGATOR_LR = 6e-5
+PINNED_BATCH_SIZE = 60
+PINNED_IMG_PER_PLACE = 4
+PINNED_MIN_IMG_PER_PLACE = 4
+PINNED_IMAGE_SIZE = (224, 224)
+PINNED_NUM_WORKERS = 10
+PINNED_PRECISION = "16-mixed"
+PINNED_MAX_EPOCHS = 4
+PINNED_CHECK_VAL_EVERY_N_EPOCH = 1
+PINNED_NUM_SANITY_VAL_STEPS = 0
+PINNED_SAVE_TOP_K = 3
+PINNED_SAVE_LAST = True
 METRICS_TO_WATCH = (
     "pitts30k_val/R1",
     "pitts30k_val/R5",
@@ -56,6 +61,7 @@ PROXY_ENV_KEYS = (
 )
 _PROXY_ENV_SANITIZED = False
 GSVCitiesDataModule = None
+salad_utils = None
 
 
 def startup_log(message: str) -> None:
@@ -97,6 +103,18 @@ def _normalize_aggregator_ckpt_path(path: str | None) -> str | None:
     return normalized
 
 
+def _validate_local_aggregator_ckpt_path(path: str | None) -> str | None:
+    if path is None:
+        return None
+    checkpoint_path = Path(path)
+    if checkpoint_path.is_file():
+        return str(checkpoint_path)
+    raise FileNotFoundError(
+        f"Missing local SALAD warm-start checkpoint at {checkpoint_path}. "
+        "Provide a local --aggregator-ckpt-path or pass --aggregator-ckpt-path none to disable warm start."
+    )
+
+
 def _count_parameters(module: nn.Module, *, trainable_only: bool = False) -> int:
     parameters = module.parameters()
     if trainable_only:
@@ -107,10 +125,30 @@ def _count_parameters(module: nn.Module, *, trainable_only: bool = False) -> int
 def _get_gsvcities_datamodule():
     global GSVCitiesDataModule
     if GSVCitiesDataModule is None:
-        from dataloaders.GSVCitiesDataloader import GSVCitiesDataModule as _GSVCitiesDataModule
+        try:
+            from dataloaders.GSVCitiesDataloader import GSVCitiesDataModule as _GSVCitiesDataModule
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to import GSVCitiesDataModule from the active worktree SALAD path at {SALAD_ROOT}. "
+                "Ensure the worktree-local SALAD checkout is available."
+            ) from exc
 
         GSVCitiesDataModule = _GSVCitiesDataModule
     return GSVCitiesDataModule
+
+
+def _get_salad_utils():
+    global salad_utils
+    if salad_utils is None:
+        try:
+            from da3_streaming.loop_utils.salad import utils as _salad_utils
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to import SALAD utilities from the active worktree path at {SALAD_ROOT}. "
+                "Ensure the worktree-local SALAD checkout is available."
+            ) from exc
+        salad_utils = _salad_utils
+    return salad_utils
 
 
 def parse_args(argv=None):
@@ -118,7 +156,13 @@ def parse_args(argv=None):
         description="Train a dual-branch DA3 feature adapter with a SALAD aggregator.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--seed", type=int, default=7, help="Random seed for trainer startup.")
+    parser.add_argument(
+        "--seed",
+        type=int,
+        choices=list(PROTOCOL_SEEDS),
+        default=0,
+        help="Pinned three-seed evaluation protocol for adapter training.",
+    )
     parser.add_argument(
         "--da3-model-name-or-path",
         type=str,
@@ -149,7 +193,7 @@ def parse_args(argv=None):
         "--feature-adapter-arch",
         type=str,
         default="dual_branch",
-        choices=["dual_branch"],
+        choices=["identity", "patch_only", "dual_branch"],
         help="Feature adapter architecture to train on top of frozen DA3 features.",
     )
     parser.add_argument(
@@ -176,18 +220,6 @@ def parse_args(argv=None):
         type=str,
         default=str(DEFAULT_AGGREGATOR_CKPT_PATH),
         help="SALAD warm-start checkpoint. Use 'none' or an empty string to disable warm start.",
-    )
-    parser.add_argument(
-        "--adapter-lr",
-        type=float,
-        default=1e-4,
-        help="Learning rate applied to the feature adapter parameter group.",
-    )
-    parser.add_argument(
-        "--lr",
-        type=float,
-        default=6e-5,
-        help="Learning rate applied to the SALAD aggregator parameter group.",
     )
     parser.add_argument(
         "--optimizer-name",
@@ -238,75 +270,22 @@ def parse_args(argv=None):
         action="store_true",
         help="Use GPU FAISS when computing validation recalls.",
     )
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=60,
-        help="GSVCities training batch size.",
-    )
-    parser.add_argument(
-        "--img-per-place",
-        type=int,
-        default=4,
-        help="Images per place sampled by GSVCities.",
-    )
-    parser.add_argument(
-        "--min-img-per-place",
-        type=int,
-        default=4,
-        help="Minimum images per place enforced by GSVCities.",
-    )
-    parser.add_argument(
-        "--image-size",
-        type=int,
-        nargs=2,
-        metavar=("HEIGHT", "WIDTH"),
-        default=(224, 224),
-        help="Training and validation image size.",
-    )
-    parser.add_argument(
-        "--num-workers",
-        type=int,
-        default=10,
-        help="GSVCities dataloader worker count.",
-    )
-    parser.add_argument(
-        "--precision",
-        type=str,
-        default="16-mixed",
-        help="Lightning trainer precision.",
-    )
-    parser.add_argument(
-        "--max-epochs",
-        type=int,
-        default=4,
-        help="Lightning trainer max_epochs.",
-    )
-    parser.add_argument(
-        "--check-val-every-n-epoch",
-        type=int,
-        default=1,
-        help="Lightning validation cadence in epochs.",
-    )
-    parser.add_argument(
-        "--num-sanity-val-steps",
-        type=int,
-        default=0,
-        help="Lightning num_sanity_val_steps.",
-    )
-    parser.add_argument(
-        "--save-top-k",
-        type=int,
-        default=3,
-        help="Number of top checkpoints to retain.",
-    )
-    parser.add_argument(
-        "--save-last",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Whether to save the last checkpoint in addition to top-k checkpoints.",
-    )
     return parser.parse_args(argv)
+
+
+def _build_feature_adapter_config(args) -> dict[str, Any] | None:
+    if args.feature_adapter_arch == "dual_branch":
+        return {
+            "local_bottleneck": args.adapter_local_bottleneck,
+            "global_hidden_dim": args.adapter_global_hidden_dim,
+        }
+    if args.feature_adapter_arch == "patch_only":
+        return {
+            "bottleneck": args.adapter_local_bottleneck,
+        }
+    if args.feature_adapter_arch == "identity":
+        return None
+    raise ValueError(f"Unsupported feature adapter architecture: {args.feature_adapter_arch}")
 
 
 class DA3AdapterSALADLightningModule(pl.LightningModule):
@@ -318,8 +297,8 @@ class DA3AdapterSALADLightningModule(pl.LightningModule):
         sanitize_unsupported_proxy_env_vars()
 
         self.args = args
-        self.adapter_lr = args.adapter_lr
-        self.lr = args.lr
+        self.adapter_lr = PINNED_ADAPTER_LR
+        self.lr = PINNED_AGGREGATOR_LR
         self.optimizer_name = args.optimizer_name
         self.weight_decay = args.weight_decay
         self.momentum = args.momentum
@@ -339,7 +318,9 @@ class DA3AdapterSALADLightningModule(pl.LightningModule):
         self.adapter_global_hidden_dim = args.adapter_global_hidden_dim
         self.agg_arch = args.agg_arch.lower()
         self.agg_config = dict(DEFAULT_AGGREGATOR_CONFIG)
-        self.aggregator_ckpt_path = _normalize_aggregator_ckpt_path(args.aggregator_ckpt_path)
+        self.aggregator_ckpt_path = _validate_local_aggregator_ckpt_path(
+            _normalize_aggregator_ckpt_path(args.aggregator_ckpt_path)
+        )
 
         self.vpr_model = build_vpr_model(
             da3_model_name_or_path=self.da3_model_name_or_path,
@@ -347,10 +328,7 @@ class DA3AdapterSALADLightningModule(pl.LightningModule):
             aux_layer=self.aux_layer,
             aux_global_token_mode=self.aux_global_token_mode,
             feature_adapter_arch=self.feature_adapter_arch,
-            feature_adapter_config={
-                "local_bottleneck": self.adapter_local_bottleneck,
-                "global_hidden_dim": self.adapter_global_hidden_dim,
-            },
+            feature_adapter_config=_build_feature_adapter_config(args),
             agg_arch="salad",
             agg_config=self.agg_config,
             aggregator_ckpt_path=self.aggregator_ckpt_path,
@@ -358,8 +336,9 @@ class DA3AdapterSALADLightningModule(pl.LightningModule):
         self.encoder_arch = self.vpr_model.encoder.__class__.__name__
 
         self._freeze_encoder()
-        self.loss_fn = salad_utils.get_loss("MultiSimilarityLoss")
-        self.miner = salad_utils.get_miner("MultiSimilarityMiner", 0.1)
+        current_salad_utils = _get_salad_utils()
+        self.loss_fn = current_salad_utils.get_loss("MultiSimilarityLoss")
+        self.miner = current_salad_utils.get_miner("MultiSimilarityMiner", 0.1)
         self.batch_acc: list[float] = []
         self.val_outputs: list[list[torch.Tensor]] = []
         self._validate_startup_state()
@@ -542,7 +521,7 @@ class DA3AdapterSALADLightningModule(pl.LightningModule):
 
             reference_descriptors = feats[:num_references]
             query_descriptors = feats[num_references:]
-            recalls = salad_utils.get_validation_recalls(
+            recalls = _get_salad_utils().get_validation_recalls(
                 r_list=reference_descriptors,
                 q_list=query_descriptors,
                 k_values=[1, 5, 10, 15, 20, 50, 100],
@@ -642,13 +621,13 @@ class DA3AdapterSALADLightningModule(pl.LightningModule):
 def build_datamodule(args):
     datamodule_cls = _get_gsvcities_datamodule()
     return datamodule_cls(
-        batch_size=args.batch_size,
-        img_per_place=args.img_per_place,
-        min_img_per_place=args.min_img_per_place,
+        batch_size=PINNED_BATCH_SIZE,
+        img_per_place=PINNED_IMG_PER_PLACE,
+        min_img_per_place=PINNED_MIN_IMG_PER_PLACE,
         shuffle_all=False,
         random_sample_from_each_place=True,
-        image_size=tuple(args.image_size),
-        num_workers=args.num_workers,
+        image_size=PINNED_IMAGE_SIZE,
+        num_workers=PINNED_NUM_WORKERS,
         show_data_stats=True,
         val_set_names=list(DEFAULT_VAL_SET_NAMES),
     )
@@ -663,8 +642,8 @@ def build_trainer(args, model: DA3AdapterSALADLightningModule) -> pl.Trainer:
         ),
         auto_insert_metric_name=False,
         save_weights_only=True,
-        save_top_k=args.save_top_k,
-        save_last=args.save_last,
+        save_top_k=PINNED_SAVE_TOP_K,
+        save_last=PINNED_SAVE_LAST,
         mode="max",
     )
 
@@ -673,10 +652,10 @@ def build_trainer(args, model: DA3AdapterSALADLightningModule) -> pl.Trainer:
         devices=1,
         default_root_dir="./logs/",
         num_nodes=1,
-        num_sanity_val_steps=args.num_sanity_val_steps,
-        precision=args.precision,
-        max_epochs=args.max_epochs,
-        check_val_every_n_epoch=args.check_val_every_n_epoch,
+        num_sanity_val_steps=PINNED_NUM_SANITY_VAL_STEPS,
+        precision=PINNED_PRECISION,
+        max_epochs=PINNED_MAX_EPOCHS,
+        check_val_every_n_epoch=PINNED_CHECK_VAL_EVERY_N_EPOCH,
         callbacks=[checkpoint_cb],
         reload_dataloaders_every_n_epochs=1,
         log_every_n_steps=20,

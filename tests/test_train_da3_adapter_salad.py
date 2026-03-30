@@ -1,5 +1,6 @@
 import importlib
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -47,10 +48,23 @@ def patch_model_construction(monkeypatch, trainer_module, *, encoder_requires_gr
         calls.update(kwargs)
         return vpr_model
 
+    salad_utils = SimpleNamespace(
+        get_loss=lambda *args, **kwargs: object(),
+        get_miner=lambda *args, **kwargs: object(),
+        get_validation_recalls=lambda *args, **kwargs: {1: 0.0, 5: 0.0, 10: 0.0},
+    )
     monkeypatch.setattr(trainer_module, "build_vpr_model", fake_build_vpr_model)
-    monkeypatch.setattr(trainer_module.salad_utils, "get_loss", lambda *args, **kwargs: object())
-    monkeypatch.setattr(trainer_module.salad_utils, "get_miner", lambda *args, **kwargs: object())
+    if hasattr(trainer_module, "salad_utils"):
+        monkeypatch.setattr(trainer_module, "salad_utils", salad_utils)
+    monkeypatch.setattr(trainer_module, "_get_salad_utils", lambda: salad_utils, raising=False)
     return calls, vpr_model
+
+
+def set_existing_default_checkpoint(monkeypatch, trainer_module, tmp_path):
+    checkpoint_path = tmp_path / "dino_salad_512_32.ckpt"
+    checkpoint_path.write_bytes(b"stub")
+    monkeypatch.setattr(trainer_module, "DEFAULT_AGGREGATOR_CKPT_PATH", checkpoint_path)
+    return checkpoint_path
 
 
 def test_parse_args_defaults_match_dual_branch_protocol():
@@ -58,6 +72,7 @@ def test_parse_args_defaults_match_dual_branch_protocol():
 
     args = trainer_module.parse_args([])
 
+    assert args.seed == 0
     assert args.da3_model_name_or_path == "depth-anything/DA3-BASE"
     assert args.feature_source == "aux"
     assert args.aux_layer == 5
@@ -67,18 +82,70 @@ def test_parse_args_defaults_match_dual_branch_protocol():
     assert args.adapter_global_hidden_dim == 256
     assert args.agg_arch == "salad"
     assert args.aggregator_ckpt_path == str(trainer_module.DEFAULT_AGGREGATOR_CKPT_PATH)
-    assert trainer_module.parse_args(["--seed", "17"]).seed == 17
 
 
-def test_configure_optimizers_uses_only_adapter_and_aggregator_param_groups(monkeypatch):
+def test_parse_args_rejects_seed_outside_three_seed_protocol():
     trainer_module = import_trainer_module()
+
+    with pytest.raises(SystemExit):
+        trainer_module.parse_args(["--seed", "7"])
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_parse_args_accepts_only_protocol_seed_values(seed):
+    trainer_module = import_trainer_module()
+
+    assert trainer_module.parse_args(["--seed", str(seed)]).seed == seed
+
+
+@pytest.mark.parametrize("feature_adapter_arch", ["identity", "patch_only", "dual_branch"])
+def test_parse_args_supports_all_feature_adapter_arch_ablation_modes(feature_adapter_arch):
+    trainer_module = import_trainer_module()
+
+    args = trainer_module.parse_args(["--feature-adapter-arch", feature_adapter_arch])
+
+    assert args.feature_adapter_arch == feature_adapter_arch
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--adapter-lr", "2e-4"],
+        ["--lr", "1e-4"],
+        ["--batch-size", "32"],
+        ["--img-per-place", "2"],
+        ["--min-img-per-place", "2"],
+        ["--image-size", "256", "256"],
+        ["--precision", "32"],
+        ["--max-epochs", "5"],
+        ["--check-val-every-n-epoch", "2"],
+        ["--num-sanity-val-steps", "1"],
+    ],
+)
+def test_parse_args_rejects_mutating_pinned_protocol_flags(argv):
+    trainer_module = import_trainer_module()
+
+    with pytest.raises(SystemExit):
+        trainer_module.parse_args(argv)
+
+
+def test_configure_optimizers_uses_only_adapter_and_aggregator_param_groups(
+    monkeypatch, tmp_path
+):
+    trainer_module = import_trainer_module()
+    expected_ckpt_path = set_existing_default_checkpoint(monkeypatch, trainer_module, tmp_path)
     calls, vpr_model = patch_model_construction(monkeypatch, trainer_module)
 
-    module = trainer_module.DA3AdapterSALADLightningModule()
+    protocol_breaking_args = SimpleNamespace(
+        **vars(trainer_module.parse_args([])),
+        adapter_lr=9.9,
+        lr=8.8,
+    )
+    module = trainer_module.DA3AdapterSALADLightningModule(args=protocol_breaking_args)
     optim_config = module.configure_optimizers()
     optimizer = optim_config["optimizer"]
 
-    assert calls["aggregator_ckpt_path"] == str(trainer_module.DEFAULT_AGGREGATOR_CKPT_PATH)
+    assert calls["aggregator_ckpt_path"] == str(expected_ckpt_path)
     assert len(optimizer.param_groups) == 2
     assert [group["lr"] for group in optimizer.param_groups] == [1e-4, 6e-5]
 
@@ -113,6 +180,25 @@ def test_parse_args_supports_disabling_aggregator_warm_start(monkeypatch):
     assert calls["aggregator_ckpt_path"] is None
 
 
+def test_default_local_warm_start_requires_explicit_local_checkpoint(monkeypatch, tmp_path):
+    trainer_module = import_trainer_module()
+    missing_local_ckpt = tmp_path / "missing_dino_salad_512_32.ckpt"
+    monkeypatch.setattr(trainer_module, "DEFAULT_AGGREGATOR_CKPT_PATH", missing_local_ckpt)
+    patch_model_construction(monkeypatch, trainer_module)
+
+    with pytest.raises(FileNotFoundError, match="local SALAD warm-start checkpoint"):
+        trainer_module.DA3AdapterSALADLightningModule(args=trainer_module.parse_args([]))
+
+
+def test_default_aggregator_checkpoint_path_stays_rooted_in_active_worktree():
+    trainer_module = import_trainer_module()
+
+    assert trainer_module.DEFAULT_AGGREGATOR_CKPT_PATH == (
+        trainer_module.SALAD_ROOT / "weights" / "dino_salad_512_32.ckpt"
+    )
+    assert "LoopAnything/.worktrees" in str(trainer_module.DEFAULT_AGGREGATOR_CKPT_PATH)
+
+
 def test_startup_validation_rejects_trainable_encoder_params():
     trainer_module = import_trainer_module()
 
@@ -145,7 +231,14 @@ def test_checkpoint_monitor_is_pitts30k_val_r1(monkeypatch):
     monkeypatch.setattr(trainer_module.pl, "Trainer", FakeTrainer)
 
     trainer = trainer_module.build_trainer(
-        trainer_module.parse_args([]),
+        SimpleNamespace(
+            precision="32",
+            max_epochs=99,
+            check_val_every_n_epoch=7,
+            num_sanity_val_steps=5,
+            save_top_k=1,
+            save_last=False,
+        ),
         SimpleNamespace(encoder_arch="DA3EncoderAdapter"),
     )
 
@@ -163,13 +256,22 @@ def test_validation_sets_keep_pitts30k_test_enabled(monkeypatch):
 
     monkeypatch.setattr(trainer_module, "GSVCitiesDataModule", FakeDataModule)
 
-    trainer_module.build_datamodule(trainer_module.parse_args([]))
+    trainer_module.build_datamodule(
+        SimpleNamespace(
+            batch_size=1,
+            img_per_place=1,
+            min_img_per_place=1,
+            image_size=(64, 64),
+            num_workers=0,
+        )
+    )
 
     assert "pitts30k_test" in captured["val_set_names"]
 
 
-def test_scheduler_defaults_match_salad_baseline(monkeypatch):
+def test_scheduler_defaults_match_salad_baseline(monkeypatch, tmp_path):
     trainer_module = import_trainer_module()
+    set_existing_default_checkpoint(monkeypatch, trainer_module, tmp_path)
     patch_model_construction(monkeypatch, trainer_module)
 
     module = trainer_module.DA3AdapterSALADLightningModule()
@@ -199,7 +301,15 @@ def test_datamodule_defaults_match_dual_branch_protocol(monkeypatch):
 
     monkeypatch.setattr(trainer_module, "GSVCitiesDataModule", FakeDataModule)
 
-    trainer_module.build_datamodule(trainer_module.parse_args([]))
+    trainer_module.build_datamodule(
+        SimpleNamespace(
+            batch_size=1,
+            img_per_place=1,
+            min_img_per_place=1,
+            image_size=(64, 64),
+            num_workers=0,
+        )
+    )
 
     assert captured["batch_size"] == 60
     assert captured["img_per_place"] == 4
@@ -227,7 +337,14 @@ def test_trainer_defaults_match_dual_branch_protocol(monkeypatch):
     monkeypatch.setattr(trainer_module.pl, "Trainer", FakeTrainer)
 
     trainer = trainer_module.build_trainer(
-        trainer_module.parse_args([]),
+        SimpleNamespace(
+            precision="32",
+            max_epochs=99,
+            check_val_every_n_epoch=7,
+            num_sanity_val_steps=5,
+            save_top_k=1,
+            save_last=False,
+        ),
         SimpleNamespace(encoder_arch="DA3EncoderAdapter"),
     )
     checkpoint = trainer.callbacks[0]
