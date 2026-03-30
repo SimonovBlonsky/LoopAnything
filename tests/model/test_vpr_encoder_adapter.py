@@ -18,6 +18,33 @@ class StubBackbone(torch.nn.Module):
         return ((self.feat, camera_tokens),), list(self.aux_feats)
 
 
+class StubClsTokenBackbone(torch.nn.Module):
+    def __init__(self, raw_tokens, normalized_tokens):
+        super().__init__()
+        self.raw_tokens = raw_tokens
+        self.normalized_tokens = normalized_tokens
+        self.intermediate_calls = []
+        self.norm_calls = []
+
+    def forward(self, x, **kwargs):
+        raise AssertionError("cls_token mode must not use the aux_feats backbone path")
+
+    def _get_intermediate_layers_not_chunked(self, x, n=1, export_feat_layers=None, **kwargs):
+        self.intermediate_calls.append(
+            {
+                "x": x,
+                "n": n,
+                "export_feat_layers": [] if export_feat_layers is None else list(export_feat_layers),
+                "kwargs": kwargs,
+            }
+        )
+        return [], [self.raw_tokens]
+
+    def norm(self, tokens):
+        self.norm_calls.append(tokens)
+        return self.normalized_tokens
+
+
 class StubMalformedBackbone(torch.nn.Module):
     def __init__(self, feat):
         super().__init__()
@@ -99,6 +126,87 @@ def test_adapter_uses_requested_aux_layer_as_feature_source():
     assert out["patch_tokens"].shape == (1, 4, 8)
     assert out["feature_map"].shape == (1, 8, 2, 2)
     assert torch.allclose(out["global_token"], aux_feat[:, 0].mean(dim=1))
+
+
+def test_aux_cls_token_mode_uses_normalized_cls_token():
+    feat = torch.randn(1, 1, 4, 16)
+    raw_tokens = torch.tensor(
+        [
+            [
+                [1.0, 11.0],
+                [2.0, 22.0],
+                [3.0, 33.0],
+                [4.0, 44.0],
+                [5.0, 55.0],
+            ]
+        ],
+        dtype=torch.float32,
+    )
+    normalized_tokens = raw_tokens + 100.0
+    model = StubDA3Wrapper(StubDA3Net(feat))
+    model.model.backbone = StubClsTokenBackbone(raw_tokens=raw_tokens, normalized_tokens=normalized_tokens)
+    adapter = DA3EncoderAdapter(
+        model,
+        patch_size=2,
+        feature_source="aux",
+        aux_layer=3,
+        aux_global_token_mode="cls_token",
+    )
+
+    out = adapter(torch.randn(1, 3, 4, 4))
+
+    assert len(model.model.backbone.intermediate_calls) == 1
+    assert len(model.model.backbone.norm_calls) == 1
+    assert model.model.backbone.intermediate_calls[0]["export_feat_layers"] == [3]
+    assert torch.allclose(model.model.backbone.norm_calls[0], raw_tokens)
+    assert torch.allclose(out["global_token"], normalized_tokens[:, 0])
+    assert torch.allclose(out["patch_tokens"], normalized_tokens[:, 1:])
+    assert out["feature_map"].shape == (1, 2, 2, 2)
+
+
+def test_aux_mean_patch_mode_preserves_legacy_behavior():
+    feat = torch.randn(1, 1, 4, 16)
+    aux_feat = torch.tensor(
+        [[[[1.0, 10.0], [2.0, 20.0], [3.0, 30.0], [4.0, 40.0]]]],
+        dtype=torch.float32,
+    )
+    model = StubDA3Net(feat, aux_feats=[aux_feat])
+    adapter = DA3EncoderAdapter(
+        model,
+        patch_size=2,
+        feature_source="aux",
+        aux_layer=3,
+        aux_global_token_mode="mean_patch",
+    )
+
+    out = adapter(torch.randn(1, 3, 4, 4))
+
+    assert model.backbone.calls[0][1]["export_feat_layers"] == [3]
+    assert torch.allclose(out["patch_tokens"], aux_feat[:, 0])
+    assert torch.allclose(out["global_token"], aux_feat[:, 0].mean(dim=1))
+
+
+def test_aux_cls_token_mode_rejects_missing_transformer_path():
+    feat = torch.randn(1, 1, 4, 16)
+    model = StubDA3Net(feat, aux_feats=[torch.randn(1, 1, 4, 8)])
+    adapter = DA3EncoderAdapter(
+        model,
+        patch_size=2,
+        feature_source="aux",
+        aux_layer=3,
+        aux_global_token_mode="cls_token",
+    )
+
+    with pytest.raises(ValueError, match="transformer"):
+        adapter(torch.randn(1, 3, 4, 4))
+
+    with pytest.raises(ValueError, match="Unsupported aux_global_token_mode"):
+        DA3EncoderAdapter(
+            StubDA3Net(feat, aux_feats=[torch.randn(1, 1, 4, 8)]),
+            patch_size=2,
+            feature_source="aux",
+            aux_global_token_mode="bad_mode",
+        )
 
 
 @pytest.mark.parametrize(

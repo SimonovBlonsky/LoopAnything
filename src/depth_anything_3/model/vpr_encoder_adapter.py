@@ -12,6 +12,7 @@ class DA3EncoderAdapter(nn.Module):
         ref_view_strategy="saddle_balanced",
         patch_size=14,
         feature_source="final",
+        aux_global_token_mode="mean_patch",
         aux_layer=3,
         aux_layers=None,
         layer_combine="single",
@@ -25,6 +26,7 @@ class DA3EncoderAdapter(nn.Module):
         self.ref_view_strategy = ref_view_strategy
         self.patch_size = patch_size
         self.feature_source = feature_source
+        self.aux_global_token_mode = self._normalize_aux_global_token_mode(aux_global_token_mode)
         self.aux_layer = aux_layer
         self.aux_layers = aux_layers
         self.layer_combine = layer_combine
@@ -54,6 +56,12 @@ class DA3EncoderAdapter(nn.Module):
 
     def _normalized_post_fusion_norm(self):
         return str(self.post_fusion_norm).lower()
+
+    def _normalize_aux_global_token_mode(self, aux_global_token_mode):
+        mode = str(aux_global_token_mode).lower()
+        if mode not in {"mean_patch", "cls_token"}:
+            raise ValueError(f"Unsupported aux_global_token_mode: {aux_global_token_mode}")
+        return mode
 
     def _has_explicit_aux_fusion_args(self):
         return (
@@ -128,6 +136,44 @@ class DA3EncoderAdapter(nn.Module):
             return feature_map.permute(0, 2, 3, 1).reshape(x.shape[0], -1, feature_map.shape[1])
         raise ValueError(f"Unsupported post_fusion_norm: {self.post_fusion_norm}")
 
+    def _combine_aux_token_list(self, token_list):
+        if len(token_list) == 0:
+            raise ValueError("aux_layers must contain at least one layer index")
+        combine = self._normalized_layer_combine()
+
+        if combine == "single":
+            if len(token_list) != 1:
+                raise ValueError("single layer_combine requires exactly one aux layer")
+            return token_list[0]
+        if combine == "avg":
+            if len(token_list) == 1:
+                raise ValueError("avg layer_combine requires multiple aux layers")
+            return torch.stack(token_list, dim=0).mean(dim=0)
+        if combine == "sum":
+            if len(token_list) == 1:
+                raise ValueError("sum layer_combine requires multiple aux layers")
+            return torch.stack(token_list, dim=0).sum(dim=0)
+        if combine == "weighted_avg":
+            if len(token_list) == 1:
+                raise ValueError("weighted_avg requires multiple aux layers")
+            if self.layer_weights is None:
+                raise ValueError("weighted_avg requires layer_weights to match aux_layers")
+            try:
+                weights = list(self.layer_weights)
+            except TypeError as exc:
+                raise ValueError("layer_weights must be a sequence") from exc
+            if len(weights) != len(token_list):
+                raise ValueError("weighted_avg requires layer_weights to match aux_layers")
+            weights = torch.as_tensor(weights, dtype=token_list[0].dtype, device=token_list[0].device)
+            if not torch.isfinite(weights).all():
+                raise ValueError("weighted_avg requires finite layer_weights")
+            total_weight = weights.sum()
+            if total_weight == 0:
+                raise ValueError("weighted_avg requires a non-zero total weight")
+            weight_shape = (len(token_list),) + (1,) * token_list[0].ndim
+            return (torch.stack(token_list, dim=0) * weights.view(*weight_shape)).sum(dim=0) / total_weight
+        raise ValueError(f"Unsupported layer_combine: {self.layer_combine}")
+
     def _extract_aux_features(self, aux_feats, requested_aux_layers):
         if len(requested_aux_layers) == 0:
             raise ValueError("aux_layers must contain at least one layer index")
@@ -141,44 +187,42 @@ class DA3EncoderAdapter(nn.Module):
         for patch_tokens in patch_tokens_list[1:]:
             if patch_tokens.shape != first_shape:
                 raise ValueError("Malformed/incompatible AUX features returned by the backbone")
-        combine = self._normalized_layer_combine()
+        return self._combine_aux_token_list(patch_tokens_list)
 
-        if combine == "single":
-            if len(patch_tokens_list) != 1:
-                raise ValueError("single layer_combine requires exactly one aux layer")
-            patch_tokens = patch_tokens_list[0]
-        elif combine == "avg":
-            if len(patch_tokens_list) == 1:
-                raise ValueError("avg layer_combine requires multiple aux layers")
-            patch_tokens = torch.stack(patch_tokens_list, dim=0).mean(dim=0)
-        elif combine == "sum":
-            if len(patch_tokens_list) == 1:
-                raise ValueError("sum layer_combine requires multiple aux layers")
-            patch_tokens = torch.stack(patch_tokens_list, dim=0).sum(dim=0)
-        elif combine == "weighted_avg":
-            if len(patch_tokens_list) == 1:
-                raise ValueError("weighted_avg requires multiple aux layers")
-            if self.layer_weights is None:
-                raise ValueError("weighted_avg requires layer_weights to match aux_layers")
-            try:
-                weights = list(self.layer_weights)
-            except TypeError as exc:
-                raise ValueError("layer_weights must be a sequence") from exc
-            if len(weights) != len(patch_tokens_list):
-                raise ValueError("weighted_avg requires layer_weights to match aux_layers")
-            weights = torch.as_tensor(weights, dtype=patch_tokens_list[0].dtype, device=patch_tokens_list[0].device)
-            if not torch.isfinite(weights).all():
-                raise ValueError("weighted_avg requires finite layer_weights")
-            total_weight = weights.sum()
-            if total_weight == 0:
-                raise ValueError("weighted_avg requires a non-zero total weight")
-            patch_tokens = (
-                torch.stack(patch_tokens_list, dim=0) * weights.view(-1, 1, 1, 1)
-            ).sum(dim=0) / total_weight
-        else:
-            raise ValueError(f"Unsupported layer_combine: {self.layer_combine}")
+    def _extract_aux_tokens_with_cls(self, da3_net, x, requested_aux_layers):
+        transformer = getattr(da3_net, "backbone", None)
+        if transformer is None:
+            raise ValueError("cls_token mode requires access to the underlying transformer backbone")
+        if not hasattr(transformer, "_get_intermediate_layers_not_chunked") or not hasattr(transformer, "norm"):
+            raise ValueError("cls_token mode requires access to the underlying transformer backbone")
 
-        return patch_tokens
+        _, aux_outputs = transformer._get_intermediate_layers_not_chunked(
+            x,
+            n=1,
+            export_feat_layers=requested_aux_layers,
+            ref_view_strategy=self.ref_view_strategy,
+        )
+        if aux_outputs is None or len(aux_outputs) != len(requested_aux_layers):
+            raise ValueError("Malformed auxiliary features returned by the transformer")
+
+        patch_tokens_list = []
+        global_tokens_list = []
+        for aux_tokens in aux_outputs:
+            normalized_tokens = transformer.norm(aux_tokens)
+            if normalized_tokens.ndim == 4:
+                if normalized_tokens.shape[1] != 1:
+                    raise ValueError("cls_token mode requires single-view auxiliary tokens")
+                normalized_tokens = normalized_tokens[:, 0]
+            if normalized_tokens.ndim != 3:
+                raise ValueError("Expected normalized auxiliary tokens with shape [B, T, C]")
+            if normalized_tokens.shape[1] < 2:
+                raise ValueError("Expected normalized auxiliary tokens to include a cls token and patches")
+            patch_tokens_list.append(normalized_tokens[:, 1:])
+            global_tokens_list.append(normalized_tokens[:, 0])
+
+        patch_tokens = self._combine_aux_token_list(patch_tokens_list)
+        global_token = self._combine_aux_token_list(global_tokens_list)
+        return patch_tokens, global_token
 
     def forward(self, x):
         x = self._normalize_input(x)
@@ -187,20 +231,30 @@ class DA3EncoderAdapter(nn.Module):
         feature_source = str(self.feature_source).lower()
         export_feat_layers = self._validate_aux_feature_source(feature_source)
 
-        feats, aux_feats = da3_net.backbone(
-            x,
-            cam_token=None,
-            export_feat_layers=export_feat_layers,
-            ref_view_strategy=self.ref_view_strategy,
-        )
-
         if feature_source == "final":
+            feats, aux_feats = da3_net.backbone(
+                x,
+                cam_token=None,
+                export_feat_layers=export_feat_layers,
+                ref_view_strategy=self.ref_view_strategy,
+            )
             patch_tokens, global_token = self._extract_final_features(feats)
         else:
-            patch_tokens = self._extract_aux_features(aux_feats, export_feat_layers)
-            patch_tokens = self._apply_post_fusion_norm(patch_tokens, x)
-            patch_tokens = patch_tokens * self.layer_scale
-            global_token = patch_tokens.mean(dim=1)
+            if self.aux_global_token_mode == "cls_token":
+                patch_tokens, global_token = self._extract_aux_tokens_with_cls(
+                    da3_net, x, export_feat_layers
+                )
+            else:
+                feats, aux_feats = da3_net.backbone(
+                    x,
+                    cam_token=None,
+                    export_feat_layers=export_feat_layers,
+                    ref_view_strategy=self.ref_view_strategy,
+                )
+                patch_tokens = self._extract_aux_features(aux_feats, export_feat_layers)
+                patch_tokens = self._apply_post_fusion_norm(patch_tokens, x)
+                patch_tokens = patch_tokens * self.layer_scale
+                global_token = patch_tokens.mean(dim=1)
 
         feature_map, spatial_shape = self._patch_tokens_to_feature_map(patch_tokens, x)
         if not torch.isfinite(feature_map).all():
