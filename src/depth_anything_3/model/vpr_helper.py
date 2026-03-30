@@ -11,6 +11,11 @@ from depth_anything_3.api import DepthAnything3
 from depth_anything_3.cfg import create_object, load_config
 from depth_anything_3.model import VPRaggregators
 from depth_anything_3.model.vpr_encoder_adapter import DA3EncoderAdapter
+from depth_anything_3.model.vpr_feature_adapter import (
+    DualBranchFeatureAdapter,
+    IdentityFeatureAdapter,
+    PatchOnlyFeatureAdapter,
+)
 from depth_anything_3.model.vpr_model import VPRModel
 
 
@@ -36,6 +41,21 @@ def build_aggregator(agg_arch, agg_config=None):
     if name == "salad":
         return VPRaggregators.SALAD(**agg_config)
     raise ValueError(f"Unsupported aggregator: {agg_arch}")
+
+
+def build_feature_adapter(adapter_arch=None, adapter_config=None):
+    adapter_config = {} if adapter_config is None else dict(adapter_config)
+    if adapter_arch is None:
+        return IdentityFeatureAdapter()
+
+    name = str(adapter_arch).lower()
+    if name == "identity":
+        return IdentityFeatureAdapter()
+    if name == "patch_only":
+        return PatchOnlyFeatureAdapter(**adapter_config)
+    if name == "dual_branch":
+        return DualBranchFeatureAdapter(**adapter_config)
+    raise ValueError(f"Unsupported feature adapter: {adapter_arch}")
 
 
 def extract_prefixed_state_dict(state_dict: Mapping[str, torch.Tensor], prefixes: Iterable[str]):
@@ -101,12 +121,24 @@ def build_da3_model(*, da3_config_path=None, da3_weight_path=None, da3_model_nam
     raise ValueError("No DA3 source provided")
 
 
-def build_da3_encoder_adapter(da3_model, *, feat_layer=-1, ref_view_strategy="saddle_balanced", patch_size=14):
+def build_da3_encoder_adapter(
+    da3_model,
+    *,
+    feat_layer=-1,
+    ref_view_strategy="saddle_balanced",
+    patch_size=14,
+    feature_source="final",
+    aux_global_token_mode="mean_patch",
+    aux_layer=3,
+):
     return DA3EncoderAdapter(
         da3_model,
         feat_layer=feat_layer,
         ref_view_strategy=ref_view_strategy,
         patch_size=patch_size,
+        feature_source=feature_source,
+        aux_global_token_mode=aux_global_token_mode,
+        aux_layer=aux_layer,
     )
 
 
@@ -119,6 +151,11 @@ def build_vpr_model(
     feat_layer=-1,
     ref_view_strategy="saddle_balanced",
     patch_size=14,
+    feature_source="final",
+    aux_layer=3,
+    aux_global_token_mode="mean_patch",
+    feature_adapter_arch=None,
+    feature_adapter_config=None,
     agg_arch,
     agg_config=None,
     aggregator_ckpt_path=None,
@@ -142,11 +179,20 @@ def build_vpr_model(
         feat_layer=feat_layer,
         ref_view_strategy=ref_view_strategy,
         patch_size=patch_size,
+        feature_source=feature_source,
+        aux_layer=aux_layer,
+        aux_global_token_mode=aux_global_token_mode,
     )
     aggregator = build_aggregator(agg_arch, agg_config=agg_config)
+    feature_adapter = build_feature_adapter(feature_adapter_arch, adapter_config=feature_adapter_config)
     if aggregator_ckpt_path is not None:
         load_aggregator_weights_from_salad_ckpt(aggregator, aggregator_ckpt_path, strict=strict)
-    model = VPRModel(encoder=encoder, aggregator=aggregator, agg_arch=agg_arch)
+    model = VPRModel(
+        encoder=encoder,
+        aggregator=aggregator,
+        agg_arch=agg_arch,
+        feature_adapter=feature_adapter,
+    )
     model.eval()
     return model
 
