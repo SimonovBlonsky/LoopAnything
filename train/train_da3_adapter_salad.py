@@ -32,6 +32,7 @@ DEFAULT_VAL_SET_NAMES = ["pitts30k_val", "pitts30k_test"]
 PROTOCOL_SEEDS = (0, 1, 2)
 PINNED_ADAPTER_LR = 1e-4
 PINNED_AGGREGATOR_LR = 6e-5
+PINNED_PATCH_ONLY_BOTTLENECK = 640
 PINNED_BATCH_SIZE = 60
 PINNED_IMG_PER_PLACE = 4
 PINNED_MIN_IMG_PER_PLACE = 4
@@ -281,7 +282,7 @@ def _build_feature_adapter_config(args) -> dict[str, Any] | None:
         }
     if args.feature_adapter_arch == "patch_only":
         return {
-            "bottleneck": args.adapter_local_bottleneck,
+            "bottleneck": PINNED_PATCH_ONLY_BOTTLENECK,
         }
     if args.feature_adapter_arch == "identity":
         return None
@@ -549,15 +550,13 @@ class DA3AdapterSALADLightningModule(pl.LightningModule):
             for parameter in self.vpr_model.aggregator.parameters()
             if parameter.requires_grad
         ]
-        if not adapter_parameters:
-            raise ValueError("No trainable feature adapter parameters found for optimization")
         if not aggregator_parameters:
             raise ValueError("No trainable aggregator parameters found for optimization")
 
-        optimizer_params = [
-            {"params": adapter_parameters, "lr": self.adapter_lr},
-            {"params": aggregator_parameters, "lr": self.lr},
-        ]
+        optimizer_params = []
+        if adapter_parameters:
+            optimizer_params.append({"params": adapter_parameters, "lr": self.adapter_lr})
+        optimizer_params.append({"params": aggregator_parameters, "lr": self.lr})
 
         optimizer_name = self.optimizer_name.lower()
         if optimizer_name == "sgd":

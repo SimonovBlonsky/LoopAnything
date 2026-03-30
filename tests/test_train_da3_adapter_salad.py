@@ -33,16 +33,25 @@ class TinyAggregator(torch.nn.Module):
 
 
 class TinyVPRModel(torch.nn.Module):
-    def __init__(self, encoder_requires_grad=True):
+    def __init__(self, encoder_requires_grad=True, feature_adapter=None):
         super().__init__()
         self.encoder = TinyEncoder(requires_grad=encoder_requires_grad)
-        self.feature_adapter = TinyAdapter()
+        self.feature_adapter = feature_adapter if feature_adapter is not None else TinyAdapter()
         self.aggregator = TinyAggregator()
 
 
-def patch_model_construction(monkeypatch, trainer_module, *, encoder_requires_grad=True):
+def patch_model_construction(
+    monkeypatch,
+    trainer_module,
+    *,
+    encoder_requires_grad=True,
+    feature_adapter=None,
+):
     calls = {}
-    vpr_model = TinyVPRModel(encoder_requires_grad=encoder_requires_grad)
+    vpr_model = TinyVPRModel(
+        encoder_requires_grad=encoder_requires_grad,
+        feature_adapter=feature_adapter,
+    )
 
     def fake_build_vpr_model(**kwargs):
         calls.update(kwargs)
@@ -161,6 +170,63 @@ def test_configure_optimizers_uses_only_adapter_and_aggregator_param_groups(
     assert optimized_param_ids == adapter_param_ids | aggregator_param_ids
     assert optimized_param_ids.isdisjoint(encoder_param_ids)
     assert all(not parameter.requires_grad for parameter in vpr_model.encoder.parameters())
+
+
+@pytest.mark.parametrize(
+    ("feature_adapter_arch", "feature_adapter", "expected_group_count", "expected_adapter_config"),
+    [
+        ("identity", torch.nn.Identity(), 1, None),
+        ("patch_only", TinyAdapter(), 2, {"bottleneck": 640}),
+        (
+            "dual_branch",
+            TinyAdapter(),
+            2,
+            {"local_bottleneck": 256, "global_hidden_dim": 256},
+        ),
+    ],
+)
+def test_supported_adapter_modes_instantiate_and_build_expected_optimizer_groups(
+    monkeypatch,
+    tmp_path,
+    feature_adapter_arch,
+    feature_adapter,
+    expected_group_count,
+    expected_adapter_config,
+):
+    trainer_module = import_trainer_module()
+    set_existing_default_checkpoint(monkeypatch, trainer_module, tmp_path)
+    calls, vpr_model = patch_model_construction(
+        monkeypatch,
+        trainer_module,
+        feature_adapter=feature_adapter,
+    )
+
+    module = trainer_module.DA3AdapterSALADLightningModule(
+        args=trainer_module.parse_args(["--feature-adapter-arch", feature_adapter_arch])
+    )
+    optim_config = module.configure_optimizers()
+    optimizer = optim_config["optimizer"]
+
+    assert calls["feature_adapter_arch"] == feature_adapter_arch
+    assert calls["feature_adapter_config"] == expected_adapter_config
+    assert len(optimizer.param_groups) == expected_group_count
+
+    optimized_param_ids = {
+        id(parameter)
+        for group in optimizer.param_groups
+        for parameter in group["params"]
+    }
+    aggregator_param_ids = {id(parameter) for parameter in vpr_model.aggregator.parameters()}
+    adapter_param_ids = {id(parameter) for parameter in vpr_model.feature_adapter.parameters()}
+
+    assert aggregator_param_ids <= optimized_param_ids
+    if feature_adapter_arch == "identity":
+        assert optimizer.param_groups[0]["lr"] == pytest.approx(6e-5)
+        assert optimized_param_ids == aggregator_param_ids
+        assert not adapter_param_ids
+    else:
+        assert [group["lr"] for group in optimizer.param_groups] == [1e-4, 6e-5]
+        assert optimized_param_ids == adapter_param_ids | aggregator_param_ids
 
 
 def test_parse_args_supports_disabling_aggregator_warm_start(monkeypatch):
@@ -288,6 +354,19 @@ def test_scheduler_defaults_match_salad_baseline(monkeypatch, tmp_path):
         "total_iters": 4000,
     }
     assert isinstance(scheduler, torch.optim.lr_scheduler.LinearLR)
+
+
+def test_patch_only_default_build_vpr_model_config_uses_pinned_640_bottleneck(monkeypatch, tmp_path):
+    trainer_module = import_trainer_module()
+    set_existing_default_checkpoint(monkeypatch, trainer_module, tmp_path)
+    calls, _ = patch_model_construction(monkeypatch, trainer_module)
+
+    trainer_module.DA3AdapterSALADLightningModule(
+        args=trainer_module.parse_args(["--feature-adapter-arch", "patch_only"])
+    )
+
+    assert calls["feature_adapter_arch"] == "patch_only"
+    assert calls["feature_adapter_config"] == {"bottleneck": 640}
 
 
 def test_datamodule_defaults_match_dual_branch_protocol(monkeypatch):
