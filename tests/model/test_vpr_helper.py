@@ -185,7 +185,20 @@ def test_build_feature_adapter_supports_identity_patch_only_and_dual_branch():
     assert identity_from_none(features) is features
     assert identity_from_name(features) is features
     assert isinstance(patch_only, PatchOnlyFeatureAdapter)
+    assert patch_only.channels == 8
+    assert patch_only.bottleneck == 4
+    assert patch_only.local_branch.reduce.weight.shape == (4, 8)
     assert isinstance(dual_branch, DualBranchFeatureAdapter)
+    assert dual_branch.channels == 8
+    assert dual_branch.local_bottleneck == 4
+    assert dual_branch.global_hidden_dim == 4
+    assert dual_branch.local_branch.reduce.weight.shape == (4, 8)
+    assert dual_branch.global_branch.reduce.weight.shape == (4, 16)
+
+
+def test_build_feature_adapter_rejects_unsupported_arch():
+    with pytest.raises(ValueError, match="Unsupported feature adapter"):
+        vpr_helper.build_feature_adapter("not_a_real_adapter")
 
 
 def test_build_da3_encoder_adapter_threads_aux_global_token_mode(monkeypatch):
