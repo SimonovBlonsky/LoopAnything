@@ -127,7 +127,9 @@ def _get_gsvcities_datamodule():
     global GSVCitiesDataModule
     if GSVCitiesDataModule is None:
         try:
-            from dataloaders.GSVCitiesDataloader import GSVCitiesDataModule as _GSVCitiesDataModule
+            from da3_streaming.loop_utils.salad.dataloaders.GSVCitiesDataloader import (
+                GSVCitiesDataModule as _GSVCitiesDataModule,
+            )
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to import GSVCitiesDataModule from the active worktree SALAD path at {SALAD_ROOT}. "

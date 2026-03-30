@@ -1,5 +1,7 @@
+import builtins
 import importlib
 import sys
+import types
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -367,6 +369,34 @@ def test_patch_only_default_build_vpr_model_config_uses_pinned_640_bottleneck(mo
 
     assert calls["feature_adapter_arch"] == "patch_only"
     assert calls["feature_adapter_config"] == {"bottleneck": 640}
+
+
+def test_build_datamodule_uses_package_qualified_import_path(monkeypatch):
+    trainer_module = import_trainer_module()
+    monkeypatch.setattr(trainer_module, "GSVCitiesDataModule", None)
+
+    class FakeDataModule:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.val_set_names = kwargs["val_set_names"]
+
+    real_import = builtins.__import__
+
+    def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "dataloaders.GSVCitiesDataloader":
+            raise AssertionError("unqualified dataloaders import should not be used")
+        if name == "da3_streaming.loop_utils.salad.dataloaders.GSVCitiesDataloader":
+            module = types.ModuleType(name)
+            module.GSVCitiesDataModule = FakeDataModule
+            return module
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+
+    datamodule = trainer_module.build_datamodule(SimpleNamespace())
+
+    assert isinstance(datamodule, FakeDataModule)
+    assert datamodule.kwargs["val_set_names"] == ["pitts30k_val", "pitts30k_test"]
 
 
 def test_datamodule_defaults_match_dual_branch_protocol(monkeypatch):
