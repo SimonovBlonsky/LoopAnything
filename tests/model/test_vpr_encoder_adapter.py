@@ -19,10 +19,11 @@ class StubBackbone(torch.nn.Module):
 
 
 class StubClsTokenBackbone(torch.nn.Module):
-    def __init__(self, raw_tokens, normalized_tokens):
+    def __init__(self, raw_tokens, normalized_tokens, num_register_tokens=0):
         super().__init__()
         self.raw_tokens = raw_tokens
         self.normalized_tokens = normalized_tokens
+        self.num_register_tokens = num_register_tokens
         self.intermediate_calls = []
         self.norm_calls = []
 
@@ -142,17 +143,25 @@ def test_aux_cls_token_mode_uses_normalized_cls_token():
     raw_tokens = torch.tensor(
         [
             [
-                [1.0, 11.0],
-                [2.0, 22.0],
-                [3.0, 33.0],
-                [4.0, 44.0],
-                [5.0, 55.0],
+                [
+                    [101.0, 1011.0],
+                    [102.0, 1022.0],
+                    [103.0, 1033.0],
+                    [1.0, 10.0],
+                    [2.0, 20.0],
+                    [3.0, 30.0],
+                    [4.0, 40.0],
+                ]
             ]
         ],
         dtype=torch.float32,
     )
     normalized_tokens = raw_tokens + 100.0
-    transformer = StubClsTokenBackbone(raw_tokens=raw_tokens, normalized_tokens=normalized_tokens)
+    transformer = StubClsTokenBackbone(
+        raw_tokens=raw_tokens,
+        normalized_tokens=normalized_tokens,
+        num_register_tokens=2,
+    )
     model = StubDA3Wrapper(StubDA3Net(feat))
     model.model.backbone = StubBackboneWithPretrained(transformer)
     adapter = DA3EncoderAdapter(
@@ -161,6 +170,8 @@ def test_aux_cls_token_mode_uses_normalized_cls_token():
         feature_source="aux",
         aux_layer=3,
         aux_global_token_mode="cls_token",
+        post_fusion_norm="token_l2",
+        layer_scale=2.0,
     )
 
     out = adapter(torch.randn(1, 3, 4, 4))
@@ -168,9 +179,11 @@ def test_aux_cls_token_mode_uses_normalized_cls_token():
     assert len(transformer.intermediate_calls) == 1
     assert len(transformer.norm_calls) == 1
     assert transformer.intermediate_calls[0]["export_feat_layers"] == [3]
+    assert transformer.norm_calls[0].shape == (1, 1, 7, 2)
     assert torch.allclose(transformer.norm_calls[0], raw_tokens)
-    assert torch.allclose(out["global_token"], normalized_tokens[:, 0])
-    assert torch.allclose(out["patch_tokens"], normalized_tokens[:, 1:])
+    assert torch.allclose(out["global_token"], normalized_tokens[:, 0, 0])
+    expected_patch_tokens = torch.nn.functional.normalize(normalized_tokens[:, 0, 3:], p=2, dim=-1) * 2.0
+    assert torch.allclose(out["patch_tokens"], expected_patch_tokens)
     assert out["feature_map"].shape == (1, 2, 2, 2)
 
 

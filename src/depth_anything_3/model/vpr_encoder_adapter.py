@@ -209,6 +209,7 @@ class DA3EncoderAdapter(nn.Module):
         if transformer is None:
             raise ValueError("cls_token mode requires access to the underlying transformer backbone")
 
+        num_register_tokens = max(0, int(getattr(transformer, "num_register_tokens", 0) or 0))
         _, aux_outputs = transformer._get_intermediate_layers_not_chunked(
             x,
             n=1,
@@ -228,9 +229,9 @@ class DA3EncoderAdapter(nn.Module):
                 normalized_tokens = normalized_tokens[:, 0]
             if normalized_tokens.ndim != 3:
                 raise ValueError("Expected normalized auxiliary tokens with shape [B, T, C]")
-            if normalized_tokens.shape[1] < 2:
+            if normalized_tokens.shape[1] <= 1 + num_register_tokens:
                 raise ValueError("Expected normalized auxiliary tokens to include a cls token and patches")
-            patch_tokens_list.append(normalized_tokens[:, 1:])
+            patch_tokens_list.append(normalized_tokens[:, 1 + num_register_tokens :])
             global_tokens_list.append(normalized_tokens[:, 0])
 
         patch_tokens = self._combine_aux_token_list(patch_tokens_list)
@@ -265,8 +266,10 @@ class DA3EncoderAdapter(nn.Module):
                     ref_view_strategy=self.ref_view_strategy,
                 )
                 patch_tokens = self._extract_aux_features(aux_feats, export_feat_layers)
-                patch_tokens = self._apply_post_fusion_norm(patch_tokens, x)
-                patch_tokens = patch_tokens * self.layer_scale
+                global_token = patch_tokens.mean(dim=1)
+            patch_tokens = self._apply_post_fusion_norm(patch_tokens, x)
+            patch_tokens = patch_tokens * self.layer_scale
+            if self.aux_global_token_mode == "mean_patch":
                 global_token = patch_tokens.mean(dim=1)
 
         feature_map, spatial_shape = self._patch_tokens_to_feature_map(patch_tokens, x)
