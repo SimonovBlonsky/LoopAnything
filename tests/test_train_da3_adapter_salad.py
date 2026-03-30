@@ -231,6 +231,22 @@ def test_supported_adapter_modes_instantiate_and_build_expected_optimizer_groups
         assert optimized_param_ids == adapter_param_ids | aggregator_param_ids
 
 
+def test_train_keeps_encoder_in_eval_mode_while_adapter_and_aggregator_remain_trainable(
+    monkeypatch, tmp_path
+):
+    trainer_module = import_trainer_module()
+    set_existing_default_checkpoint(monkeypatch, trainer_module, tmp_path)
+    _, vpr_model = patch_model_construction(monkeypatch, trainer_module)
+
+    module = trainer_module.DA3AdapterSALADLightningModule()
+    module.train()
+
+    assert module.vpr_model is vpr_model
+    assert module.vpr_model.encoder.training is False
+    assert any(parameter.requires_grad for parameter in module.vpr_model.feature_adapter.parameters())
+    assert any(parameter.requires_grad for parameter in module.vpr_model.aggregator.parameters())
+
+
 def test_parse_args_supports_disabling_aggregator_warm_start(monkeypatch):
     trainer_module = import_trainer_module()
     calls, _ = patch_model_construction(monkeypatch, trainer_module)

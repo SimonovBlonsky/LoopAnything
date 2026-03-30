@@ -375,6 +375,11 @@ class DA3AdapterSALADLightningModule(pl.LightningModule):
         self.vpr_model.encoder.requires_grad_(False)
         self.vpr_model.encoder.eval()
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self._freeze_encoder()
+        return self
+
     def _named_trainable_parameters(self) -> list[tuple[str, nn.Parameter]]:
         return [
             (name, parameter)
