@@ -1,20 +1,83 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Iterable, Mapping
 
 import torch
 import yaml
 
 from depth_anything_3.api import DepthAnything3
+from depth_anything_3.model import VPRaggregators
 from depth_anything_3.model.cross_view_fusion import build_cross_view_fusion
 from depth_anything_3.model.retrieval_strategy import build_retrieval_strategy
 from depth_anything_3.model.unified_pipeline import UnifiedPipeline
-from depth_anything_3.model.vpr_helper import (
-    build_aggregator,
-    build_feature_adapter,
-    extract_prefixed_state_dict,
-    _unwrap_checkpoint_state_dict,
+from depth_anything_3.model.vpr_feature_adapter import (
+    DualBranchFeatureAdapter,
+    IdentityFeatureAdapter,
+    PatchOnlyFeatureAdapter,
 )
+
+
+# ---------------------------------------------------------------------------
+# VPR component builders (migrated from vpr_helper.py)
+# ---------------------------------------------------------------------------
+
+
+def build_aggregator(agg_arch: str, agg_config: dict | None = None):
+    """Build a VPR aggregator by name."""
+    agg_config = {} if agg_config is None else dict(agg_config)
+    name = agg_arch.lower()
+    if name == "cosplace":
+        return VPRaggregators.CosPlace(**agg_config)
+    if name == "gem":
+        agg_config.setdefault("p", 3)
+        return VPRaggregators.GeMPool(**agg_config)
+    if name == "convap":
+        return VPRaggregators.ConvAP(**agg_config)
+    if name == "mixvpr":
+        return VPRaggregators.MixVPR(**agg_config)
+    if name == "salad":
+        return VPRaggregators.SALAD(**agg_config)
+    raise ValueError(f"Unsupported aggregator: {agg_arch}")
+
+
+def build_feature_adapter(adapter_arch: str | None = None, adapter_config: dict | None = None):
+    """Build a feature adapter by name."""
+    adapter_config = {} if adapter_config is None else dict(adapter_config)
+    if adapter_arch is None:
+        return IdentityFeatureAdapter()
+    name = str(adapter_arch).lower()
+    if name == "identity":
+        return IdentityFeatureAdapter()
+    if name == "patch_only":
+        return PatchOnlyFeatureAdapter(**adapter_config)
+    if name == "dual_branch":
+        return DualBranchFeatureAdapter(**adapter_config)
+    raise ValueError(f"Unsupported feature adapter: {adapter_arch}")
+
+
+def extract_prefixed_state_dict(
+    state_dict: Mapping[str, torch.Tensor], prefixes: Iterable[str],
+) -> dict[str, torch.Tensor]:
+    """Extract keys matching any prefix, stripping the prefix."""
+    extracted = {}
+    for key, value in state_dict.items():
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                extracted[key[len(prefix):]] = value
+                break
+    return extracted
+
+
+def _unwrap_checkpoint_state_dict(checkpoint):
+    """Unwrap a Lightning/PyTorch checkpoint to its raw state_dict."""
+    if not isinstance(checkpoint, Mapping):
+        raise ValueError("Expected checkpoint to contain a mapping of parameters")
+    if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], Mapping):
+        return checkpoint["state_dict"]
+    if "model" in checkpoint and isinstance(checkpoint["model"], Mapping):
+        return checkpoint["model"]
+    return checkpoint
 
 
 VPR_ADAPTER_PREFIXES = (

@@ -1,0 +1,62 @@
+model:
+  da3_model_name_or_path: "depth-anything/DA3-BASE"
+  vpr_checkpoint: null  # no warm-start; train adapter + SALAD from scratch (or set path to warm-start)
+  aux_layer: 5
+
+  feature_adapter_arch: "patch_only"
+  feature_adapter_config:
+    channels: 768
+    bottleneck: 640
+
+  agg_arch: "salad"
+  agg_config:
+    num_channels: 768
+    num_clusters: 16
+    cluster_dim: 32
+    token_dim: 32
+
+  freeze:
+    backbone: true
+    vpr: false          # adapter + SALAD trainable
+    fusion: true        # not used in VPR training, freeze
+    head: true          # not used in VPR training, freeze
+
+  # These are required by build_unified_pipeline but unused during VPR training
+  retrieval:
+    strategy: "soft_attention"
+    top_k: 10
+    temperature: 1.0
+
+  cross_view_fusion:
+    embed_dim: 1536
+    num_heads: 8
+    num_layers: 2
+    bidirectional: false
+    dropout: 0.0
+
+training:
+  mode: "vpr"
+
+  batch_size: 60
+  img_per_place: 4
+  min_img_per_place: 4
+  image_size: [224, 224]
+  num_workers: 10
+  max_epochs: 4
+
+  optimizer:
+    name: "adamw"
+    adapter_lr: 1.0e-4
+    aggregator_lr: 6.0e-5
+    weight_decay: 9.5e-9
+
+  scheduler:
+    name: "linear"
+    start_factor: 1.0
+    end_factor: 0.2
+    total_iters: 4000
+
+  validation:
+    val_set_names:
+      - "pitts30k_val"
+      - "pitts30k_test"

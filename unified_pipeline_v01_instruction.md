@@ -31,6 +31,177 @@ chess, fire, heads, office, pumpkin, redkitchen, stairs
 
 ---
 
+## 0. Pipeline 架构
+
+### 0.1 完整前向流程（`forward()`）
+
+```
+Query Image [B,1,3,H,W]
+        |
+        v
++------------------+
+|  DA3 Backbone    |  (frozen, DINOv2-based)
+|  (single pass)   |
++------------------+
+        |
+        +---> feats (final layer)          aux_feats (intermediate layer 5)
+        |     [B,1,P,1536]                 [B,1,P,768]
+        |           |                            |
+        |           |                            v
+        |           |                  +--------------------+
+        |           |                  | extract_aux_patch  |
+        |           |                  | _tokens            |
+        |           |                  +--------------------+
+        |           |                            |
+        |           |                       [B,P,768]
+        |           |                            v
+        |           |                  +--------------------+
+        |           |                  | Feature Adapter    |  (PatchOnly, trainable)
+        |           |                  | (bottleneck 640)   |
+        |           |                  +--------------------+
+        |           |                            |
+        |           |                    feature_map + global_token
+        |           |                            v
+        |           |                  +--------------------+
+        |           |                  | SALAD Aggregator   |  (trainable)
+        |           |                  | (16 clusters)      |
+        |           |                  +--------------------+
+        |           |                            |
+        |           |                    query_descriptor [B,D]
+        |           |                            |
+        |           |         +------------------+
+        |           |         |
+        |           |         v
+        |           |  +------------------+     candidate_descriptors [K,D]
+        |           |  | Retrieval        |  <--- (from database)
+        |           |  | Strategy         |
+        |           |  | (SoftAttention)  |
+        |           |  +------------------+
+        |           |         |
+        |           |    weights [B,K]
+        |           |         |
+        |           v         v
+        |  +---------------------------------+    candidate_patch_tokens [B,K,P,C]
+        |  |   Cross-View Fusion             | <--- candidate_camera_tokens [B,K,C]
+        |  |   (cross-attention, 2 layers)   |      (from database)
+        |  +---------------------------------+
+        |           |
+        |   enhanced_patch [B,P,1536]
+        |   enhanced_cam   [B,1536]
+        |           |
+        |           v
+        |  +------------------+
+        |  |  DA3 Head        |  (DualDPT, trainable)
+        |  |  (depth/3DGS)   |
+        |  +------------------+
+        |           |
+        |   enhanced_cam
+        |           |
+        |           v
+        |  +------------------+
+        |  |  CamDec          |  (trainable)
+        |  +------------------+
+        |           |
+        |       pose_enc [B,1,9]
+        |           |
+        |           v
+        |  +------------------+
+        |  | pose_encoding_   |  (caller-side decoding)
+        |  | to_extri_intri() |
+        |  +------------------+
+        |           |
+        |       c2w [B,1,4,4]  (camera-to-world)
+```
+
+### 0.2 调用模式总览
+
+```
+                            UnifiedPipeline
+    ┌──────────────────────────────────────────────────┐
+    │                                                  │
+    │   retrieval_only()        forward()              │
+    │   ┌──────────┐     ┌─────────────────────┐       │
+    │   │ Backbone │     │ Backbone            │       │
+    │   │    +     │     │    +                │       │
+    │   │ Adapter  │     │ Adapter + Retrieval │       │
+    │   │    +     │     │    +                │       │
+    │   │ SALAD    │     │ Fusion + Head       │       │
+    │   └──┬───────┘     └────────┬────────────┘       │
+    │      │                      │                    │
+    │  descriptor            pose_enc                  │
+    │                                                  │
+    │   pose_only()      extract_database_features()   │
+    │   ┌──────────┐     ┌─────────────────────┐       │
+    │   │ Backbone │     │ Backbone            │       │
+    │   │ (q + K)  │     │    +                │       │
+    │   │    +     │     │ Adapter + SALAD     │       │
+    │   │ Fusion   │     │    +                │       │
+    │   │    +     │     │ extract final feats │       │
+    │   │ Head     │     └────────┬────────────┘       │
+    │   └──┬───────┘              │                    │
+    │      │               descriptor [B,D]            │
+    │  pose_enc            patch_tokens [B,P,C]        │
+    │                      camera_tokens [B,C]         │
+    └──────────────────────────────────────────────────┘
+```
+
+### 0.3 训练阶段冻结策略
+
+```
+                        Stage 1 (Pose)           VPR Training
+                        ─────────────            ────────────
+  DA3 Backbone          frozen                   frozen
+  Feature Adapter       frozen                   TRAINABLE
+  SALAD Aggregator      frozen                   TRAINABLE
+  Retrieval Strategy    --                       --
+  Cross-View Fusion     TRAINABLE                frozen
+  DA3 Head + CamDec     TRAINABLE                frozen
+                        ─────────────            ────────────
+  Loss                  Geodesic + L2 trans      MultiSimilarity
+  Data                  7scenes (pose pairs)     GSVCities (places)
+  Config                train_unified_stage1     train_unified_vpr
+```
+
+### 0.4 评估 / 部署流程
+
+```
+                    ┌───────────────────────────────────────────┐
+  Offline (建库)    │  for each db_frame:                       │
+                    │    extract_database_features(frame)       │
+                    │      → descriptor   → 存盘 (memmap)       │
+                    │      → patch_tokens → 存盘 (memmap)       │
+                    │      → camera_token → 存盘 (memmap)       │
+                    └───────────────────────────────────────────┘
+                                        |
+                                        v
+                    ┌───────────────────────────────────────────┐
+  Online (查询)     │  1. retrieval_only(query)                 │
+                    │      → query_descriptor                   │
+                    │  2. cosine_similarity → top-K indices     │
+                    │  3. load top-K patch/cam tokens (memmap)  │
+                    │  4. forward(query, cand_patch, cand_cam,  │
+                    │              cand_desc)                   │
+                    │      → pose_enc → decode → c2w            │
+                    └───────────────────────────────────────────┘
+```
+
+### 0.5 关键张量形状
+
+| 张量 | 形状 | 说明 |
+|------|------|------|
+| 输入图像 | `[B, 1, 3, H, W]` | H=W=504 (eval) 或 224 (VPR训练) |
+| aux_feats | `[B, 1, P, 768]` | P = (H/14)*(W/14), layer 5 输出 |
+| final feats patch | `[B, 1, P, 1536]` | 768*2 (cat_token) |
+| final feats cam | `[B, 1, 1536]` | camera token |
+| descriptor | `[B, D]` | D 取决于 SALAD 配置 |
+| candidate patch | `[B, K, P, C]` | K=top_k, C=1536 |
+| candidate cam | `[B, K, C]` | C=1536 |
+| weights | `[B, K]` | 检索权重，和为 1 |
+| pose_enc | `[B, 1, 9]` | 编码后的位姿 |
+| c2w | `[B, 1, 4, 4]` | camera-to-world 矩阵 |
+
+---
+
 ## 1. 评估（Evaluation）
 
 ### 1.1 单场景评估

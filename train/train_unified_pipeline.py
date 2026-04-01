@@ -42,7 +42,8 @@ def geodesic_rotation_loss(pred_R: torch.Tensor, gt_R: torch.Tensor) -> torch.Te
     """
     R_rel = torch.bmm(pred_R.transpose(1, 2), gt_R)
     trace = R_rel[:, 0, 0] + R_rel[:, 1, 1] + R_rel[:, 2, 2]
-    cos_angle = torch.clamp((trace - 1) / 2, -1.0, 1.0)
+    # Clamp away from ±1 to avoid infinite acos gradient (critical for FP16)
+    cos_angle = torch.clamp((trace - 1) / 2, -1.0 + 1e-7, 1.0 - 1e-7)
     angle = torch.acos(cos_angle)
     return angle.mean()
 
@@ -102,6 +103,23 @@ class UnifiedPipelineLightningModule(pl.LightningModule):
         cand_descs = torch.cat(all_descs, dim=0)  # [B*K, D]
         return cand_patches, cand_cams, cand_descs
 
+    @staticmethod
+    def _nan_check(tensor, name, batch_idx):
+        """Check for NaN/Inf and print diagnostic if found. Returns True if bad."""
+        if not torch.isfinite(tensor).all():
+            nan_count = torch.isnan(tensor).sum().item()
+            inf_count = torch.isinf(tensor).sum().item()
+            print(
+                f"\n[NaN DEBUG] batch={batch_idx} | '{name}' has "
+                f"{nan_count} NaN, {inf_count} Inf | "
+                f"shape={list(tensor.shape)} "
+                f"min={tensor[torch.isfinite(tensor)].min().item() if torch.isfinite(tensor).any() else 'N/A':.6g} "
+                f"max={tensor[torch.isfinite(tensor)].max().item() if torch.isfinite(tensor).any() else 'N/A':.6g}",
+                flush=True,
+            )
+            return True
+        return False
+
     def training_step(self, batch, batch_idx):
         query_image = batch["query_image"].unsqueeze(1)  # [B, 1, 3, H, W]
         query_pose = batch["query_pose"]  # [B, 4, 4]
@@ -111,14 +129,22 @@ class UnifiedPipelineLightningModule(pl.LightningModule):
         with torch.no_grad():
             cand_patches, cand_cams, cand_descs = self._extract_candidate_features(candidate_images)
 
+        self._nan_check(cand_patches, "cand_patches (backbone out)", batch_idx)
+        self._nan_check(cand_cams, "cand_cams (backbone out)", batch_idx)
+        self._nan_check(cand_descs, "cand_descs (backbone out)", batch_idx)
+
         # Forward through unified pipeline
         K = candidate_images.shape[1]
         output = self.pipeline(query_image, cand_patches, cand_cams, cand_descs[:K])
 
         # Decode pose_enc to c2w matrix
         pose_enc = output.pose_enc  # [B, 1, 9]
+        self._nan_check(pose_enc, "pose_enc (pipeline out)", batch_idx)
+
         image_size = (query_image.shape[-2], query_image.shape[-1])
         c2w, _ixt = pose_encoding_to_extri_intri(pose_enc, image_size)
+        self._nan_check(c2w, "c2w (decoded pose)", batch_idx)
+
         # c2w: [B, 1, 4, 4] camera-to-world
         pred_R = c2w[:, 0, :3, :3]  # [B, 3, 3]
         pred_t = c2w[:, 0, :3, 3]   # [B, 3]
@@ -129,6 +155,37 @@ class UnifiedPipelineLightningModule(pl.LightningModule):
         rot_loss = geodesic_rotation_loss(pred_R, gt_R)
         trans_loss = translation_loss(pred_t, gt_t)
         total_loss = self.rotation_weight * rot_loss + self.translation_weight * trans_loss
+
+        if self._nan_check(rot_loss, "rot_loss", batch_idx) or \
+           self._nan_check(trans_loss, "trans_loss", batch_idx):
+            # Print extra context to help locate the source
+            R_rel = torch.bmm(pred_R.transpose(1, 2), gt_R)
+            trace = R_rel[:, 0, 0] + R_rel[:, 1, 1] + R_rel[:, 2, 2]
+            cos_angle = (trace - 1) / 2
+            print(
+                f"[NaN DEBUG]   trace range: [{trace.min().item():.6g}, {trace.max().item():.6g}]",
+                flush=True,
+            )
+            print(
+                f"[NaN DEBUG]   cos_angle range (pre-clamp): [{cos_angle.min().item():.6g}, {cos_angle.max().item():.6g}]",
+                flush=True,
+            )
+            print(
+                f"[NaN DEBUG]   pred_R det: {torch.det(pred_R).tolist()}",
+                flush=True,
+            )
+            print(
+                f"[NaN DEBUG]   pred_t range: [{pred_t.min().item():.6g}, {pred_t.max().item():.6g}]",
+                flush=True,
+            )
+            print(
+                f"[NaN DEBUG]   query_descriptor finite: {torch.isfinite(output.query_descriptor).all().item()}",
+                flush=True,
+            )
+            print(
+                f"[NaN DEBUG]   candidate_weights: {output.candidate_weights[0].tolist()}",
+                flush=True,
+            )
 
         self.log("train/rot_loss", rot_loss, prog_bar=True)
         self.log("train/trans_loss", trans_loss, prog_bar=True)
@@ -257,6 +314,8 @@ def main():
         check_val_every_n_epoch=train_config.get("eval", {}).get("eval_every_n_epoch", 5),
         callbacks=[checkpoint_cb],
         precision="16-mixed",
+        gradient_clip_val=1.0,
+        gradient_clip_algorithm="norm",
         default_root_dir="./logs/unified_pipeline/",
     )
 
