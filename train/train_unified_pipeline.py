@@ -205,9 +205,11 @@ def build_scene_dataloaders(train_config):
     sampling = train_config.get("candidate_sampling", {})
     image_size = tuple(train_config.get("image_size", [504, 504]))
 
+    data_root = train_config.get("data_root", None)
+
     train_datasets = []
     for scene in scenes:
-        entries = load_scene_images_and_poses(dataset_name, scene, "train")
+        entries = load_scene_images_and_poses(dataset_name, scene, "train", data_root=data_root)
         ds = UnifiedVislocDataset(
             entries=entries,
             num_candidates=train_config.get("eval", {}).get("top_k", 10),

@@ -35,6 +35,7 @@ model:
 
 training:
   dataset: "7scenes"
+  data_root: "/mnt/nas_9/group/chenguyuan/NeurIPS26/LoopAnything-dev/reloc3r/data/7scenes"
   scenes:
     - chess
     - fire
