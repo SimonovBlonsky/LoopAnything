@@ -19,7 +19,8 @@ model:
     backbone: true
     vpr: true
     fusion: false
-    head: false
+    da3_head: true       # DualDPT head 已有 DA3 预训练权重，冻结
+    cam_dec: false        # cam_dec 接收 fusion 后的 enhanced_cam，需训练
 
   retrieval:
     strategy: "soft_attention"

@@ -129,9 +129,13 @@ def _apply_freeze(pipeline: UnifiedPipeline, freeze_config: dict):
         pipeline.cross_view_fusion.requires_grad_(False)
         pipeline.cross_view_fusion.eval()
 
-    if freeze_config.get("head", False):
+    # Support both the old combined "head" flag and separate "da3_head"/"cam_dec" flags.
+    # If "da3_head" or "cam_dec" is explicitly set, use them; otherwise fall back to "head".
+    head_flag = freeze_config.get("head", False)
+    if freeze_config.get("da3_head", head_flag):
         pipeline.da3_head.requires_grad_(False)
         pipeline.da3_head.eval()
+    if freeze_config.get("cam_dec", head_flag):
         pipeline.cam_dec.requires_grad_(False)
         pipeline.cam_dec.eval()
 

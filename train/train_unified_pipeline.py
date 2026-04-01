@@ -109,12 +109,16 @@ class UnifiedPipelineLightningModule(pl.LightningModule):
         if not torch.isfinite(tensor).all():
             nan_count = torch.isnan(tensor).sum().item()
             inf_count = torch.isinf(tensor).sum().item()
+            finite_mask = torch.isfinite(tensor)
+            if finite_mask.any():
+                vmin = f"{tensor[finite_mask].min().item():.6g}"
+                vmax = f"{tensor[finite_mask].max().item():.6g}"
+            else:
+                vmin, vmax = "N/A", "N/A"
             print(
                 f"\n[NaN DEBUG] batch={batch_idx} | '{name}' has "
                 f"{nan_count} NaN, {inf_count} Inf | "
-                f"shape={list(tensor.shape)} "
-                f"min={tensor[torch.isfinite(tensor)].min().item() if torch.isfinite(tensor).any() else 'N/A':.6g} "
-                f"max={tensor[torch.isfinite(tensor)].max().item() if torch.isfinite(tensor).any() else 'N/A':.6g}",
+                f"shape={list(tensor.shape)} min={vmin} max={vmax}",
                 flush=True,
             )
             return True
@@ -133,19 +137,51 @@ class UnifiedPipelineLightningModule(pl.LightningModule):
         self._nan_check(cand_cams, "cand_cams (backbone out)", batch_idx)
         self._nan_check(cand_descs, "cand_descs (backbone out)", batch_idx)
 
-        # Forward through unified pipeline
+        # ---- Step-by-step forward with NaN checks at each stage ----
         K = candidate_images.shape[1]
-        output = self.pipeline(query_image, cand_patches, cand_cams, cand_descs[:K])
+        pipeline = self.pipeline
 
-        # Decode pose_enc to c2w matrix
-        pose_enc = output.pose_enc  # [B, 1, 9]
-        self._nan_check(pose_enc, "pose_enc (pipeline out)", batch_idx)
+        # 1) Query backbone
+        feats, aux_feats, image_h, image_w = pipeline._run_backbone(query_image)
+        from depth_anything_3.model.vpr_feature_utils import extract_final_layer_features
+        q_patch, q_cam = extract_final_layer_features(feats)
+        self._nan_check(q_patch, "query_patch (backbone final)", batch_idx)
+        self._nan_check(q_cam, "query_cam (backbone final)", batch_idx)
 
+        # 2) VPR branch
+        query_descriptor = pipeline._run_vpr_branch(aux_feats, image_h, image_w)
+        self._nan_check(query_descriptor, "query_descriptor (VPR)", batch_idx)
+
+        # 3) Retrieval weights
+        candidate_weights = pipeline.retrieval_strategy(query_descriptor[0], cand_descs[:K])
+        candidate_weights = candidate_weights.unsqueeze(0).expand(query_image.shape[0], -1)
+        self._nan_check(candidate_weights, "candidate_weights (retrieval)", batch_idx)
+
+        # 4) Cross-view fusion
+        enhanced_patch, enhanced_cam = pipeline.cross_view_fusion(
+            q_patch, q_cam, cand_patches, cand_cams, candidate_weights,
+        )
+        self._nan_check(enhanced_patch, "enhanced_patch (fusion out)", batch_idx)
+        self._nan_check(enhanced_cam, "enhanced_cam (fusion out)", batch_idx)
+
+        # 5) DA3 head
+        fused_feats = []
+        for i, (patch, cam) in enumerate(feats):
+            if i < len(feats) - 1:
+                fused_feats.append((patch, cam))
+            else:
+                fused_feats.append((enhanced_patch.unsqueeze(1), enhanced_cam.unsqueeze(1)))
+        head_out = pipeline.da3_head(fused_feats, image_h, image_w, patch_start_idx=0)
+
+        # 6) CamDec → pose_enc
+        pose_enc = pipeline.cam_dec(enhanced_cam.unsqueeze(1))  # [B, 1, 9]
+        self._nan_check(pose_enc, "pose_enc (cam_dec out)", batch_idx)
+
+        # ---- Decode and compute loss ----
         image_size = (query_image.shape[-2], query_image.shape[-1])
         c2w, _ixt = pose_encoding_to_extri_intri(pose_enc, image_size)
         self._nan_check(c2w, "c2w (decoded pose)", batch_idx)
 
-        # c2w: [B, 1, 4, 4] camera-to-world
         pred_R = c2w[:, 0, :3, :3]  # [B, 3, 3]
         pred_t = c2w[:, 0, :3, 3]   # [B, 3]
 
@@ -158,34 +194,13 @@ class UnifiedPipelineLightningModule(pl.LightningModule):
 
         if self._nan_check(rot_loss, "rot_loss", batch_idx) or \
            self._nan_check(trans_loss, "trans_loss", batch_idx):
-            # Print extra context to help locate the source
             R_rel = torch.bmm(pred_R.transpose(1, 2), gt_R)
             trace = R_rel[:, 0, 0] + R_rel[:, 1, 1] + R_rel[:, 2, 2]
             cos_angle = (trace - 1) / 2
-            print(
-                f"[NaN DEBUG]   trace range: [{trace.min().item():.6g}, {trace.max().item():.6g}]",
-                flush=True,
-            )
-            print(
-                f"[NaN DEBUG]   cos_angle range (pre-clamp): [{cos_angle.min().item():.6g}, {cos_angle.max().item():.6g}]",
-                flush=True,
-            )
-            print(
-                f"[NaN DEBUG]   pred_R det: {torch.det(pred_R).tolist()}",
-                flush=True,
-            )
-            print(
-                f"[NaN DEBUG]   pred_t range: [{pred_t.min().item():.6g}, {pred_t.max().item():.6g}]",
-                flush=True,
-            )
-            print(
-                f"[NaN DEBUG]   query_descriptor finite: {torch.isfinite(output.query_descriptor).all().item()}",
-                flush=True,
-            )
-            print(
-                f"[NaN DEBUG]   candidate_weights: {output.candidate_weights[0].tolist()}",
-                flush=True,
-            )
+            print(f"[NaN DEBUG]   trace range: [{trace.min().item():.6g}, {trace.max().item():.6g}]", flush=True)
+            print(f"[NaN DEBUG]   cos_angle (pre-clamp): [{cos_angle.min().item():.6g}, {cos_angle.max().item():.6g}]", flush=True)
+            print(f"[NaN DEBUG]   pred_t range: [{pred_t.min().item():.6g}, {pred_t.max().item():.6g}]", flush=True)
+            print(f"[NaN DEBUG]   candidate_weights: {candidate_weights[0].tolist()}", flush=True)
 
         self.log("train/rot_loss", rot_loss, prog_bar=True)
         self.log("train/trans_loss", trans_loss, prog_bar=True)
