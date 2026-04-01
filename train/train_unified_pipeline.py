@@ -267,40 +267,73 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_scene_dataloaders(train_config):
-    """Build per-scene dataloaders for round-robin training."""
+def _build_datasets(train_config):
+    """Load scene entries and build UnifiedVislocDataset instances."""
     sys.path.insert(0, str(PROJECT_ROOT))
     from eval_unified_visloc import load_scene_images_and_poses
 
     dataset_name = train_config["dataset"]
-    scenes = train_config["scenes"]
     sampling = train_config.get("candidate_sampling", {})
     image_size = tuple(train_config.get("image_size", [504, 504]))
-
     data_root = train_config.get("data_root", None)
+    num_candidates = train_config.get("eval", {}).get("top_k", 10)
 
-    train_datasets = []
-    for scene in scenes:
-        entries = load_scene_images_and_poses(dataset_name, scene, "train", data_root=data_root)
-        ds = UnifiedVislocDataset(
+    def make_dataset(scene, split):
+        entries = load_scene_images_and_poses(dataset_name, scene, split, data_root=data_root)
+        return UnifiedVislocDataset(
             entries=entries,
-            num_candidates=train_config.get("eval", {}).get("top_k", 10),
+            num_candidates=num_candidates,
             pos_threshold=sampling.get("pos_threshold", 1.0),
             neg_threshold=sampling.get("neg_threshold", 3.0),
             pos_ratio=sampling.get("pos_ratio", 0.7),
             distance_alpha=sampling.get("distance_alpha", 0.5),
             image_size=image_size,
         )
-        train_datasets.append(ds)
 
-    combined = torch.utils.data.ConcatDataset(train_datasets)
-    return DataLoader(
-        combined,
-        batch_size=train_config["batch_size"],
+    return make_dataset
+
+
+def build_scene_dataloaders(train_config):
+    """Build train and (optionally) val dataloaders."""
+    make_dataset = _build_datasets(train_config)
+    scenes = train_config["scenes"]
+    batch_size = train_config["batch_size"]
+    num_workers = train_config.get("num_workers", 8)
+
+    # Train: all scenes, train split
+    train_datasets = [make_dataset(scene, "train") for scene in scenes]
+    combined_train = torch.utils.data.ConcatDataset(train_datasets)
+    train_loader = DataLoader(
+        combined_train,
+        batch_size=batch_size,
         shuffle=True,
-        num_workers=train_config.get("num_workers", 8),
+        num_workers=num_workers,
         pin_memory=True,
     )
+
+    # Val: pick scene(s) from config, test split
+    eval_config = train_config.get("eval", {})
+    val_scenes = eval_config.get("val_scenes", None)
+    if val_scenes is None:
+        # Default: use the first scene's test split
+        val_scenes = [scenes[0]]
+    elif isinstance(val_scenes, str):
+        val_scenes = [val_scenes]
+
+    val_datasets = [make_dataset(scene, "test") for scene in val_scenes]
+    combined_val = torch.utils.data.ConcatDataset(val_datasets)
+    val_loader = DataLoader(
+        combined_val,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    print(f"Train: {len(combined_train)} samples from {len(scenes)} scenes")
+    print(f"Val:   {len(combined_val)} samples from {val_scenes}")
+
+    return train_loader, val_loader
 
 
 def main():
@@ -311,7 +344,7 @@ def main():
     train_config = config["training"]
 
     model = UnifiedPipelineLightningModule(config)
-    train_loader = build_scene_dataloaders(train_config)
+    train_loader, val_loader = build_scene_dataloaders(train_config)
 
     checkpoint_cb = pl.callbacks.ModelCheckpoint(
         monitor="val/trans_err_m",
@@ -322,11 +355,12 @@ def main():
         mode="min",
     )
 
+    eval_config = train_config.get("eval", {})
     trainer = pl.Trainer(
         accelerator="gpu",
         devices=args.devices,
         max_epochs=train_config["max_epochs"],
-        check_val_every_n_epoch=train_config.get("eval", {}).get("eval_every_n_epoch", 5),
+        check_val_every_n_epoch=eval_config.get("eval_every_n_epoch", 1),
         callbacks=[checkpoint_cb],
         precision="16-mixed",
         gradient_clip_val=1.0,
@@ -337,6 +371,7 @@ def main():
     trainer.fit(
         model=model,
         train_dataloaders=train_loader,
+        val_dataloaders=val_loader,
         ckpt_path=args.resume_from,
     )
 

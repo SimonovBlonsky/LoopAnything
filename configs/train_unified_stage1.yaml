@@ -70,5 +70,7 @@ training:
     scene_sampling: "round_robin"
 
   eval:
-    eval_every_n_epoch: 5
+    eval_every_n_epoch: 1
+    val_scenes:
+      - heads
     top_k: 10
