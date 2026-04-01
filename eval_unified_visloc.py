@@ -31,31 +31,32 @@ from reloc3r.utils.metric import get_rot_err
 
 # Dataset configs
 SEVEN_SCENES = {
-    "root": str(REPO_ROOT / "data" / "7scenes"),
+    "root": str(REPO_ROOT / "reloc3r" / "data" / "7scenes"),
     "scenes": ["chess", "fire", "heads", "office", "pumpkin", "redkitchen", "stairs"],
     "intrinsics": np.array([[525.0, 0.0, 320.0], [0.0, 525.0, 240.0], [0.0, 0.0, 1.0]], dtype=np.float32),
 }
 CAMBRIDGE = {
-    "root": str(REPO_ROOT / "data" / "cambridge"),
+    "root": str(REPO_ROOT / "reloc3r" / "data" / "cambridge"),
     "scenes": ["GreatCourt", "KingsCollege", "OldHospital", "ShopFacade", "StMarysChurch"],
     "intrinsics": np.array([[1671.31, 0.0, 960.0], [0.0, 1671.31, 540.0], [0.0, 0.0, 1.0]], dtype=np.float32),
 }
 DATASET_CONFIGS = {"7scenes": SEVEN_SCENES, "cambridge": CAMBRIDGE}
 
 
-def load_scene_images_and_poses(dataset_name, scene, split):
+def load_scene_images_and_poses(dataset_name, scene, split, data_root=None):
     """Load all images and GT poses for a scene split.
 
     Args:
         dataset_name: "7scenes" or "cambridge"
         scene: scene name
         split: "train" or "test"
+        data_root: override default dataset root path
 
     Returns:
         list of dicts with keys: image_path, pose (4x4 np.array)
     """
     config = DATASET_CONFIGS[dataset_name]
-    root = config["root"]
+    root = data_root if data_root else config["root"]
 
     if dataset_name == "7scenes":
         return _load_7scenes_split(root, scene, split)
@@ -66,11 +67,32 @@ def load_scene_images_and_poses(dataset_name, scene, split):
 
 
 def _load_7scenes_split(root, scene, split):
-    """Load 7Scenes image paths and poses for a split."""
+    """Load 7Scenes image paths and poses for a split.
+
+    Uses TrainSplit.txt / TestSplit.txt to filter sequences.
+    """
     scene_dir = Path(root) / scene
+
+    # Read split file to get allowed sequences
+    split_map = {"train": "TrainSplit.txt", "test": "TestSplit.txt"}
+    split_file = scene_dir / split_map[split]
+    if not split_file.exists():
+        raise FileNotFoundError(f"Split file not found: {split_file}")
+
+    allowed_seqs = set()
+    with open(split_file) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                # "sequence1" -> "seq-01", "sequence12" -> "seq-12"
+                seq_num = int(line.replace("sequence", ""))
+                allowed_seqs.add(f"seq-{seq_num:02d}")
+
     seq_dirs = sorted([d for d in scene_dir.iterdir() if d.is_dir() and d.name.startswith("seq-")])
     entries = []
     for seq_dir in seq_dirs:
+        if seq_dir.name not in allowed_seqs:
+            continue
         frames = sorted(seq_dir.glob("*.color.png"))
         for frame_path in frames:
             pose_path = str(frame_path).replace(".color.png", ".pose.txt")
@@ -123,50 +145,92 @@ def preprocess_image(image_path, target_size=(504, 504)):
 
 
 @torch.no_grad()
-def build_database(pipeline, db_entries, device, batch_size=16, target_size=(504, 504)):
-    """Build database of descriptors and final features."""
-    all_descriptors = []
-    all_patch_tokens = []
-    all_camera_tokens = []
+def build_database(pipeline, db_entries, device, batch_size=16, target_size=(504, 504),
+                   cache_dir=None):
+    """Build database features and save all to disk as numpy memmap files.
 
-    for i in tqdm(range(0, len(db_entries), batch_size), desc="Building database"):
+    Args:
+        cache_dir: directory for memmap files. If None, uses a temp directory.
+
+    Returns:
+        desc_mmap: np.memmap [N, D] on disk
+        patch_mmap: np.memmap [N, P, C] on disk
+        cam_mmap: np.memmap [N, C] on disk
+    """
+    import tempfile
+
+    if cache_dir is None:
+        cache_dir = Path(tempfile.mkdtemp(prefix="unified_db_"))
+    else:
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+    N = len(db_entries)
+
+    # First batch to determine shapes
+    first_batch = torch.stack([preprocess_image(db_entries[0]["image_path"], target_size)])
+    first_batch = first_batch.unsqueeze(1).to(device)
+    desc0, patch0, cam0 = pipeline.extract_database_features(first_batch)
+    D = desc0.shape[1]
+    P, C_patch = patch0.shape[1], patch0.shape[2]
+    C_cam = cam0.shape[1]
+
+    # Create memmap files for all three
+    desc_mmap = np.memmap(cache_dir / "db_descriptors.mmap", dtype=np.float32, mode="w+", shape=(N, D))
+    patch_mmap = np.memmap(cache_dir / "db_patch_tokens.mmap", dtype=np.float32, mode="w+", shape=(N, P, C_patch))
+    cam_mmap = np.memmap(cache_dir / "db_camera_tokens.mmap", dtype=np.float32, mode="w+", shape=(N, C_cam))
+
+    print(f"Database cache dir: {cache_dir}")
+    print(f"  descriptors:  [{N}, {D}] = {N * D * 4 / 1e6:.0f} MB")
+    print(f"  patch_tokens: [{N}, {P}, {C_patch}] = {N * P * C_patch * 4 / 1e9:.1f} GB")
+    print(f"  camera_tokens: [{N}, {C_cam}] = {N * C_cam * 4 / 1e6:.0f} MB")
+
+    for i in tqdm(range(0, N, batch_size), desc="Building database"):
         batch_entries = db_entries[i:i+batch_size]
         images = torch.stack([preprocess_image(e["image_path"], target_size) for e in batch_entries])
-        images = images.unsqueeze(1).to(device)  # [B, 1, 3, H, W]
+        images = images.unsqueeze(1).to(device)
 
         descriptors, patch_tokens, camera_tokens = pipeline.extract_database_features(images)
-        all_descriptors.append(descriptors.cpu())
-        all_patch_tokens.append(patch_tokens.cpu())
-        all_camera_tokens.append(camera_tokens.cpu())
 
-    return (
-        torch.cat(all_descriptors, dim=0),
-        torch.cat(all_patch_tokens, dim=0),
-        torch.cat(all_camera_tokens, dim=0),
-    )
+        bs = descriptors.shape[0]
+        desc_mmap[i:i+bs] = descriptors.cpu().numpy()
+        patch_mmap[i:i+bs] = patch_tokens.cpu().numpy()
+        cam_mmap[i:i+bs] = camera_tokens.cpu().numpy()
+
+    desc_mmap.flush()
+    patch_mmap.flush()
+    cam_mmap.flush()
+
+    return desc_mmap, patch_mmap, cam_mmap
 
 
 @torch.no_grad()
 def evaluate_scene(pipeline, db_entries, query_entries, db_descriptors, db_patch_tokens,
                    db_camera_tokens, device, top_k=10, target_size=(504, 504)):
-    """Evaluate unified pipeline on a single scene."""
+    """Evaluate unified pipeline on a single scene.
+
+    All db_* args are np.memmap on disk; only top-K slices are loaded per query.
+    """
     rotation_errors = []
     translation_errors = []
+
+    # Load descriptors to device once (small enough: N*D*4 bytes)
+    db_desc_device = torch.from_numpy(np.array(db_descriptors)).to(device)
 
     for q_entry in tqdm(query_entries, desc="Evaluating queries"):
         query_img = preprocess_image(q_entry["image_path"], target_size)
         query_img = query_img.unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, 3, H, W]
 
-        # First get top-K indices via retrieval
+        # Retrieval
         query_desc = pipeline.retrieval_only(query_img)  # [1, D]
-        sims = torch.nn.functional.cosine_similarity(query_desc[0].unsqueeze(0), db_descriptors.to(device), dim=1)
+        sims = torch.nn.functional.cosine_similarity(query_desc[0].unsqueeze(0), db_desc_device, dim=1)
         k = min(top_k, sims.shape[0])
-        topk_indices = sims.topk(k).indices.cpu()
+        topk_indices = sims.topk(k).indices.cpu().numpy()
 
-        # Get candidate features
-        cand_patch = db_patch_tokens[topk_indices].unsqueeze(0).to(device)  # [1, K, P, C]
-        cand_cam = db_camera_tokens[topk_indices].unsqueeze(0).to(device)  # [1, K, C]
-        cand_desc = db_descriptors[topk_indices].to(device)  # [K, D]
+        # Load only top-K features from memmap (disk → GPU, tiny amount)
+        cand_patch = torch.from_numpy(np.array(db_patch_tokens[topk_indices])).unsqueeze(0).to(device)
+        cand_cam = torch.from_numpy(np.array(db_camera_tokens[topk_indices])).unsqueeze(0).to(device)
+        cand_desc = torch.from_numpy(np.array(db_descriptors[topk_indices])).to(device)
 
         # Run full pipeline
         output = pipeline(query_img, cand_patch, cand_cam, cand_desc)
@@ -204,6 +268,8 @@ def main():
     parser.add_argument("--output-dir", type=str, default="workspace/eval_results")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--image-size", type=int, nargs=2, default=[504, 504])
+    parser.add_argument("--data-root", type=str, default=None, help="Override default dataset root path")
+    parser.add_argument("--cache-dir", type=str, default=None, help="Directory for database feature cache (memmap)")
     args = parser.parse_args()
 
     config = load_config(args.model_config)
@@ -217,13 +283,14 @@ def main():
     pipeline.eval()
 
     target_size = tuple(args.image_size)
-    db_entries = load_scene_images_and_poses(args.dataset, args.scene, "train")
-    query_entries = load_scene_images_and_poses(args.dataset, args.scene, "test")
+    db_entries = load_scene_images_and_poses(args.dataset, args.scene, "train", data_root=args.data_root)
+    query_entries = load_scene_images_and_poses(args.dataset, args.scene, "test", data_root=args.data_root)
 
     print(f"Database: {len(db_entries)} images, Queries: {len(query_entries)} images")
 
     db_descriptors, db_patch_tokens, db_camera_tokens = build_database(
-        pipeline, db_entries, args.device, batch_size=args.batch_size, target_size=target_size
+        pipeline, db_entries, args.device, batch_size=args.batch_size, target_size=target_size,
+        cache_dir=args.cache_dir,
     )
 
     rerrs, terrs = evaluate_scene(
