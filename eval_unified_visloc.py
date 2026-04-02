@@ -10,7 +10,8 @@ from tqdm import tqdm
 
 # Add paths for external dependencies
 PROJECT_ROOT = Path(__file__).resolve().parent
-REPO_ROOT = PROJECT_ROOT.parents[2]  # ~/code/NeurIPS26
+# change repo root setting to fit server path
+REPO_ROOT = PROJECT_ROOT.parents[0]  # Local: ~/code/NeurIPS26 Server: /mnt/nas_9/group/chenguyuan/NeurIPS26/LoopAnything-dev
 SRC_ROOT = PROJECT_ROOT / "src"
 for path in (SRC_ROOT, str(REPO_ROOT)):
     if str(path) not in sys.path:

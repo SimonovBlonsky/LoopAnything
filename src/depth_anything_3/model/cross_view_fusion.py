@@ -39,6 +39,12 @@ class _CrossAttentionLayer(nn.Module):
 class CrossViewFusion(nn.Module):
     """Cross-view fusion via cross-attention between query and candidate features.
 
+    Uses zero-initialized residual gates so fusion output starts as identity
+    (the original query tokens pass through unchanged). This ensures:
+    - Pretrained downstream modules (da3_head, cam_dec) receive valid inputs from the start
+    - The fusion contribution is learned gradually during training
+    - No NaN from randomly initialized attention producing garbage outputs
+
     Default: unidirectional (query attends to candidates).
     Optional: bidirectional (candidates also attend to query).
     """
@@ -65,6 +71,10 @@ class CrossViewFusion(nn.Module):
             ])
 
         self.cam_cross_attn = _CrossAttentionLayer(embed_dim, num_heads, dropout)
+
+        # Zero-initialized gates: at init, fusion output = original query tokens
+        self.patch_gate = nn.Parameter(torch.zeros(1))
+        self.cam_gate = nn.Parameter(torch.zeros(1))
 
     def forward(
         self,
@@ -96,22 +106,30 @@ class CrossViewFusion(nn.Module):
         kv_patches = weighted_cand_patches.reshape(B, K * N, C)
 
         # Query-to-candidate cross attention on patch tokens
-        enhanced_patches = query_patch_tokens
+        fused_patches = query_patch_tokens
         for layer in self.q2c_layers:
-            enhanced_patches = layer(enhanced_patches, kv_patches)
+            fused_patches = layer(fused_patches, kv_patches)
 
         if self.bidirectional:
-            # Candidate-to-query (update kv, though output is unused for now)
             enhanced_kv = kv_patches
             for layer in self.c2q_layers:
-                enhanced_kv = layer(enhanced_kv, enhanced_patches)
+                enhanced_kv = layer(enhanced_kv, fused_patches)
 
-        # Camera token fusion: query camera attends to weighted candidate camera tokens
-        w_cam = candidate_weights.unsqueeze(-1)  # [B, K, 1]
-        weighted_cand_cams = candidate_camera_tokens * w_cam  # [B, K, C]
-        query_cam_seq = query_camera_token.unsqueeze(1)  # [B, 1, C]
-        enhanced_cam_seq = self.cam_cross_attn(query_cam_seq, weighted_cand_cams)  # [B, 1, C]
-        enhanced_camera_token = enhanced_cam_seq.squeeze(1)  # [B, C]
+        # Gated residual: start as identity, gradually blend in fusion
+        patch_delta = fused_patches - query_patch_tokens
+        enhanced_patches = query_patch_tokens + self.patch_gate * patch_delta
+
+        # Camera token fusion in FP32 to avoid NaN with small KV sequence (K=10)
+        with torch.cuda.amp.autocast(enabled=False):
+            w_cam = candidate_weights.float().unsqueeze(-1)  # [B, K, 1]
+            weighted_cand_cams = candidate_camera_tokens.float() * w_cam  # [B, K, C]
+            query_cam_seq = query_camera_token.float().unsqueeze(1)  # [B, 1, C]
+            fused_cam_seq = self.cam_cross_attn(query_cam_seq, weighted_cand_cams)  # [B, 1, C]
+            fused_cam = fused_cam_seq.squeeze(1)  # [B, C]
+
+        # Gated residual for camera token
+        cam_delta = fused_cam.to(query_camera_token.dtype) - query_camera_token
+        enhanced_camera_token = query_camera_token + self.cam_gate * cam_delta
 
         return enhanced_patches, enhanced_camera_token
 

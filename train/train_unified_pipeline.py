@@ -205,6 +205,12 @@ class UnifiedPipelineLightningModule(pl.LightningModule):
         self.log("train/rot_loss", rot_loss, prog_bar=True)
         self.log("train/trans_loss", trans_loss, prog_bar=True)
         self.log("train/total_loss", total_loss, prog_bar=True)
+
+        # Log fusion gate values to track how fast fusion contribution grows
+        fusion = pipeline.cross_view_fusion
+        self.log("train/patch_gate", fusion.patch_gate.item(), prog_bar=False)
+        self.log("train/cam_gate", fusion.cam_gate.item(), prog_bar=False)
+
         return total_loss
 
     def validation_step(self, batch, batch_idx):
