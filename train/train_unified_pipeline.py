@@ -213,6 +213,10 @@ class UnifiedPipelineLightningModule(pl.LightningModule):
 
         return total_loss
 
+    def on_validation_epoch_start(self):
+        self._val_rerrs = []
+        self._val_terrs = []
+
     def validation_step(self, batch, batch_idx):
         query_image = batch["query_image"].unsqueeze(1)
         query_pose = batch["query_pose"]
@@ -238,8 +242,22 @@ class UnifiedPipelineLightningModule(pl.LightningModule):
         for i in range(pred_R.shape[0]):
             rerr = get_rot_err(pred_R[i], gt_R[i])
             terr = np.linalg.norm(pred_t[i] - gt_t[i])
-            self.log("val/rot_err_deg", rerr, on_step=False, on_epoch=True)
-            self.log("val/trans_err_m", terr, on_step=False, on_epoch=True)
+            self._val_rerrs.append(rerr)
+            self._val_terrs.append(terr)
+
+    def on_validation_epoch_end(self):
+        if not self._val_rerrs:
+            return
+        med_rerr = np.median(self._val_rerrs)
+        med_terr = np.median(self._val_terrs)
+        self.log("val/rot_err_deg", med_rerr, prog_bar=True)
+        self.log("val/trans_err_m", med_terr, prog_bar=True)
+        print(
+            f"\n[Epoch {self.current_epoch}] Val median pose error: "
+            f"{med_terr:.4f} m  {med_rerr:.2f} deg  "
+            f"({len(self._val_rerrs)} queries)",
+            flush=True,
+        )
 
     def configure_optimizers(self):
         opt_config = self.train_config["optimizer"]
