@@ -4,25 +4,24 @@ import torch
 import torch.nn as nn
 from addict import Dict
 
-from depth_anything_3.model.cross_view_fusion import CrossViewFusion
 from depth_anything_3.model.retrieval_strategy import BaseRetrievalStrategy
 from depth_anything_3.model.vpr_feature_utils import (
     extract_aux_patch_tokens,
-    extract_final_layer_features,
     patch_tokens_to_feature_dict,
 )
 
 
 class UnifiedPipeline(nn.Module):
-    """Unified image retrieval + pose regression pipeline.
+    """Unified image retrieval + pose regression pipeline v1.1.
 
-    Single backbone pass: intermediate layer → VPR side branch (adapter + SALAD),
-    final layer → cross-view fusion with retrieved candidates → Head → pose.
+    Two-stage architecture:
+        Stage 1 (retrieval): query single-view backbone → aux features → VPR descriptor
+        Stage 2 (pose): [query, top-M candidates] multi-view backbone → alternate attention → cam_dec → pose
 
     Three calling modes:
-        forward():        full unified feed-forward
+        forward():        full pipeline (retrieval + pose)
         retrieval_only(): extract global descriptors only
-        pose_only():      given pre-selected candidates, run pose regression
+        pose_only():      given pre-selected candidates, multi-view backbone → pose
     """
 
     PATCH_SIZE = 14
@@ -33,23 +32,25 @@ class UnifiedPipeline(nn.Module):
         feature_adapter: nn.Module,
         aggregator: nn.Module,
         retrieval_strategy: BaseRetrievalStrategy,
-        cross_view_fusion: CrossViewFusion,
         da3_head: nn.Module,
         cam_dec: nn.Module,
         aux_layer: int = 5,
+        pose_top_m: int = 3,
     ):
         super().__init__()
         self.da3_backbone = da3_backbone
         self.feature_adapter = feature_adapter
         self.aggregator = aggregator
         self.retrieval_strategy = retrieval_strategy
-        self.cross_view_fusion = cross_view_fusion
         self.da3_head = da3_head
         self.cam_dec = cam_dec
         self.aux_layer = aux_layer
+        self.pose_top_m = pose_top_m
 
-    def _run_backbone(self, x: torch.Tensor):
-        """Run backbone once, exporting aux layer features.
+    # ----- Stage 1: Retrieval -----
+
+    def _run_backbone_single(self, x: torch.Tensor):
+        """Run backbone in single-view mode, exporting aux layer features.
 
         Args:
             x: [B, 1, 3, H, W] single-view input
@@ -61,12 +62,13 @@ class UnifiedPipeline(nn.Module):
         """
         image_h, image_w = x.shape[-2], x.shape[-1]
         feats, aux_feats = self.da3_backbone(
-            x, cam_token=None, export_feat_layers=[self.aux_layer], ref_view_strategy="saddle_balanced"
+            x, cam_token=None, export_feat_layers=[self.aux_layer],
+            ref_view_strategy="saddle_balanced",
         )
         return feats, aux_feats, image_h, image_w
 
     def _run_vpr_branch(self, aux_feats, image_h, image_w):
-        """VPR side branch: aux features → adapter → SALAD → descriptor.
+        """VPR side branch: aux features -> adapter -> SALAD -> descriptor.
 
         Args:
             aux_feats: aux features from backbone
@@ -76,149 +78,207 @@ class UnifiedPipeline(nn.Module):
             descriptor: [B, D] global descriptor
         """
         patch_tokens = extract_aux_patch_tokens(aux_feats)
-        feat_dict = patch_tokens_to_feature_dict(patch_tokens, image_h, image_w, self.PATCH_SIZE)
+        feat_dict = patch_tokens_to_feature_dict(
+            patch_tokens, image_h, image_w, self.PATCH_SIZE,
+        )
         feat_dict = self.feature_adapter(feat_dict)
-        descriptor = self.aggregator((feat_dict["feature_map"], feat_dict["global_token"]))
+        descriptor = self.aggregator(
+            (feat_dict["feature_map"], feat_dict["global_token"]),
+        )
         return descriptor
 
-    def _run_pose_branch(self, feats, candidate_patch_tokens, candidate_camera_tokens,
-                         candidate_weights, image_h, image_w):
-        """Pose branch: fusion + head + cam_dec.
+    # ----- Stage 2: Multi-view Pose -----
+
+    def _run_backbone_multiview(self, multi_view_input: torch.Tensor):
+        """Run backbone in multi-view mode with alternate attention.
 
         Args:
-            feats: backbone feats (list of tuples)
-            candidate_patch_tokens: [B, K, P, C] candidate final layer patch tokens
-            candidate_camera_tokens: [B, K, C] candidate final layer camera tokens
-            candidate_weights: [B, K] retrieval weights
+            multi_view_input: [B, 1+M, 3, H, W] query (view 0) + M candidates
+
+        Returns:
+            feats: list of (patch_tokens [B, 1+M, P, C], camera_tokens [B, 1+M, C])
+            image_h, image_w: image dimensions
+        """
+        image_h, image_w = multi_view_input.shape[-2], multi_view_input.shape[-1]
+        feats, _ = self.da3_backbone(
+            multi_view_input, cam_token=None, export_feat_layers=[],
+            ref_view_strategy="saddle_balanced",
+        )
+        return feats, image_h, image_w
+
+    def _run_pose_cam_dec(self, feats, image_h, image_w):
+        """Pose via cam_dec path (differentiable, for training).
+
+        Args:
+            feats: backbone multi-view feats
             image_h, image_w: image dimensions
 
         Returns:
-            output dict with pose_enc and head outputs
+            Dict with pose_enc [B, 1+M, 9] and decoded extrinsics/intrinsics
         """
-        query_patch, query_cam = extract_final_layer_features(feats)
+        from depth_anything_3.model.utils.transform import pose_encoding_to_extri_intri
+        from depth_anything_3.utils.geometry import affine_inverse
 
-        enhanced_patch, enhanced_cam = self.cross_view_fusion(
-            query_patch, query_cam,
-            candidate_patch_tokens, candidate_camera_tokens,
-            candidate_weights,
-        )
+        # cam_dec expects camera tokens [B, S, C]
+        camera_tokens = feats[-1][1]  # [B, 1+M, C]
+        pose_enc = self.cam_dec(camera_tokens)  # [B, 1+M, 9]
 
-        # Rebuild feats for DualDPT: replace final layer with fused features
-        fused_feats = []
-        for i, (patch, cam) in enumerate(feats):
-            if i < len(feats) - 1:
-                fused_feats.append((patch, cam))
-            else:
-                # Replace final layer: restore N=1 dim
-                fused_patch = enhanced_patch.unsqueeze(1)  # [B, 1, P, C]
-                fused_cam = enhanced_cam.unsqueeze(1)  # [B, 1, C]
-                fused_feats.append((fused_patch, fused_cam))
+        c2w, ixt = pose_encoding_to_extri_intri(pose_enc, (image_h, image_w))
 
         output = Dict()
-        head_out = self.da3_head(fused_feats, image_h, image_w, patch_start_idx=0)
-        output.update(head_out)
-
-        pose_enc = self.cam_dec(enhanced_cam.unsqueeze(1))  # [B, 1, 9]
         output.pose_enc = pose_enc
+        output.extrinsics = affine_inverse(c2w)
+        output.intrinsics = ixt
+        return output
+
+    def _run_pose_ray(self, feats, image_h, image_w):
+        """Pose via ray path (non-differentiable, for inference).
+
+        Args:
+            feats: backbone multi-view feats
+            image_h, image_w: image dimensions
+
+        Returns:
+            Dict with extrinsics and intrinsics from ray map
+        """
+        from depth_anything_3.utils.geometry import affine_inverse
+        from depth_anything_3.utils.ray_utils import get_extrinsic_from_camray
+
+        head_out = self.da3_head(feats, image_h, image_w, patch_start_idx=0)
+
+        output = Dict()
+        if "ray" in head_out and "ray_conf" in head_out:
+            pred_ext, pred_fl, pred_pp = get_extrinsic_from_camray(
+                head_out.ray, head_out.ray_conf,
+                head_out.ray.shape[-3], head_out.ray.shape[-2],
+            )
+            pred_ext = affine_inverse(pred_ext)  # w2c -> c2w
+            pred_ext = pred_ext[:, :, :3, :]
+
+            pred_ixt = torch.eye(3, 3)[None, None].repeat(
+                pred_ext.shape[0], pred_ext.shape[1], 1, 1,
+            ).clone().to(pred_ext.device)
+            pred_ixt[:, :, 0, 0] = pred_fl[:, :, 0] / 2 * image_w
+            pred_ixt[:, :, 1, 1] = pred_fl[:, :, 1] / 2 * image_h
+            pred_ixt[:, :, 0, 2] = pred_pp[:, :, 0] * image_w * 0.5
+            pred_ixt[:, :, 1, 2] = pred_pp[:, :, 1] * image_h * 0.5
+
+            output.extrinsics = pred_ext
+            output.intrinsics = pred_ixt
+
+        if "depth" in head_out:
+            output.depth = head_out.depth
 
         return output
+
+    # ----- Public API -----
 
     def forward(
         self,
-        query: torch.Tensor,
-        candidate_patch_tokens: torch.Tensor,
-        candidate_camera_tokens: torch.Tensor,
-        candidate_descriptors: torch.Tensor,
+        query_image: torch.Tensor,
+        candidate_images: torch.Tensor,
     ) -> Dict:
-        """Full unified forward pass.
+        """Full unified forward: retrieval + multi-view pose.
 
         Args:
-            query: [B, 1, 3, H, W] query image
-            candidate_patch_tokens: [B, K, P, C] pre-extracted candidate final features
-            candidate_camera_tokens: [B, K, C] pre-extracted candidate camera tokens
-            candidate_descriptors: [K, D] pre-extracted candidate global descriptors
+            query_image: [B, 1, 3, H, W]
+            candidate_images: [B, K, 3, H, W] all K candidates (top-M selected internally)
 
         Returns:
-            Dict with keys: pose_enc, query_descriptor, candidate_weights, and head outputs
+            Dict with: pose_enc, extrinsics, intrinsics, query_descriptor, selected_indices
         """
-        feats, aux_feats, image_h, image_w = self._run_backbone(query)
+        B, K = candidate_images.shape[:2]
 
+        # Stage 1: Retrieval
+        _, aux_feats, image_h, image_w = self._run_backbone_single(query_image)
         query_descriptor = self._run_vpr_branch(aux_feats, image_h, image_w)
 
-        # Retrieval: get candidate weights
-        candidate_weights = self.retrieval_strategy(query_descriptor[0], candidate_descriptors)
-        candidate_weights = candidate_weights.unsqueeze(0).expand(query.shape[0], -1)  # [B, K]
+        # Get candidate descriptors (no grad, frozen backbone)
+        with torch.no_grad():
+            cand_descs = []
+            for k in range(K):
+                cand_input = candidate_images[:, k:k+1]
+                _, cand_aux, _, _ = self._run_backbone_single(cand_input)
+                cand_desc = self._run_vpr_branch(cand_aux, image_h, image_w)
+                cand_descs.append(cand_desc)
+            cand_descs = torch.cat(cand_descs, dim=0)  # [B*K, D]
 
-        output = self._run_pose_branch(
-            feats, candidate_patch_tokens, candidate_camera_tokens,
-            candidate_weights, image_h, image_w,
+        # Select top-M
+        M = min(self.pose_top_m, K)
+        sims = torch.nn.functional.cosine_similarity(
+            query_descriptor[0].unsqueeze(0), cand_descs[:K], dim=-1,
         )
+        topm_indices = sims.topk(M).indices  # [M]
+
+        # Gather top-M candidate images
+        selected_cands = candidate_images[:, topm_indices]  # [B, M, 3, H, W]
+
+        # Stage 2: Multi-view pose
+        multi_view = torch.cat([query_image, selected_cands], dim=1)  # [B, 1+M, 3, H, W]
+        feats, _, _ = self._run_backbone_multiview(multi_view)
+
+        output = self._run_pose_cam_dec(feats, image_h, image_w)
         output.query_descriptor = query_descriptor
-        output.candidate_weights = candidate_weights
+        output.selected_indices = topm_indices
         return output
 
     def retrieval_only(self, images: torch.Tensor) -> torch.Tensor:
-        """Extract global descriptors only (for ablation experiments).
+        """Extract global descriptors only.
 
         Args:
-            images: [B, 1, 3, H, W] input images
+            images: [B, 1, 3, H, W]
 
         Returns:
-            descriptors: [B, D] global descriptors
+            descriptors: [B, D]
         """
-        _, aux_feats, image_h, image_w = self._run_backbone(images)
+        _, aux_feats, image_h, image_w = self._run_backbone_single(images)
         return self._run_vpr_branch(aux_feats, image_h, image_w)
 
     def pose_only(
         self,
         query_image: torch.Tensor,
         candidate_images: torch.Tensor,
+        pose_path: str = "cam_dec",
     ) -> Dict:
-        """Pose-only mode: given pre-selected candidates, run pose regression.
+        """Pose-only: given pre-selected candidates, run multi-view backbone.
 
         Args:
-            query_image: [B, 1, 3, H, W] query image
-            candidate_images: [B, K, 3, H, W] pre-selected candidate images
+            query_image: [B, 1, 3, H, W]
+            candidate_images: [B, M, 3, H, W] pre-selected candidates
+            pose_path: "cam_dec", "ray", or "both"
 
         Returns:
-            Dict with keys: pose_enc and head outputs
+            Dict with pose results
         """
-        B, K = candidate_images.shape[:2]
+        multi_view = torch.cat([query_image, candidate_images], dim=1)  # [B, 1+M, 3, H, W]
+        feats, image_h, image_w = self._run_backbone_multiview(multi_view)
 
-        query_feats, _, image_h, image_w = self._run_backbone(query_image)
+        output = Dict()
 
-        cand_patch_list = []
-        cand_cam_list = []
-        for k in range(K):
-            cand_input = candidate_images[:, k:k+1]  # [B, 1, 3, H, W]
-            cand_feats, _, _, _ = self._run_backbone(cand_input)
-            cand_patch, cand_cam = extract_final_layer_features(cand_feats)
-            cand_patch_list.append(cand_patch)
-            cand_cam_list.append(cand_cam)
+        if pose_path in ("cam_dec", "both"):
+            cam_out = self._run_pose_cam_dec(feats, image_h, image_w)
+            output.update(cam_out)
 
-        candidate_patch_tokens = torch.stack(cand_patch_list, dim=1)  # [B, K, P, C]
-        candidate_camera_tokens = torch.stack(cand_cam_list, dim=1)  # [B, K, C]
+        if pose_path in ("ray", "both"):
+            with torch.no_grad():
+                ray_out = self._run_pose_ray(feats, image_h, image_w)
+            if pose_path == "ray":
+                output.update(ray_out)
+            else:
+                output.ray_extrinsics = ray_out.get("extrinsics")
+                output.ray_intrinsics = ray_out.get("intrinsics")
 
-        candidate_weights = torch.ones(B, K, device=query_image.device) / K
-
-        return self._run_pose_branch(
-            query_feats, candidate_patch_tokens, candidate_camera_tokens,
-            candidate_weights, image_h, image_w,
-        )
+        return output
 
     @torch.no_grad()
-    def extract_database_features(self, images: torch.Tensor):
-        """Offline: extract descriptors + final features for database images.
+    def extract_database_features(self, images: torch.Tensor) -> torch.Tensor:
+        """Offline: extract VPR descriptors for database images.
 
         Args:
-            images: [B, 1, 3, H, W] database images (process in batches)
+            images: [B, 1, 3, H, W]
 
         Returns:
-            descriptors: [B, D] global descriptors
-            patch_tokens: [B, P, C] final layer patch tokens
-            camera_tokens: [B, C] final layer camera tokens
+            descriptors: [B, D]
         """
-        feats, aux_feats, image_h, image_w = self._run_backbone(images)
-        descriptors = self._run_vpr_branch(aux_feats, image_h, image_w)
-        patch_tokens, camera_tokens = extract_final_layer_features(feats)
-        return descriptors, patch_tokens, camera_tokens
+        _, aux_feats, image_h, image_w = self._run_backbone_single(images)
+        return self._run_vpr_branch(aux_feats, image_h, image_w)
