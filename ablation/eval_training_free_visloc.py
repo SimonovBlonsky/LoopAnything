@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 from typing import Any
 
 import numpy as np
@@ -13,6 +14,28 @@ from tqdm import tqdm
 SUPPORTED_BACKENDS = ("dino_salad", "da3_salad")
 SUPPORTED_POSE_PATHS = ("cam_dec", "ray", "both")
 SUPPORTED_ANCHOR_MODES = ("multi_ref_alignment", "top1_anchor")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+REPO_ROOT = PROJECT_ROOT.parents[2]
+RELOC3R_ROOT = REPO_ROOT / "reloc3r"
+SALAD_ROOT = PROJECT_ROOT / "da3_streaming" / "loop_utils" / "salad"
+
+
+def _bootstrap_import_paths(sys_path: list[str] | None = None) -> list[str]:
+    target = sys.path if sys_path is None else sys_path
+    ordered_paths = [
+        str(PROJECT_ROOT),
+        str(SRC_ROOT),
+        str(REPO_ROOT),
+        str(RELOC3R_ROOT),
+    ]
+    for path in reversed(ordered_paths):
+        if path not in target:
+            target.insert(0, path)
+    return target
+
+
+_bootstrap_import_paths()
 
 
 def load_config(config_path: str) -> dict[str, Any]:
@@ -198,19 +221,24 @@ def build_da3_salad_retriever(unified_config: str, unified_checkpoint: str | Non
     return pipeline, retriever
 
 
-def _ensure_salad_path() -> None:
-    import sys
-
-    project_root = Path(__file__).resolve().parents[1]
-    salad_root = project_root / "da3_streaming" / "loop_utils" / "salad"
-    salad_path = str(salad_root)
-    if salad_path not in sys.path:
-        sys.path.insert(0, salad_path)
+def _ensure_salad_path(sys_path: list[str] | None = None) -> list[str]:
+    target = _bootstrap_import_paths(sys_path)
+    salad_path = str(SALAD_ROOT)
+    if salad_path not in target:
+        target.insert(0, salad_path)
+    return target
 
 
 def load_dino_salad_retriever(salad_checkpoint: str, device: str):
-    _ensure_salad_path()
-    from models.helper import get_model
+    salad_path = str(SALAD_ROOT)
+    added_path = salad_path not in sys.path
+    if added_path:
+        _ensure_salad_path()
+    try:
+        from models.helper import get_model
+    finally:
+        if added_path and salad_path in sys.path:
+            sys.path.remove(salad_path)
 
     checkpoint_path = Path(salad_checkpoint)
     if not checkpoint_path.is_file():

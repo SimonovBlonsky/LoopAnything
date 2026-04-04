@@ -4,8 +4,15 @@ import torch
 from addict import Dict
 
 from ablation.eval_training_free_visloc import (
+    PROJECT_ROOT,
+    REPO_ROOT,
+    RELOC3R_ROOT,
+    SALAD_ROOT,
+    SRC_ROOT,
+    _ensure_salad_path,
     align_query_pose_multi_ref,
     align_query_pose_top1_anchor,
+    _bootstrap_import_paths,
     build_output_path,
     build_da3_salad_retriever,
     evaluate_scene_training_free,
@@ -139,6 +146,26 @@ def test_validate_runtime_args_requires_salad_checkpoint_for_dino():
     )
     with pytest.raises(ValueError, match="salad-checkpoint"):
         validate_runtime_args(args)
+
+
+def test_bootstrap_import_paths_covers_runtime_dependencies():
+    paths = ["/tmp/placeholder"]
+    bootstrapped = _bootstrap_import_paths(paths)
+
+    assert str(SRC_ROOT) in bootstrapped
+    assert str(PROJECT_ROOT) in bootstrapped
+    assert str(REPO_ROOT) in bootstrapped
+    assert str(RELOC3R_ROOT) in bootstrapped
+    assert str(SALAD_ROOT) not in bootstrapped
+
+
+def test_ensure_salad_path_adds_salad_root_without_dropping_repo_paths():
+    paths = ["/tmp/placeholder"]
+    bootstrapped = _ensure_salad_path(paths)
+
+    assert str(REPO_ROOT) in bootstrapped
+    assert str(SALAD_ROOT) in bootstrapped
+    assert bootstrapped.index(str(SALAD_ROOT)) < bootstrapped.index(str(REPO_ROOT))
 
 
 def test_build_da3_salad_retriever_calls_pipeline_retrieval_only(monkeypatch):
