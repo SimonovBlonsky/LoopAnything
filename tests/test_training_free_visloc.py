@@ -22,6 +22,8 @@ from ablation.eval_training_free_visloc import (
     build_output_path,
     build_da3_salad_retriever,
     evaluate_scene_training_free,
+    estimate_query_pose_motion_averaging,
+    group_to_query_to_db_relative_pose,
     load_dino_salad_retriever,
     _purge_salad_modules,
     parse_args,
@@ -126,6 +128,35 @@ def test_top1_anchor_alignment_recovers_query_pose():
     assert np.allclose(aligned_query, gt_query, atol=1e-6)
 
 
+def test_group_to_query_to_db_relative_pose_matches_reloc3r_convention():
+    query_pose = _pose(_rotz(15.0), np.array([0.3, -0.2, 1.1]))
+    db_pose = _pose(_rotz(-25.0), np.array([1.7, 0.4, -0.6]))
+    pred_group = np.stack([query_pose, db_pose], axis=0)
+
+    rel_pose = group_to_query_to_db_relative_pose(pred_group)
+    expected = np.linalg.inv(db_pose) @ query_pose
+
+    assert np.allclose(rel_pose, expected, atol=1e-6)
+
+
+def test_motion_averaging_recovers_query_pose_from_pairwise_relposes():
+    query_pose = _pose(_rotz(10.0), np.array([0.4, 0.7, -0.2]))
+    ref1_pose = _pose(_rotz(-5.0), np.array([1.0, 0.0, 0.1]))
+    ref2_pose = _pose(_rotz(20.0), np.array([-0.4, 1.2, 0.3]))
+
+    relposes_q2d = np.stack(
+        [
+            np.linalg.inv(ref1_pose) @ query_pose,
+            np.linalg.inv(ref2_pose) @ query_pose,
+        ],
+        axis=0,
+    )
+    ref_gt = np.stack([ref1_pose, ref2_pose], axis=0)
+
+    pred_query = estimate_query_pose_motion_averaging(relposes_q2d, ref_gt)
+    assert np.allclose(pred_query, query_pose, atol=1e-6)
+
+
 def test_validate_retrieval_backend_accepts_supported_backends():
     assert validate_retrieval_backend("dino_salad") == "dino_salad"
     assert validate_retrieval_backend("da3_salad") == "da3_salad"
@@ -139,6 +170,7 @@ def test_parse_args_parses_protocol_flags():
     assert args.scene == "heads"
     assert args.backend == "dino_salad"
     assert args.pose_path == "cam_dec"
+    assert args.anchor_mode == "reloc3r_motion_averaging"
 
 
 def test_parse_args_parses_cpu_fallback_bounds():
@@ -379,6 +411,91 @@ def test_evaluate_scene_training_free_returns_audit_payload(monkeypatch):
     assert "translation_errors_ray" in payload
     assert "effective_anchor_modes_cam_dec" in payload
     assert "effective_anchor_modes_ray" in payload
+
+
+def test_pairwise_motion_averaging_uses_full_topk_for_pose(monkeypatch):
+    from ablation import eval_training_free_visloc as module
+
+    class FakePipeline:
+        def __init__(self):
+            self.pose_only_calls = 0
+
+        def pose_only(self, query_image, candidate_images, pose_path="cam_dec"):
+            self.pose_only_calls += 1
+            assert pose_path == "cam_dec"
+            assert query_image.shape[1] == 1
+            assert candidate_images.shape[1] == 1
+            return Dict(
+                extrinsics=torch.eye(4)[None, None].repeat(1, 2, 1, 1),
+                intrinsics=torch.eye(3)[None, None].repeat(1, 2, 1, 1),
+            )
+
+    fake_pipeline = FakePipeline()
+    gt_query = np.eye(4, dtype=np.float64)
+    gt_ref0 = np.eye(4, dtype=np.float64)
+    gt_ref0[:3, 3] = np.array([1.0, 0.0, 0.0])
+    gt_ref1 = np.eye(4, dtype=np.float64)
+    gt_ref1[:3, 3] = np.array([0.0, 1.0, 0.0])
+    gt_ref2 = np.eye(4, dtype=np.float64)
+    gt_ref2[:3, 3] = np.array([0.0, 0.0, 1.0])
+
+    db_entries = [
+        {"image_path": "db0.png", "pose": gt_ref0.astype(np.float32)},
+        {"image_path": "db1.png", "pose": gt_ref1.astype(np.float32)},
+        {"image_path": "db2.png", "pose": gt_ref2.astype(np.float32)},
+    ]
+    query_entries = [{"image_path": "q0.png", "pose": gt_query.astype(np.float32)}]
+
+    monkeypatch.setattr(module, "preprocess_image", lambda _p, target_size: torch.zeros(3, *target_size))
+    monkeypatch.setattr(module, "get_rot_err", lambda _a, _b: 0.0)
+    monkeypatch.setattr(
+        module,
+        "_extract_group_c2w",
+        lambda _resolved, _branch, _hw: np.stack(
+            [
+                np.stack([gt_query, gt_ref0], axis=0),
+            ],
+            axis=0,
+        ),
+    )
+
+    captured = {}
+
+    def fake_motion_averaging(relposes_q2d, ref_gt):
+        captured["num_relposes"] = relposes_q2d.shape[0]
+        captured["num_refs"] = ref_gt.shape[0]
+        return gt_query
+
+    monkeypatch.setattr(module, "estimate_query_pose_motion_averaging", fake_motion_averaging)
+
+    def retriever(query_input):
+        return torch.tensor([[1.0, 0.0]], dtype=torch.float32).repeat(query_input.shape[0], 1)
+
+    db_descriptors = torch.tensor(
+        [[1.0, 0.0], [0.8, 0.0], [0.7, 0.0]],
+        dtype=torch.float32,
+    )
+
+    payload = evaluate_scene_training_free(
+        pose_pipeline=fake_pipeline,
+        retriever=retriever,
+        db_entries=db_entries,
+        query_entries=query_entries,
+        db_descriptors=db_descriptors,
+        device="cpu",
+        top_k=3,
+        top_m=2,
+        pose_path="cam_dec",
+        anchor_mode="reloc3r_motion_averaging",
+        target_size=(8, 8),
+        config={"model": {"x": 1}},
+        retriever_backend="da3_salad",
+    )
+
+    assert fake_pipeline.pose_only_calls == 3
+    assert captured["num_relposes"] == 3
+    assert captured["num_refs"] == 3
+    assert payload["topm_indices"][0].tolist() == [0, 1, 2]
 
 
 def test_build_output_path_includes_pose_path_and_anchor_mode(tmp_path):

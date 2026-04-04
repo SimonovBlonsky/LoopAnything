@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 SUPPORTED_BACKENDS = ("dino_salad", "da3_salad")
 SUPPORTED_POSE_PATHS = ("cam_dec", "ray", "both")
-SUPPORTED_ANCHOR_MODES = ("multi_ref_alignment", "top1_anchor")
+SUPPORTED_ANCHOR_MODES = ("reloc3r_motion_averaging", "multi_ref_alignment", "top1_anchor")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 REPO_ROOT = PROJECT_ROOT.parents[2]
@@ -109,7 +109,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--anchor-mode",
         type=str,
-        default="multi_ref_alignment",
+        default="reloc3r_motion_averaging",
         choices=list(SUPPORTED_ANCHOR_MODES),
     )
     parser.add_argument("--batch-size", type=int, default=16)
@@ -396,6 +396,9 @@ def _estimate_query_pose_from_group(
     ref_gt_c2w: np.ndarray,
     anchor_mode: str,
 ) -> tuple[np.ndarray, str]:
+    if anchor_mode == "reloc3r_motion_averaging":
+        raise ValueError("reloc3r_motion_averaging requires pairwise relative-pose evaluation.")
+
     mode = anchor_mode
     if mode == "multi_ref_alignment" and ref_gt_c2w.shape[0] < 2:
         mode = "top1_anchor"
@@ -442,14 +445,46 @@ def evaluate_scene_training_free(
         query_img = preprocess_image(q_entry["image_path"], target_size).to(device)
         query_input = query_img.unsqueeze(0).unsqueeze(0)  # [1, 1, 3, H, W]
         query_desc = retriever(query_input)  # [1, D]
+        gt_pose = np.asarray(q_entry["pose"], dtype=np.float64)
 
         sims = F.cosine_similarity(query_desc[0].unsqueeze(0), db_desc_device, dim=1)
         topk_indices_t, topm_indices_t = select_topk_topm(sims, top_k=top_k, top_m=top_m)
         topk_indices = topk_indices_t.detach().cpu().numpy().astype(np.int64)
         topm_indices = topm_indices_t.detach().cpu().numpy().astype(np.int64)
         topk_all.append(topk_indices)
-        topm_all.append(topm_indices)
+        if anchor_mode == "reloc3r_motion_averaging":
+            # Use the full retrieved top-K set for pairwise relpose + motion averaging.
+            pose_indices = topk_indices
+            topm_all.append(pose_indices)
+            ref_gt = np.stack(
+                [db_entries[idx]["pose"] for idx in pose_indices.tolist()],
+                axis=0,
+            ).astype(np.float64)
+            relposes_by_branch: dict[str, list[np.ndarray]] = {"cam_dec": [], "ray": []}
 
+            for db_idx in pose_indices.tolist():
+                candidate_image = preprocess_image(db_entries[db_idx]["image_path"], target_size)
+                candidate_input = candidate_image.unsqueeze(0).unsqueeze(0).to(device)
+
+                output = pose_pipeline.pose_only(query_input, candidate_input, pose_path=pose_path)
+                resolved = resolve_pose_output(output, pose_path)
+
+                for branch in resolved.keys():
+                    pred_group = _extract_group_c2w(resolved, branch, target_size)[0]
+                    relposes_by_branch[branch].append(group_to_query_to_db_relative_pose(pred_group))
+
+            for branch in resolved.keys():
+                relposes_q2d = np.stack(relposes_by_branch[branch], axis=0)
+                query_pose = estimate_query_pose_motion_averaging(relposes_q2d, ref_gt)
+                query_poses_by_branch[branch].append(query_pose)
+                branch_rotation_errors[branch].append(get_rot_err(query_pose[:3, :3], gt_pose[:3, :3]))
+                branch_translation_errors[branch].append(
+                    float(np.linalg.norm(query_pose[:3, 3] - gt_pose[:3, 3]))
+                )
+                branch_effective_modes[branch].append(anchor_mode)
+            continue
+
+        topm_all.append(topm_indices)
         candidate_images = [
             preprocess_image(db_entries[idx]["image_path"], target_size) for idx in topm_indices.tolist()
         ]
@@ -460,13 +495,10 @@ def evaluate_scene_training_free(
 
         ref_gt = np.stack([db_entries[idx]["pose"] for idx in topm_indices.tolist()], axis=0).astype(np.float64)
 
-        branch_modes: dict[str, str] = {}
         for branch in resolved.keys():
             pred_group = _extract_group_c2w(resolved, branch, target_size)[0]
             query_pose, mode_used = _estimate_query_pose_from_group(pred_group, ref_gt, anchor_mode)
             query_poses_by_branch[branch].append(query_pose)
-            branch_modes[branch] = mode_used
-            gt_pose = np.asarray(q_entry["pose"], dtype=np.float64)
             branch_rotation_errors[branch].append(get_rot_err(query_pose[:3, :3], gt_pose[:3, :3]))
             branch_translation_errors[branch].append(
                 float(np.linalg.norm(query_pose[:3, 3] - gt_pose[:3, 3]))
@@ -582,6 +614,30 @@ def _apply_sim3_to_pose(pose: np.ndarray, rot: np.ndarray, trans: np.ndarray, sc
     aligned[:3, :3] = rot @ pose[:3, :3]
     aligned[:3, 3] = scale * (rot @ pose[:3, 3]) + trans
     return aligned
+
+
+def group_to_query_to_db_relative_pose(pred_group: np.ndarray) -> np.ndarray:
+    """Convert a 2-view [query, db] group into reloc3r's query-to-db relative pose."""
+    pred_group = _as_pose_array(pred_group, "pred_group")
+    if pred_group.shape[0] != 2:
+        raise ValueError("pred_group must contain exactly [query, db] poses for pairwise relpose.")
+    return np.linalg.inv(pred_group[1]) @ pred_group[0]
+
+
+def estimate_query_pose_motion_averaging(
+    relposes_q2d: np.ndarray | list[np.ndarray],
+    ref_gt: np.ndarray | list[np.ndarray],
+) -> np.ndarray:
+    """Fuse pairwise q->db predictions with reloc3r's motion averaging solver."""
+    relposes_q2d = _as_pose_array(relposes_q2d, "relposes_q2d")
+    ref_gt = _as_pose_array(ref_gt, "ref_gt")
+    if relposes_q2d.shape[0] != ref_gt.shape[0]:
+        raise ValueError("relposes_q2d count must match ref_gt count.")
+
+    from reloc3r.reloc3r_visloc import Reloc3rVisloc
+
+    solver = Reloc3rVisloc()
+    return solver.motion_averaging(list(ref_gt), list(relposes_q2d))
 
 
 def align_query_pose_multi_ref(pred_group: np.ndarray, ref_gt: np.ndarray) -> np.ndarray:
