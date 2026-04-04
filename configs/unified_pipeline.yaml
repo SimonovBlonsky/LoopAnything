@@ -2,6 +2,7 @@ model:
   da3_model_name_or_path: "depth-anything/DA3-BASE"
   vpr_checkpoint: "checkpoints/image_retrieval/DA3_vprmodel_patchonlyadapter_aux5.ckpt"
   aux_layer: 5
+  pose_top_m: 3
 
   feature_adapter_arch: "patch_only"
   feature_adapter_config:

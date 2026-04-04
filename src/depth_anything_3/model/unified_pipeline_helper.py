@@ -8,7 +8,6 @@ import yaml
 
 from depth_anything_3.api import DepthAnything3
 from depth_anything_3.model import VPRaggregators
-from depth_anything_3.model.cross_view_fusion import build_cross_view_fusion
 from depth_anything_3.model.retrieval_strategy import build_retrieval_strategy
 from depth_anything_3.model.unified_pipeline import UnifiedPipeline
 from depth_anything_3.model.vpr_feature_adapter import (
@@ -125,9 +124,8 @@ def _apply_freeze(pipeline: UnifiedPipeline, freeze_config: dict):
         pipeline.aggregator.requires_grad_(False)
         pipeline.aggregator.eval()
 
-    if freeze_config.get("fusion", False):
-        pipeline.cross_view_fusion.requires_grad_(False)
-        pipeline.cross_view_fusion.eval()
+    # Legacy key kept for backward config compatibility in v1.1.
+    _ = freeze_config.get("fusion", False)
 
     # Support both the old combined "head" flag and separate "da3_head"/"cam_dec" flags.
     # If "da3_head" or "cam_dec" is explicitly set, use them; otherwise fall back to "head".
@@ -145,7 +143,7 @@ def build_unified_pipeline(config: dict, device: str = "cpu") -> UnifiedPipeline
 
     Args:
         config: dict with keys: da3_model_name_or_path, vpr_checkpoint,
-                aux_layer, freeze, retrieval, cross_view_fusion,
+                aux_layer, freeze, retrieval,
                 feature_adapter_arch, feature_adapter_config,
                 agg_arch, agg_config.
     """
@@ -178,10 +176,11 @@ def build_unified_pipeline(config: dict, device: str = "cpu") -> UnifiedPipeline
     retrieval_config = model_config.get("retrieval", {"strategy": "soft_attention", "top_k": 10, "temperature": 1.0})
     retrieval_strategy = build_retrieval_strategy(retrieval_config)
 
-    fusion_config = model_config.get("cross_view_fusion", {"embed_dim": 1536, "num_heads": 8, "num_layers": 2})
-    cross_view_fusion = build_cross_view_fusion(fusion_config)
+    # Legacy key tolerated for backward config compatibility in v1.1.
+    _ = model_config.get("cross_view_fusion")
 
     aux_layer = model_config.get("aux_layer", 5)
+    pose_top_m = model_config.get("pose_top_m", 3)
 
     # 4. Assemble pipeline
     pipeline = UnifiedPipeline(
@@ -189,10 +188,10 @@ def build_unified_pipeline(config: dict, device: str = "cpu") -> UnifiedPipeline
         feature_adapter=feature_adapter,
         aggregator=aggregator,
         retrieval_strategy=retrieval_strategy,
-        cross_view_fusion=cross_view_fusion,
         da3_head=da3_head,
         cam_dec=cam_dec,
         aux_layer=aux_layer,
+        pose_top_m=pose_top_m,
     )
 
     # 5. Apply freeze
