@@ -6,9 +6,12 @@ from addict import Dict
 from ablation.eval_training_free_visloc import (
     align_query_pose_multi_ref,
     align_query_pose_top1_anchor,
+    build_da3_salad_retriever,
+    evaluate_scene_training_free,
     parse_args,
     resolve_pose_output,
     select_topk_topm,
+    validate_runtime_args,
     validate_retrieval_backend,
 )
 
@@ -119,3 +122,120 @@ def test_parse_args_parses_protocol_flags():
     assert args.scene == "heads"
     assert args.backend == "dino_salad"
     assert args.pose_path == "cam_dec"
+
+
+def test_validate_runtime_args_requires_salad_checkpoint_for_dino():
+    args = parse_args(
+        [
+            "--dataset",
+            "7scenes",
+            "--scene",
+            "heads",
+            "--retriever-backend",
+            "dino_salad",
+        ]
+    )
+    with pytest.raises(ValueError, match="salad-checkpoint"):
+        validate_runtime_args(args)
+
+
+def test_build_da3_salad_retriever_calls_pipeline_retrieval_only(monkeypatch):
+    class FakePipeline:
+        def __init__(self):
+            self.seen = None
+
+        def eval(self):
+            return self
+
+        def retrieval_only(self, images):
+            self.seen = images
+            return torch.ones(images.shape[0], 4)
+
+        def load_state_dict(self, _state, strict=False):
+            return {"strict": strict}
+
+    fake_pipeline = FakePipeline()
+
+    from ablation import eval_training_free_visloc as module
+
+    monkeypatch.setattr(module, "load_config", lambda _p: {"model": {}})
+    monkeypatch.setattr(module, "build_unified_pipeline", lambda _cfg, device: fake_pipeline)
+
+    pipeline, retriever = build_da3_salad_retriever("cfg.yaml", None, device="cpu")
+    assert pipeline is fake_pipeline
+    out = retriever(torch.zeros(2, 1, 3, 8, 8))
+    assert out.shape == (2, 4)
+    assert fake_pipeline.seen is not None
+
+
+def test_evaluate_scene_training_free_returns_audit_payload(monkeypatch):
+    from ablation import eval_training_free_visloc as module
+
+    # query + 2 refs
+    pose_enc = torch.zeros(1, 3, 9)
+
+    class FakePipeline:
+        def pose_only(self, query_image, candidate_images, pose_path="cam_dec"):
+            assert pose_path == "both"
+            assert query_image.shape[1] == 1
+            assert candidate_images.shape[1] == 2
+            return Dict(
+                pose_enc=pose_enc,
+                extrinsics=torch.zeros(1, 3, 3, 4),  # cam_dec branch stores w2c in practice
+                intrinsics=torch.eye(3)[None, None].repeat(1, 3, 1, 1),
+                ray_extrinsics=torch.eye(4)[None, None].repeat(1, 3, 1, 1),
+                ray_intrinsics=torch.eye(3)[None, None].repeat(1, 3, 1, 1),
+            )
+
+    monkeypatch.setattr(module, "preprocess_image", lambda _p, target_size: torch.zeros(3, *target_size))
+    monkeypatch.setattr(module, "get_rot_err", lambda _a, _b: 0.0)
+
+    # Force cam_dec c2w recovery through pose_enc (not output.extrinsics)
+    gt_query = np.eye(4, dtype=np.float64)
+    gt_ref1 = np.eye(4, dtype=np.float64)
+    gt_ref1[:3, 3] = np.array([1.0, 0.0, 0.0])
+    gt_ref2 = np.eye(4, dtype=np.float64)
+    gt_ref2[:3, 3] = np.array([0.0, 1.0, 0.0])
+    gt_group = np.stack([gt_query, gt_ref1, gt_ref2], axis=0)
+
+    def fake_pose_encoding_to_extri_intri(_pose_enc, _hw):
+        c2w = torch.from_numpy(gt_group[:, :3, :]).unsqueeze(0).float()
+        ixt = torch.eye(3)[None, None].repeat(1, 3, 1, 1)
+        return c2w, ixt
+
+    monkeypatch.setattr(module, "pose_encoding_to_extri_intri", fake_pose_encoding_to_extri_intri)
+
+    db_entries = [
+        {"image_path": "db0.png", "pose": gt_ref1.astype(np.float32)},
+        {"image_path": "db1.png", "pose": gt_ref2.astype(np.float32)},
+    ]
+    query_entries = [{"image_path": "q0.png", "pose": gt_query.astype(np.float32)}]
+
+    def retriever(query_input):
+        return torch.tensor([[1.0, 0.0]], dtype=torch.float32).repeat(query_input.shape[0], 1)
+
+    db_descriptors = torch.tensor([[1.0, 0.0], [0.5, 0.0]], dtype=torch.float32)
+
+    payload = evaluate_scene_training_free(
+        pose_pipeline=FakePipeline(),
+        retriever=retriever,
+        db_entries=db_entries,
+        query_entries=query_entries,
+        db_descriptors=db_descriptors,
+        device="cpu",
+        top_k=2,
+        top_m=2,
+        pose_path="both",
+        anchor_mode="multi_ref_alignment",
+        target_size=(8, 8),
+        config={"model": {"x": 1}},
+        retriever_backend="da3_salad",
+    )
+
+    assert "rotation_errors" in payload
+    assert "translation_errors" in payload
+    assert "topk_indices" in payload
+    assert "topm_indices" in payload
+    assert "config" in payload
+    assert "query_poses_cam_dec" in payload
+    assert "query_poses_ray" in payload
