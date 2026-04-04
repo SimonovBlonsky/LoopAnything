@@ -27,6 +27,7 @@ model:
     top_k: 10
     temperature: 1.0
 
+  # Legacy v1.0 block; ignored by the v1.1 unified_pipeline_helper builder.
   cross_view_fusion:
     embed_dim: 1536
     num_heads: 8

@@ -43,6 +43,8 @@ def test_unified_pipeline_forward_uses_image_contract_and_pose_top_m():
     assert "query_descriptor" in output
     multi_view_input = pipeline._run_backbone_multiview.call_args[0][0]
     assert multi_view_input.shape[1] == 1 + pipeline.pose_top_m
+    assert torch.equal(multi_view_input[:, :1], query_image)
+    assert torch.equal(multi_view_input[:, 1:], candidate_images[:, expected])
 
 
 def test_unified_pipeline_pose_only():
@@ -135,3 +137,24 @@ def test_build_unified_pipeline_uses_v11_constructor_without_cross_view_fusion(m
 
     helper.build_unified_pipeline(cfg)
     assert captured["pose_top_m"] == 5
+
+
+def test_apply_freeze_supports_legacy_fusion_flag_without_cross_view_module():
+    from depth_anything_3.model import unified_pipeline_helper as helper
+
+    pipeline = SimpleNamespace(
+        da3_backbone=nn.Linear(2, 2),
+        feature_adapter=nn.Linear(2, 2),
+        aggregator=nn.Linear(2, 2),
+        da3_head=nn.Linear(2, 2),
+        cam_dec=nn.Linear(2, 2),
+    )
+
+    helper._apply_freeze(
+        pipeline,
+        {"backbone": True, "vpr": True, "fusion": True, "head": False},
+    )
+
+    assert all(not p.requires_grad for p in pipeline.da3_backbone.parameters())
+    assert all(not p.requires_grad for p in pipeline.feature_adapter.parameters())
+    assert all(not p.requires_grad for p in pipeline.aggregator.parameters())
