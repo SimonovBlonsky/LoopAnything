@@ -336,11 +336,11 @@ def evaluate_scene_training_free(
         db_desc_device = torch.from_numpy(db_desc_device)
     db_desc_device = db_desc_device.to(device)
 
-    rotation_errors: list[float] = []
-    translation_errors: list[float] = []
     topk_all: list[np.ndarray] = []
     topm_all: list[np.ndarray] = []
-    effective_modes: list[str] = []
+    branch_rotation_errors: dict[str, list[float]] = {"cam_dec": [], "ray": []}
+    branch_translation_errors: dict[str, list[float]] = {"cam_dec": [], "ray": []}
+    branch_effective_modes: dict[str, list[str]] = {"cam_dec": [], "ray": []}
     query_poses_by_branch: dict[str, list[np.ndarray]] = {"cam_dec": [], "ray": []}
 
     for q_entry in tqdm(query_entries, desc="Evaluating queries"):
@@ -371,29 +371,40 @@ def evaluate_scene_training_free(
             query_pose, mode_used = _estimate_query_pose_from_group(pred_group, ref_gt, anchor_mode)
             query_poses_by_branch[branch].append(query_pose)
             branch_modes[branch] = mode_used
+            gt_pose = np.asarray(q_entry["pose"], dtype=np.float64)
+            branch_rotation_errors[branch].append(get_rot_err(query_pose[:3, :3], gt_pose[:3, :3]))
+            branch_translation_errors[branch].append(
+                float(np.linalg.norm(query_pose[:3, 3] - gt_pose[:3, 3]))
+            )
+            branch_effective_modes[branch].append(mode_used)
 
-        primary_branch = "cam_dec" if "cam_dec" in resolved else "ray"
-        pred_pose = query_poses_by_branch[primary_branch][-1]
-        gt_pose = np.asarray(q_entry["pose"], dtype=np.float64)
-        rotation_errors.append(get_rot_err(pred_pose[:3, :3], gt_pose[:3, :3]))
-        translation_errors.append(float(np.linalg.norm(pred_pose[:3, 3] - gt_pose[:3, 3])))
-        effective_modes.append(branch_modes[primary_branch])
-
+    primary_branch = "cam_dec" if pose_path in ("cam_dec", "both") else "ray"
     payload: dict[str, Any] = {
-        "rotation_errors": np.asarray(rotation_errors, dtype=np.float32),
-        "translation_errors": np.asarray(translation_errors, dtype=np.float32),
         "topk_indices": np.asarray(topk_all, dtype=object),
         "topm_indices": np.asarray(topm_all, dtype=object),
-        "effective_anchor_modes": np.asarray(effective_modes, dtype=object),
         "retriever_backend": retriever_backend,
         "pose_path": pose_path,
-        "primary_pose_branch": "cam_dec" if pose_path in ("cam_dec", "both") else "ray",
+        "primary_pose_branch": primary_branch,
         "config": config,
     }
+    for branch in ("cam_dec", "ray"):
+        if branch_rotation_errors[branch]:
+            payload[f"rotation_errors_{branch}"] = np.asarray(
+                branch_rotation_errors[branch], dtype=np.float32
+            )
+            payload[f"translation_errors_{branch}"] = np.asarray(
+                branch_translation_errors[branch], dtype=np.float32
+            )
+            payload[f"effective_anchor_modes_{branch}"] = np.asarray(
+                branch_effective_modes[branch], dtype=object
+            )
     if query_poses_by_branch["cam_dec"]:
         payload["query_poses_cam_dec"] = np.stack(query_poses_by_branch["cam_dec"], axis=0)
     if query_poses_by_branch["ray"]:
         payload["query_poses_ray"] = np.stack(query_poses_by_branch["ray"], axis=0)
+    payload["rotation_errors"] = payload[f"rotation_errors_{primary_branch}"]
+    payload["translation_errors"] = payload[f"translation_errors_{primary_branch}"]
+    payload["effective_anchor_modes"] = payload[f"effective_anchor_modes_{primary_branch}"]
     return payload
 
 
@@ -402,6 +413,36 @@ def save_result_payload(payload: dict[str, Any], output_path: Path) -> None:
     save_dict = dict(payload)
     save_dict["config"] = np.array(payload["config"], dtype=object)
     np.savez(output_path, **save_dict)
+
+
+def summarize_result_medians(payload: dict[str, Any]) -> list[dict[str, float | str]]:
+    summaries: list[dict[str, float | str]] = []
+    for branch in ("cam_dec", "ray"):
+        rotation_key = f"rotation_errors_{branch}"
+        translation_key = f"translation_errors_{branch}"
+        if rotation_key not in payload or translation_key not in payload:
+            continue
+        summaries.append(
+            {
+                "branch": branch,
+                "median_translation": float(np.median(payload[translation_key])),
+                "median_rotation": float(np.median(payload[rotation_key])),
+            }
+        )
+    return summaries
+
+
+def build_output_path(
+    output_dir: str | Path,
+    retriever_backend: str,
+    dataset: str,
+    scene: str,
+    pose_path: str,
+    anchor_mode: str,
+) -> Path:
+    return Path(output_dir) / (
+        f"training_free_{retriever_backend}_{dataset}_{scene}_{pose_path}_{anchor_mode}.npz"
+    )
 
 
 def _as_pose_array(poses: np.ndarray | list[np.ndarray], name: str) -> np.ndarray:
@@ -515,15 +556,20 @@ def main() -> None:
         retriever_backend=args.retriever_backend,
     )
 
-    med_t = float(np.median(result["translation_errors"]))
-    med_r = float(np.median(result["rotation_errors"]))
-    print(
-        f"[Training-Free][{args.retriever_backend}] Scene {args.scene} "
-        f"median pose error: {med_t:.2f} m  {med_r:.2f} deg"
-    )
+    for summary in summarize_result_medians(result):
+        print(
+            f"[Training-Free][{args.retriever_backend}][{summary['branch']}] Scene {args.scene} "
+            f"median pose error: {summary['median_translation']:.2f} m  "
+            f"{summary['median_rotation']:.2f} deg"
+        )
 
-    output_path = Path(args.output_dir) / (
-        f"training_free_{args.retriever_backend}_{args.dataset}_{args.scene}.npz"
+    output_path = build_output_path(
+        output_dir=args.output_dir,
+        retriever_backend=args.retriever_backend,
+        dataset=args.dataset,
+        scene=args.scene,
+        pose_path=args.pose_path,
+        anchor_mode=args.anchor_mode,
     )
     save_result_payload(result, output_path)
     print(f"Saved results to: {output_path}")

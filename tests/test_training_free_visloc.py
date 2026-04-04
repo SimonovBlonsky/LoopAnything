@@ -6,11 +6,13 @@ from addict import Dict
 from ablation.eval_training_free_visloc import (
     align_query_pose_multi_ref,
     align_query_pose_top1_anchor,
+    build_output_path,
     build_da3_salad_retriever,
     evaluate_scene_training_free,
     parse_args,
     resolve_pose_output,
     select_topk_topm,
+    summarize_result_medians,
     validate_runtime_args,
     validate_retrieval_backend,
 )
@@ -239,3 +241,42 @@ def test_evaluate_scene_training_free_returns_audit_payload(monkeypatch):
     assert "config" in payload
     assert "query_poses_cam_dec" in payload
     assert "query_poses_ray" in payload
+    assert "rotation_errors_cam_dec" in payload
+    assert "translation_errors_cam_dec" in payload
+    assert "rotation_errors_ray" in payload
+    assert "translation_errors_ray" in payload
+    assert "effective_anchor_modes_cam_dec" in payload
+    assert "effective_anchor_modes_ray" in payload
+
+
+def test_build_output_path_includes_pose_path_and_anchor_mode(tmp_path):
+    output_path = build_output_path(
+        output_dir=tmp_path,
+        retriever_backend="da3_salad",
+        dataset="7scenes",
+        scene="heads",
+        pose_path="both",
+        anchor_mode="multi_ref_alignment",
+    )
+
+    assert output_path.parent == tmp_path
+    assert output_path.name == (
+        "training_free_da3_salad_7scenes_heads_both_multi_ref_alignment.npz"
+    )
+
+
+def test_summarize_result_medians_reports_all_available_branches():
+    payload = {
+        "rotation_errors_cam_dec": np.array([1.0, 3.0], dtype=np.float32),
+        "translation_errors_cam_dec": np.array([0.2, 0.4], dtype=np.float32),
+        "rotation_errors_ray": np.array([5.0, 7.0], dtype=np.float32),
+        "translation_errors_ray": np.array([1.0, 3.0], dtype=np.float32),
+        "primary_pose_branch": "cam_dec",
+    }
+
+    summaries = summarize_result_medians(payload)
+    assert [summary["branch"] for summary in summaries] == ["cam_dec", "ray"]
+    assert summaries[0]["median_translation"] == pytest.approx(0.3)
+    assert summaries[0]["median_rotation"] == pytest.approx(2.0)
+    assert summaries[1]["median_translation"] == pytest.approx(2.0)
+    assert summaries[1]["median_rotation"] == pytest.approx(6.0)
