@@ -9,7 +9,7 @@ from addict import Dict
 def test_unified_pipeline_forward_uses_image_contract_and_pose_top_m():
     from depth_anything_3.model.unified_pipeline import UnifiedPipeline
 
-    B, K, H, W = 1, 4, 8, 8
+    B, K, H, W = 2, 4, 8, 8
 
     pipeline = UnifiedPipeline.__new__(UnifiedPipeline)
     nn.Module.__init__(pipeline)
@@ -17,11 +17,11 @@ def test_unified_pipeline_forward_uses_image_contract_and_pose_top_m():
     pipeline._run_backbone_single = MagicMock(return_value=(None, None, H, W))
     pipeline._run_vpr_branch = MagicMock(
         side_effect=[
-            torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
-            torch.tensor([[1.00, 0.0, 0.0, 0.0]]),
-            torch.tensor([[0.00, 1.0, 0.0, 0.0]]),
-            torch.tensor([[0.80, 0.2, 0.0, 0.0]]),
-            torch.tensor([[-1.0, 0.0, 0.0, 0.0]]),
+            torch.tensor([[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]]),
+            torch.tensor([[1.00, 0.0, 0.0, 0.0], [1.00, 0.0, 0.0, 0.0]]),
+            torch.tensor([[0.00, 1.0, 0.0, 0.0], [0.00, 1.0, 0.0, 0.0]]),
+            torch.tensor([[0.80, 0.2, 0.0, 0.0], [0.20, 0.8, 0.0, 0.0]]),
+            torch.tensor([[-1.0, 0.0, 0.0, 0.0], [0.00, -1.0, 0.0, 0.0]]),
         ],
     )
     pipeline._run_backbone_multiview = MagicMock(return_value=(None, H, W))
@@ -30,21 +30,23 @@ def test_unified_pipeline_forward_uses_image_contract_and_pose_top_m():
     )
 
     query_image = torch.randn(B, 1, 3, H, W)
-    candidate_images = torch.stack(
-        [torch.full((3, H, W), float(i)) for i in range(K)],
-        dim=0,
-    ).unsqueeze(0)
+    candidate_images = torch.zeros(B, K, 3, H, W)
+    for b in range(B):
+        for k in range(K):
+            candidate_images[b, k].fill_(float(10 * b + k))
 
     output = pipeline.forward(query_image, candidate_images)
 
-    expected = torch.tensor([0, 2])
+    expected = torch.tensor([[0, 2], [1, 2]])
     assert torch.equal(output.selected_indices.cpu(), expected)
     assert "pose_enc" in output
     assert "query_descriptor" in output
     multi_view_input = pipeline._run_backbone_multiview.call_args[0][0]
     assert multi_view_input.shape[1] == 1 + pipeline.pose_top_m
     assert torch.equal(multi_view_input[:, :1], query_image)
-    assert torch.equal(multi_view_input[:, 1:], candidate_images[:, expected])
+    batch_idx = torch.arange(B).unsqueeze(1)
+    expected_selected = candidate_images[batch_idx, expected]
+    assert torch.equal(multi_view_input[:, 1:], expected_selected)
 
 
 def test_unified_pipeline_pose_only():
@@ -64,6 +66,9 @@ def test_unified_pipeline_pose_only():
 
     output = pipeline.pose_only(query_image, candidate_images, pose_path="cam_dec")
     assert "pose_enc" in output
+    multi_view_input = pipeline._run_backbone_multiview.call_args[0][0]
+    assert torch.equal(multi_view_input[:, :1], query_image)
+    assert torch.equal(multi_view_input[:, 1:], candidate_images)
 
 
 def test_unified_pipeline_extract_database_features_returns_descriptors_only():

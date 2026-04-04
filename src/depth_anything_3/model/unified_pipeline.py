@@ -185,7 +185,8 @@ class UnifiedPipeline(nn.Module):
             candidate_images: [B, K, 3, H, W] all K candidates (top-M selected internally)
 
         Returns:
-            Dict with: pose_enc, extrinsics, intrinsics, query_descriptor, selected_indices
+            Dict with: pose_enc, extrinsics, intrinsics, query_descriptor,
+                selected_indices [B, M] (per-sample retrieval top-M)
         """
         B, K = candidate_images.shape[:2]
 
@@ -201,17 +202,18 @@ class UnifiedPipeline(nn.Module):
                 _, cand_aux, _, _ = self._run_backbone_single(cand_input)
                 cand_desc = self._run_vpr_branch(cand_aux, image_h, image_w)
                 cand_descs.append(cand_desc)
-            cand_descs = torch.cat(cand_descs, dim=0)  # [B*K, D]
+            cand_descs = torch.stack(cand_descs, dim=1)  # [B, K, D]
 
         # Select top-M
         M = min(self.pose_top_m, K)
         sims = torch.nn.functional.cosine_similarity(
-            query_descriptor[0].unsqueeze(0), cand_descs[:K], dim=-1,
+            query_descriptor.unsqueeze(1), cand_descs, dim=-1,
         )
-        topm_indices = sims.topk(M).indices  # [M]
+        topm_indices = sims.topk(M, dim=1).indices  # [B, M]
 
         # Gather top-M candidate images
-        selected_cands = candidate_images[:, topm_indices]  # [B, M, 3, H, W]
+        gather_idx = topm_indices[:, :, None, None, None].expand(-1, -1, *candidate_images.shape[2:])
+        selected_cands = torch.gather(candidate_images, dim=1, index=gather_idx)  # [B, M, 3, H, W]
 
         # Stage 2: Multi-view pose
         multi_view = torch.cat([query_image, selected_cands], dim=1)  # [B, 1+M, 3, H, W]
