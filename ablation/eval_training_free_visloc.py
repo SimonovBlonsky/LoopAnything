@@ -120,13 +120,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--cpu-fallback-max-queries",
         type=int,
-        default=32,
+        default=0,
         help="Cap query count for bounded smoke runtime; especially useful when CUDA falls back to CPU.",
     )
     parser.add_argument(
         "--cpu-fallback-max-db-entries",
         type=int,
-        default=64,
+        default=0,
         help="Cap database size for bounded smoke runtime; especially useful when CUDA falls back to CPU.",
     )
     args = parser.parse_args(argv)
