@@ -98,6 +98,16 @@ def load_config(config_path: str) -> dict:
         return yaml.safe_load(f)
 
 
+def _load_da3_wrapper(model_name_or_path: str):
+    """Load DA3 with a cache-first strategy to keep evaluation robust offline."""
+    try:
+        # Prefer local cache to avoid proxy/network instability during smoke evaluation.
+        return DepthAnything3.from_pretrained(model_name_or_path, local_files_only=True)
+    except Exception:
+        # Fall back to default Hub behavior when the cache is missing/incomplete.
+        return DepthAnything3.from_pretrained(model_name_or_path)
+
+
 def _load_vpr_weights(feature_adapter, aggregator, vpr_checkpoint_path):
     """Load VPR checkpoint into feature_adapter and aggregator."""
     checkpoint = torch.load(Path(vpr_checkpoint_path), map_location="cpu")
@@ -151,7 +161,7 @@ def build_unified_pipeline(config: dict, device: str = "cpu") -> UnifiedPipeline
 
     # 1. Load DA3 model and extract backbone + head + cam_dec
     da3_model_name = model_config.get("da3_model_name_or_path", "depth-anything/DA3-BASE")
-    da3_wrapper = DepthAnything3.from_pretrained(da3_model_name)
+    da3_wrapper = _load_da3_wrapper(da3_model_name)
     da3_net = da3_wrapper.model  # DepthAnything3Net
 
     backbone = da3_net.backbone

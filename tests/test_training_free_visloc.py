@@ -1,3 +1,8 @@
+import os
+import sys
+from collections import OrderedDict
+from types import ModuleType
+
 import numpy as np
 import pytest
 import torch
@@ -13,9 +18,12 @@ from ablation.eval_training_free_visloc import (
     align_query_pose_multi_ref,
     align_query_pose_top1_anchor,
     _bootstrap_import_paths,
+    default_data_root,
     build_output_path,
     build_da3_salad_retriever,
     evaluate_scene_training_free,
+    load_dino_salad_retriever,
+    _purge_salad_modules,
     parse_args,
     resolve_pose_output,
     select_topk_topm,
@@ -133,6 +141,30 @@ def test_parse_args_parses_protocol_flags():
     assert args.pose_path == "cam_dec"
 
 
+def test_parse_args_parses_cpu_fallback_bounds():
+    args = parse_args(
+        [
+            "--dataset",
+            "7scenes",
+            "--scene",
+            "heads",
+            "--cpu-fallback-max-queries",
+            "4",
+            "--cpu-fallback-max-db-entries",
+            "64",
+        ]
+    )
+    assert args.cpu_fallback_max_queries == 4
+    assert args.cpu_fallback_max_db_entries == 64
+
+
+def test_default_data_root_matches_workspace_layout():
+    root_7 = default_data_root("7scenes")
+    root_c = default_data_root("cambridge")
+    assert root_7.endswith("/reloc3r/data/7scenes")
+    assert root_c.endswith("/reloc3r/data/cambridge")
+
+
 def test_validate_runtime_args_requires_salad_checkpoint_for_dino():
     args = parse_args(
         [
@@ -195,6 +227,79 @@ def test_build_da3_salad_retriever_calls_pipeline_retrieval_only(monkeypatch):
     out = retriever(torch.zeros(2, 1, 3, 8, 8))
     assert out.shape == (2, 4)
     assert fake_pipeline.seen is not None
+
+
+def test_load_dino_salad_retriever_uses_local_vprmodel_recipe(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeModel:
+        def __init__(self, **kwargs):
+            captured["init"] = kwargs
+
+        def load_state_dict(self, state_dict, strict=True):
+            captured["state_dict_keys"] = list(state_dict.keys())
+            captured["strict"] = strict
+
+        def to(self, device):
+            captured["device"] = device
+            return self
+
+        def eval(self):
+            captured["eval"] = True
+            return self
+
+        def __call__(self, images):
+            captured["shape"] = tuple(images.shape)
+            return torch.ones(images.shape[0], 8)
+
+    fake_module = ModuleType("vpr_model")
+    fake_module.VPRModel = FakeModel
+    monkeypatch.setitem(sys.modules, "vpr_model", fake_module)
+    monkeypatch.delenv("XFORMERS_DISABLED", raising=False)
+    monkeypatch.setattr(
+        torch,
+        "load",
+        lambda _path, map_location=None: OrderedDict(
+            [("backbone.model.cls_token", torch.tensor(1.0))]
+        ),
+    )
+
+    checkpoint = tmp_path / "dino_salad_512_32.ckpt"
+    checkpoint.write_text("placeholder")
+
+    retriever = load_dino_salad_retriever(str(checkpoint), device="cpu")
+    descriptors = retriever(torch.zeros(2, 1, 3, 8, 8))
+
+    assert descriptors.shape == (2, 8)
+    assert captured["init"]["agg_config"]["num_clusters"] == 16
+    assert captured["init"]["agg_config"]["cluster_dim"] == 32
+    assert captured["strict"] is True
+    assert captured["device"] == "cpu"
+    assert captured["shape"] == (2, 3, 8, 8)
+    assert os.environ["XFORMERS_DISABLED"] == "1"
+
+
+def test_purge_salad_modules_removes_shadowing_utils_and_models():
+    fake_registry = {
+        "utils": ModuleType("utils"),
+        "utils.misc": ModuleType("utils.misc"),
+        "models": ModuleType("models"),
+        "models.helper": ModuleType("models.helper"),
+        "depth_anything_3": ModuleType("depth_anything_3"),
+    }
+    fake_registry["utils"].__file__ = str(SALAD_ROOT / "utils" / "__init__.py")
+    fake_registry["utils.misc"].__file__ = str(SALAD_ROOT / "utils" / "misc.py")
+    fake_registry["models"].__file__ = str(SALAD_ROOT / "models" / "__init__.py")
+    fake_registry["models.helper"].__file__ = str(SALAD_ROOT / "models" / "helper.py")
+    fake_registry["depth_anything_3"].__file__ = str(PROJECT_ROOT / "src" / "depth_anything_3" / "__init__.py")
+
+    _purge_salad_modules(fake_registry)
+
+    assert "utils" not in fake_registry
+    assert "utils.misc" not in fake_registry
+    assert "models" not in fake_registry
+    assert "models.helper" not in fake_registry
+    assert "depth_anything_3" in fake_registry
 
 
 def test_evaluate_scene_training_free_returns_audit_payload(monkeypatch):

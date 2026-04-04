@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import sys
 from typing import Any
@@ -116,10 +117,28 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-dir", type=str, default="workspace/ablation_results")
     parser.add_argument("--data-root", type=str, default=None)
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument(
+        "--cpu-fallback-max-queries",
+        type=int,
+        default=32,
+        help="Cap query count for bounded smoke runtime; especially useful when CUDA falls back to CPU.",
+    )
+    parser.add_argument(
+        "--cpu-fallback-max-db-entries",
+        type=int,
+        default=64,
+        help="Cap database size for bounded smoke runtime; especially useful when CUDA falls back to CPU.",
+    )
     args = parser.parse_args(argv)
     args.retriever_backend = validate_retrieval_backend(args.retriever_backend)
     args.backend = args.retriever_backend  # backward compatibility for tests/scripts
     return args
+
+
+def default_data_root(dataset: str) -> str:
+    """Resolve reloc3r dataset roots relative to the NeurIPS26 workspace."""
+    dataset_dir = "7scenes" if dataset == "7scenes" else "cambridge"
+    return str(REPO_ROOT / "reloc3r" / "data" / dataset_dir)
 
 
 def select_topk_topm(
@@ -196,6 +215,22 @@ def validate_runtime_args(args: argparse.Namespace) -> argparse.Namespace:
     return args
 
 
+def resolve_runtime_device(requested_device: str) -> str:
+    """Resolve a usable runtime device, with a safe CUDA fallback."""
+    if requested_device != "cuda":
+        return requested_device
+    if not torch.cuda.is_available():
+        print("[WARN] CUDA requested but not available. Falling back to CPU.")
+        return "cpu"
+    try:
+        # Force CUDA initialization early so we can recover before model loading.
+        _ = torch.zeros(1, device="cuda")
+        return "cuda"
+    except Exception as exc:
+        print(f"[WARN] CUDA init failed ({exc}). Falling back to CPU.")
+        return "cpu"
+
+
 def _load_checkpoint_if_exists(pipeline: Any, checkpoint_path: str | None, device: str):
     if checkpoint_path and Path(checkpoint_path).is_file():
         checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -225,8 +260,26 @@ def _ensure_salad_path(sys_path: list[str] | None = None) -> list[str]:
     target = _bootstrap_import_paths(sys_path)
     salad_path = str(SALAD_ROOT)
     if salad_path not in target:
+        # Keep SALAD ahead of repo root so `models.helper` resolves from the SALAD package.
         target.insert(0, salad_path)
     return target
+
+
+def _purge_salad_modules(modules: dict[str, Any] | None = None) -> None:
+    """Drop top-level SALAD modules that would shadow repo-local packages."""
+    registry = sys.modules if modules is None else modules
+    for name, module in list(registry.items()):
+        module_file = getattr(module, "__file__", None)
+        if not module_file:
+            continue
+        try:
+            module_path = Path(module_file).resolve()
+        except OSError:
+            continue
+        if not str(module_path).startswith(str(SALAD_ROOT.resolve())):
+            continue
+        if name == "utils" or name.startswith("utils.") or name == "models" or name.startswith("models."):
+            registry.pop(name, None)
 
 
 def load_dino_salad_retriever(salad_checkpoint: str, device: str):
@@ -235,7 +288,10 @@ def load_dino_salad_retriever(salad_checkpoint: str, device: str):
     if added_path:
         _ensure_salad_path()
     try:
-        from models.helper import get_model
+        if device == "cpu":
+            # Local DINOv2 falls back to PyTorch attention when xFormers is disabled.
+            os.environ["XFORMERS_DISABLED"] = "1"
+        from vpr_model import VPRModel
     finally:
         if added_path and salad_path in sys.path:
             sys.path.remove(salad_path)
@@ -244,16 +300,26 @@ def load_dino_salad_retriever(salad_checkpoint: str, device: str):
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"SALAD checkpoint not found: {salad_checkpoint}")
 
-    model = get_model(
-        "dinov2_vitb14",
-        num_channels=768,
-        num_clusters=64,
-        cluster_dim=128,
-        token_dim=256,
+    # Match the local SALAD checkpoint recipe used by the bundled eval script.
+    model = VPRModel(
+        backbone_arch="dinov2_vitb14",
+        backbone_config={
+            "num_trainable_blocks": 4,
+            "return_token": True,
+            "norm_layer": True,
+        },
+        agg_arch="SALAD",
+        agg_config={
+            "num_channels": 768,
+            "num_clusters": 16,
+            "cluster_dim": 32,
+            "token_dim": 32,
+        },
     )
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     state_dict = checkpoint.get("state_dict", checkpoint)
-    model.load_state_dict(state_dict, strict=False)
+    model.load_state_dict(state_dict, strict=True)
+    _purge_salad_modules()
     model = model.to(device)
     model.eval()
 
@@ -314,6 +380,7 @@ def _extract_group_c2w(
     branch_out = resolved_output[branch]
     pose_enc = branch_out.get("pose_enc")
     if branch == "cam_dec" and pose_enc is not None:
+        # cam_dec branch is most reliable when decoded directly from pose_enc.
         c2w, _ = pose_encoding_to_extri_intri(pose_enc, image_size_hw)
         return _to_4x4_batch(c2w)
 
@@ -546,24 +613,41 @@ def align_query_pose_top1_anchor(pred_group: np.ndarray, ref_gt: np.ndarray) -> 
 def main() -> None:
     args = parse_args()
     validate_runtime_args(args)
+    runtime_device = resolve_runtime_device(args.device)
     target_size = (args.image_size[0], args.image_size[1])
+    data_root = args.data_root or default_data_root(args.dataset)
 
     if args.retriever_backend == "da3_salad":
         pose_pipeline, retriever = build_da3_salad_retriever(
-            args.unified_config, args.unified_checkpoint, args.device,
+            args.unified_config, args.unified_checkpoint, runtime_device,
         )
         config = load_config(args.unified_config)
     else:
-        pose_pipeline, config = build_pose_pipeline(args.unified_config, args.unified_checkpoint, args.device)
-        retriever = load_dino_salad_retriever(args.salad_checkpoint, args.device)
+        pose_pipeline, config = build_pose_pipeline(
+            args.unified_config, args.unified_checkpoint, runtime_device,
+        )
+        retriever = load_dino_salad_retriever(args.salad_checkpoint, runtime_device)
 
-    db_entries = load_scene_images_and_poses(args.dataset, args.scene, "train", data_root=args.data_root)
-    query_entries = load_scene_images_and_poses(args.dataset, args.scene, "test", data_root=args.data_root)
+    db_entries = load_scene_images_and_poses(args.dataset, args.scene, "train", data_root=data_root)
+    query_entries = load_scene_images_and_poses(args.dataset, args.scene, "test", data_root=data_root)
+    if args.cpu_fallback_max_db_entries > 0:
+        # A bounded database keeps smoke runs practical during runtime verification.
+        db_entries = db_entries[: args.cpu_fallback_max_db_entries]
+        print(
+            f"[WARN] Using first {len(db_entries)} database images for bounded smoke "
+            "(set --cpu-fallback-max-db-entries <= 0 to disable)."
+        )
+    if args.cpu_fallback_max_queries > 0:
+        query_entries = query_entries[: args.cpu_fallback_max_queries]
+        print(
+            f"[WARN] Evaluating only first {len(query_entries)} queries for bounded smoke "
+            "(set --cpu-fallback-max-queries <= 0 to disable)."
+        )
 
     db_descriptors = extract_descriptors(
         db_entries,
         retriever,
-        device=args.device,
+        device=runtime_device,
         batch_size=args.batch_size,
         target_size=target_size,
     )
@@ -574,7 +658,7 @@ def main() -> None:
         db_entries=db_entries,
         query_entries=query_entries,
         db_descriptors=db_descriptors,
-        device=args.device,
+        device=runtime_device,
         top_k=args.top_k,
         top_m=args.top_m,
         pose_path=args.pose_path,

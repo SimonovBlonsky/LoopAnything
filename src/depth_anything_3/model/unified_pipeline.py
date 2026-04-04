@@ -209,6 +209,7 @@ class UnifiedPipeline(nn.Module):
         sims = torch.nn.functional.cosine_similarity(
             query_descriptor.unsqueeze(1), cand_descs, dim=-1,
         )
+        # Each batch row selects its own retrieval set; indices shape is [B, M].
         topm_indices = sims.topk(M, dim=1).indices  # [B, M]
 
         # Gather top-M candidate images
