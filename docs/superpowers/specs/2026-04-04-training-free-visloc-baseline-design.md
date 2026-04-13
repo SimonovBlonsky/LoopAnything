@@ -1,5 +1,13 @@
 # Training-Free Visual Localization Baseline Design
 
+> **SUPERSEDED (2026-04-06):** This spec served as the initial training-free
+> baseline design. Key findings from experiments led to architectural changes:
+> (1) `multi_ref_alignment` replaced by `reloc3r_motion_averaging` as primary
+> anchor mode; (2) multi-view (1+M) group inference replaced by pairwise 2-view
+> for fair comparison with reloc3r; (3) a trained `RelPoseHead` now supersedes
+> the training-free cam_dec path. See the successor spec:
+> [`2026-04-06-relpose-head-training-spec.md`](2026-04-06-relpose-head-training-spec.md).
+
 ## Goal
 Build a training-free visual localization baseline for 7Scenes under the reloc3r-style `TrainSplit/TestSplit` protocol:
 

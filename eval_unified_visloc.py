@@ -10,8 +10,13 @@ from tqdm import tqdm
 
 # Add paths for external dependencies
 PROJECT_ROOT = Path(__file__).resolve().parent
-# change repo root setting to fit server path
-REPO_ROOT = PROJECT_ROOT.parents[0]  # Local: ~/code/NeurIPS26 Server: /mnt/nas_9/group/chenguyuan/NeurIPS26/LoopAnything-dev
+# Resolve NeurIPS26 repo root: walk up until we find the reloc3r/ sibling.
+_candidate = PROJECT_ROOT
+for _p in [PROJECT_ROOT] + list(PROJECT_ROOT.parents):
+    if (_p / "reloc3r").is_dir():
+        _candidate = _p
+        break
+REPO_ROOT = _candidate
 SRC_ROOT = PROJECT_ROOT / "src"
 for path in (SRC_ROOT, str(REPO_ROOT)):
     if str(path) not in sys.path:
@@ -104,35 +109,101 @@ def _load_7scenes_split(root, scene, split):
 
 
 def _load_cambridge_split(root, scene, split):
-    """Load Cambridge image paths and poses for a split."""
+    """Load Cambridge image paths and poses for a split.
+
+    Uses dataset_{split}.txt for the image list, and reconstruction.nvm
+    (VisualSfM) for ground-truth poses. This matches reloc3r's protocol
+    (see reloc3r/datasets/cambridge.py ReadModelVisualSfM).
+    """
     scene_dir = Path(root) / scene
+
+    # 1. Read SfM poses from reconstruction.nvm (same as reloc3r).
+    params_dict = _read_cambridge_nvm(str(scene_dir))
+
+    # 2. Read split image list from dataset_{split}.txt.
     split_file = scene_dir / f"dataset_{split}.txt"
+    if not split_file.exists():
+        raise FileNotFoundError(f"Split file not found: {split_file}")
+
     entries = []
-    if split_file.exists():
-        with open(split_file) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split()
-                if len(parts) >= 7:
-                    img_path = scene_dir / parts[0]
-                    # Cambridge format: img_path qw qx qy qz tx ty tz
-                    qw, qx, qy, qz = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
-                    tx, ty, tz = float(parts[5]), float(parts[6]), float(parts[7])
-                    pose = _quat_trans_to_pose(qw, qx, qy, qz, tx, ty, tz)
-                    entries.append({"image_path": str(img_path), "pose": pose})
+    with open(split_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("Visual") or line.startswith("Image"):
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+            rel_path = parts[0]
+            img_path = str(scene_dir / rel_path)
+            if img_path not in params_dict:
+                continue
+            pose_c2w = params_dict[img_path]["pose_c2w"]
+            entries.append({"image_path": img_path, "pose": pose_c2w.astype(np.float32)})
     return entries
 
 
-def _quat_trans_to_pose(qw, qx, qy, qz, tx, ty, tz):
-    """Convert quaternion + translation to 4x4 pose matrix."""
-    from scipy.spatial.transform import Rotation
-    R = Rotation.from_quat([qx, qy, qz, qw]).as_matrix()
-    pose = np.eye(4, dtype=np.float32)
-    pose[:3, :3] = R
-    pose[:3, 3] = [tx, ty, tz]
-    return pose
+def _rotation_from_quaternion(quad):
+    """Convert quaternion [w, x, y, z] to 3x3 rotation matrix.
+
+    Ported from reloc3r/datasets/cambridge.py.
+    """
+    norm = np.linalg.norm(quad)
+    if norm < 1e-10:
+        raise ValueError(f"Degenerate quaternion with norm {norm}")
+    quad = quad / norm
+    qr, qi, qj, qk = quad[0], quad[1], quad[2], quad[3]
+    R = np.zeros((3, 3))
+    R[0, 0] = 1 - 2 * (qj ** 2 + qk ** 2)
+    R[0, 1] = 2 * (qi * qj - qk * qr)
+    R[0, 2] = 2 * (qi * qk + qj * qr)
+    R[1, 0] = 2 * (qi * qj + qk * qr)
+    R[1, 1] = 1 - 2 * (qi ** 2 + qk ** 2)
+    R[1, 2] = 2 * (qj * qk - qi * qr)
+    R[2, 0] = 2 * (qi * qk - qj * qr)
+    R[2, 1] = 2 * (qj * qk + qi * qr)
+    R[2, 2] = 1 - 2 * (qi ** 2 + qj ** 2)
+    return R
+
+
+def _read_cambridge_nvm(scene_dir, nvm_file="reconstruction.nvm"):
+    """Read camera params from VisualSfM NVM file.
+
+    Returns dict mapping absolute image path -> {intrinsics, pose_c2w}.
+    Ported from reloc3r/datasets/cambridge.py ReadModelVisualSfM.
+    """
+    import os
+    nvm_path = os.path.join(scene_dir, nvm_file)
+    if not os.path.exists(nvm_path):
+        raise FileNotFoundError(f"NVM file not found: {nvm_path}")
+    with open(nvm_path) as f:
+        lines = f.readlines()
+
+    counter = 2
+    n_images = int(lines[counter].strip())
+    counter += 1
+
+    params_dict = {}
+    for _ in range(n_images):
+        parts = lines[counter].strip().split()
+        counter += 1
+
+        imname = os.path.join(scene_dir, parts[0]).replace(".jpg", ".png")
+        focal = float(parts[1])
+        qvec = np.array([float(parts[k]) for k in range(2, 6)])
+        center = np.array([float(parts[k]) for k in range(6, 9)])
+
+        # NVM convention: qvec is w2c rotation, center is camera center in world.
+        R = _rotation_from_quaternion(qvec)
+        T = -R @ center
+        Rt = np.eye(4)
+        Rt[:3, :3] = R
+        Rt[:3, 3] = T
+        pose_c2w = np.linalg.inv(Rt)
+
+        params_dict[imname] = {"pose_c2w": pose_c2w}
+
+    return params_dict
 
 
 def preprocess_image(image_path, target_size=(504, 504)):

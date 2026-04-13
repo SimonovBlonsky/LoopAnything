@@ -12,14 +12,15 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
-SUPPORTED_BACKENDS = ("dino_salad", "da3_salad")
-SUPPORTED_POSE_PATHS = ("cam_dec", "ray", "both")
+SUPPORTED_BACKENDS = ("dino_salad", "da3_salad", "netvlad")
+SUPPORTED_POSE_PATHS = ("cam_dec", "ray", "both", "relpose_head")
 SUPPORTED_ANCHOR_MODES = ("reloc3r_motion_averaging", "multi_ref_alignment", "top1_anchor")
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 REPO_ROOT = PROJECT_ROOT.parents[2]
 RELOC3R_ROOT = REPO_ROOT / "reloc3r"
 SALAD_ROOT = PROJECT_ROOT / "da3_streaming" / "loop_utils" / "salad"
+NETVLAD_ROOT = REPO_ROOT / "netvlad_image_retrieval"
 
 
 def _bootstrap_import_paths(sys_path: list[str] | None = None) -> list[str]:
@@ -62,10 +63,44 @@ def load_scene_images_and_poses(
     return _loader(dataset_name, scene, split, data_root=data_root)
 
 
-def preprocess_image(image_path: str, target_size: tuple[int, int] = (504, 504)) -> torch.Tensor:
-    from eval_unified_visloc import preprocess_image as _preprocess
+IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
+IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
-    return _preprocess(image_path, target_size=target_size)
+
+def preprocess_image(image_path: str, target_size: tuple[int, int] = (504, 504)) -> torch.Tensor:
+    """Load and resize an image to [0, 1] range.
+
+    This function intentionally does NOT apply model-specific normalization.
+    Each consumer (retriever, pose pipeline) is responsible for its own
+    normalization requirements.
+
+    Args:
+        image_path: path to the image file.
+        target_size: (H, W) target dimensions.
+
+    Returns:
+        [3, H, W] float32 tensor in [0, 1] range.
+    """
+    import cv2
+    from utils.image import imread_cv2
+
+    img = imread_cv2(image_path)
+    # cv2.resize expects (width, height); target_size is (H, W).
+    img = cv2.resize(img, (target_size[1], target_size[0]))
+    img = img.astype(np.float32) / 255.0
+    img = torch.from_numpy(img).permute(2, 0, 1)  # [3, H, W]
+    return img
+
+
+def _apply_imagenet_norm(images: torch.Tensor) -> torch.Tensor:
+    """Apply ImageNet normalization to images in [0, 1] range.
+
+    Works with any shape that has a channel dimension at position -3
+    (e.g. [3, H, W], [B, 3, H, W], [B, V, 3, H, W]).
+    """
+    mean = IMAGENET_MEAN.to(images.device)
+    std = IMAGENET_STD.to(images.device)
+    return (images - mean) / std
 
 
 def get_rot_err(rot_a: np.ndarray, rot_b: np.ndarray) -> float:
@@ -94,6 +129,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--unified-config", type=str, default="configs/unified_pipeline.yaml")
     parser.add_argument("--unified-checkpoint", type=str, default=None)
     parser.add_argument("--salad-checkpoint", type=str, default=None)
+    parser.add_argument("--relpose-checkpoint", type=str, default=None,
+                        help="Path to trained RelPoseHead checkpoint (required for --pose-path relpose_head)")
     parser.add_argument("--dataset", type=str, required=True, choices=["7scenes", "cambridge"])
     parser.add_argument("--scene", type=str, required=True)
     parser.add_argument(
@@ -128,6 +165,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=int,
         default=0,
         help="Cap database size for bounded smoke runtime; especially useful when CUDA falls back to CPU.",
+    )
+    parser.add_argument(
+        "--scale-diagnostics",
+        action="store_true",
+        default=False,
+        help="Enable per-query scale diagnostics comparing pred vs GT translation norms.",
     )
     args = parser.parse_args(argv)
     args.retriever_backend = validate_retrieval_backend(args.retriever_backend)
@@ -212,6 +255,12 @@ def validate_runtime_args(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError(f"Unsupported anchor-mode: {args.anchor_mode}")
     if args.retriever_backend == "dino_salad" and not args.salad_checkpoint:
         raise ValueError("dino_salad backend requires --salad-checkpoint")
+    if args.retriever_backend == "netvlad" and args.salad_checkpoint:
+        print("[INFO] --salad-checkpoint is ignored for the netvlad backend.")
+    if args.pose_path == "relpose_head" and not args.relpose_checkpoint:
+        raise ValueError("relpose_head pose path requires --relpose-checkpoint")
+    if args.pose_path == "relpose_head" and args.anchor_mode != "reloc3r_motion_averaging":
+        raise ValueError("relpose_head only supports reloc3r_motion_averaging anchor mode")
     return args
 
 
@@ -251,7 +300,7 @@ def build_da3_salad_retriever(unified_config: str, unified_checkpoint: str | Non
 
     @torch.no_grad()
     def retriever(images: torch.Tensor) -> torch.Tensor:
-        return pipeline.retrieval_only(images.to(device))
+        return pipeline.retrieval_only(_apply_imagenet_norm(images).to(device))
 
     return pipeline, retriever
 
@@ -327,7 +376,35 @@ def load_dino_salad_retriever(salad_checkpoint: str, device: str):
     def retriever(images: torch.Tensor) -> torch.Tensor:
         if images.ndim == 5:
             images = images[:, 0]
-        return model(images.to(device))
+        return model(_apply_imagenet_norm(images).to(device))
+
+    return retriever
+
+
+def load_netvlad_retriever(device: str):
+    """Load the VGG16-NetVLAD-Pitts30K retriever (same model as reloc3r).
+
+    NetVLAD expects images in [0, 1] range and applies its own MATLAB-based
+    mean subtraction internally. Since ``preprocess_image`` already produces
+    [0, 1] tensors, no additional normalization is needed here.
+    """
+    netvlad_path = str(NETVLAD_ROOT)
+    added_path = netvlad_path not in sys.path
+    if added_path:
+        sys.path.insert(0, netvlad_path)
+    try:
+        from netvlad import NetVLAD
+    finally:
+        if added_path and netvlad_path in sys.path:
+            sys.path.remove(netvlad_path)
+
+    model = NetVLAD(NetVLAD.default_conf).eval().to(device)
+
+    @torch.no_grad()
+    def retriever(images: torch.Tensor) -> torch.Tensor:
+        if images.ndim == 5:
+            images = images[:, 0]  # [B, 3, H, W]
+        return model({"image": images.to(device)})["global_descriptor"]
 
     return retriever
 
@@ -413,6 +490,103 @@ def _estimate_query_pose_from_group(
     raise ValueError(f"Unsupported anchor mode: {anchor_mode}")
 
 
+# ---------------------------------------------------------------------------
+# Scale diagnostics (enabled via --scale-diagnostics flag)
+# ---------------------------------------------------------------------------
+_SCALE_DIAG_ENABLED = False
+_SCALE_DIAG_LOG: list[dict] = []
+
+
+def _log_scale_diagnostics(
+    relposes_q2d: np.ndarray,
+    ref_gt_c2w: np.ndarray,
+    gt_query_c2w: np.ndarray,
+    branch: str,
+    query_idx: int,
+):
+    """Compare predicted vs GT relative translation norms for one query."""
+    K = relposes_q2d.shape[0]
+    pred_norms = []
+    gt_norms = []
+    scale_ratios = []
+
+    for i in range(K):
+        # Predicted q2d translation norm.
+        pred_t_norm = float(np.linalg.norm(relposes_q2d[i, :3, 3]))
+        pred_norms.append(pred_t_norm)
+
+        # GT q2d = inv(c2w_db) @ c2w_query.
+        gt_q2d = np.linalg.inv(ref_gt_c2w[i]) @ gt_query_c2w
+        gt_t_norm = float(np.linalg.norm(gt_q2d[:3, 3]))
+        gt_norms.append(gt_t_norm)
+
+        # Scale ratio (pred / gt). Avoid division by zero.
+        if gt_t_norm > 1e-8:
+            scale_ratios.append(pred_t_norm / gt_t_norm)
+
+    entry = {
+        "query_idx": query_idx,
+        "branch": branch,
+        "pred_t_norms": pred_norms,
+        "gt_t_norms": gt_norms,
+        "scale_ratios": scale_ratios,
+    }
+    _SCALE_DIAG_LOG.append(entry)
+
+    # Print per-query summary every 50 queries.
+    if (query_idx + 1) % 50 == 0 and scale_ratios:
+        ratios = np.array(scale_ratios)
+        print(
+            f"  [ScaleDiag q={query_idx} {branch}] "
+            f"pred_t_norm: median={np.median(pred_norms):.4f} std={np.std(pred_norms):.4f} | "
+            f"gt_t_norm: median={np.median(gt_norms):.4f} | "
+            f"scale_ratio: median={np.median(ratios):.4f} std={np.std(ratios):.4f} "
+            f"min={ratios.min():.4f} max={ratios.max():.4f}"
+        )
+
+
+def summarize_scale_diagnostics() -> dict[str, Any] | None:
+    """Print and return aggregate scale statistics after all queries."""
+    if not _SCALE_DIAG_LOG:
+        return None
+
+    all_ratios = []
+    all_pred_norms = []
+    all_gt_norms = []
+    for entry in _SCALE_DIAG_LOG:
+        all_ratios.extend(entry["scale_ratios"])
+        all_pred_norms.extend(entry["pred_t_norms"])
+        all_gt_norms.extend(entry["gt_t_norms"])
+
+    ratios = np.array(all_ratios)
+    pred_norms = np.array(all_pred_norms)
+    gt_norms = np.array(all_gt_norms)
+
+    summary = {
+        "n_pairs": len(ratios),
+        "scale_ratio_median": float(np.median(ratios)),
+        "scale_ratio_mean": float(np.mean(ratios)),
+        "scale_ratio_std": float(np.std(ratios)),
+        "scale_ratio_min": float(ratios.min()),
+        "scale_ratio_max": float(ratios.max()),
+        "scale_ratio_iqr": float(np.percentile(ratios, 75) - np.percentile(ratios, 25)),
+        "pred_t_norm_median": float(np.median(pred_norms)),
+        "pred_t_norm_std": float(np.std(pred_norms)),
+        "gt_t_norm_median": float(np.median(gt_norms)),
+        "gt_t_norm_std": float(np.std(gt_norms)),
+    }
+
+    print("\n===== Scale Diagnostics Summary =====")
+    print(f"  Total pairs analyzed: {summary['n_pairs']}")
+    print(f"  Predicted t_norm:  median={summary['pred_t_norm_median']:.4f}  std={summary['pred_t_norm_std']:.4f}")
+    print(f"  GT t_norm:         median={summary['gt_t_norm_median']:.4f}  std={summary['gt_t_norm_std']:.4f}")
+    print(f"  Scale ratio (pred/gt):")
+    print(f"    median={summary['scale_ratio_median']:.4f}  mean={summary['scale_ratio_mean']:.4f}  std={summary['scale_ratio_std']:.4f}")
+    print(f"    min={summary['scale_ratio_min']:.4f}  max={summary['scale_ratio_max']:.4f}  IQR={summary['scale_ratio_iqr']:.4f}")
+    print("=====================================\n")
+    return summary
+
+
 @torch.no_grad()
 def evaluate_scene_training_free(
     pose_pipeline: Any,
@@ -460,13 +634,44 @@ def evaluate_scene_training_free(
                 [db_entries[idx]["pose"] for idx in pose_indices.tolist()],
                 axis=0,
             ).astype(np.float64)
+
+            if pose_path == "relpose_head":
+                # RelPoseHead: directly predict pairwise q2d relative pose.
+                relposes_q2d_list: list[np.ndarray] = []
+                for db_idx in pose_indices.tolist():
+                    candidate_image = preprocess_image(db_entries[db_idx]["image_path"], target_size)
+                    candidate_input = candidate_image.unsqueeze(0).unsqueeze(0).to(device)
+                    rel_pose = pose_pipeline.pairwise_relpose(
+                        _apply_imagenet_norm(query_input),
+                        _apply_imagenet_norm(candidate_input),
+                    )
+                    relposes_q2d_list.append(rel_pose[0].detach().cpu().numpy().astype(np.float64))
+
+                relposes_q2d = np.stack(relposes_q2d_list, axis=0)
+                query_pose = estimate_query_pose_motion_averaging(relposes_q2d, ref_gt)
+                branch = "relpose_head"
+                query_poses_by_branch.setdefault(branch, []).append(query_pose)
+                branch_rotation_errors.setdefault(branch, []).append(
+                    get_rot_err(query_pose[:3, :3], gt_pose[:3, :3])
+                )
+                branch_translation_errors.setdefault(branch, []).append(
+                    float(np.linalg.norm(query_pose[:3, 3] - gt_pose[:3, 3]))
+                )
+                branch_effective_modes.setdefault(branch, []).append(anchor_mode)
+                continue
+
+            # cam_dec / ray / both: derive relative pose from predicted c2w group.
             relposes_by_branch: dict[str, list[np.ndarray]] = {"cam_dec": [], "ray": []}
 
             for db_idx in pose_indices.tolist():
                 candidate_image = preprocess_image(db_entries[db_idx]["image_path"], target_size)
                 candidate_input = candidate_image.unsqueeze(0).unsqueeze(0).to(device)
 
-                output = pose_pipeline.pose_only(query_input, candidate_input, pose_path=pose_path)
+                # DA3 backbone requires ImageNet normalization.
+                output = pose_pipeline.pose_only(
+                    _apply_imagenet_norm(query_input), _apply_imagenet_norm(candidate_input),
+                    pose_path=pose_path,
+                )
                 resolved = resolve_pose_output(output, pose_path)
 
                 for branch in resolved.keys():
@@ -475,6 +680,14 @@ def evaluate_scene_training_free(
 
             for branch in resolved.keys():
                 relposes_q2d = np.stack(relposes_by_branch[branch], axis=0)
+
+                # --- Scale diagnostic ---
+                if _SCALE_DIAG_ENABLED:
+                    _log_scale_diagnostics(
+                        relposes_q2d, ref_gt, gt_pose, branch,
+                        query_idx=len(topk_all) - 1,
+                    )
+
                 query_pose = estimate_query_pose_motion_averaging(relposes_q2d, ref_gt)
                 query_poses_by_branch[branch].append(query_pose)
                 branch_rotation_errors[branch].append(get_rot_err(query_pose[:3, :3], gt_pose[:3, :3]))
@@ -490,7 +703,11 @@ def evaluate_scene_training_free(
         ]
         candidate_input = torch.stack(candidate_images, dim=0).unsqueeze(0).to(device)
 
-        output = pose_pipeline.pose_only(query_input, candidate_input, pose_path=pose_path)
+        # DA3 backbone requires ImageNet normalization.
+        output = pose_pipeline.pose_only(
+            _apply_imagenet_norm(query_input), _apply_imagenet_norm(candidate_input),
+            pose_path=pose_path,
+        )
         resolved = resolve_pose_output(output, pose_path)
 
         ref_gt = np.stack([db_entries[idx]["pose"] for idx in topm_indices.tolist()], axis=0).astype(np.float64)
@@ -505,7 +722,12 @@ def evaluate_scene_training_free(
             )
             branch_effective_modes[branch].append(mode_used)
 
-    primary_branch = "cam_dec" if pose_path in ("cam_dec", "both") else "ray"
+    if pose_path == "relpose_head":
+        primary_branch = "relpose_head"
+    elif pose_path in ("cam_dec", "both"):
+        primary_branch = "cam_dec"
+    else:
+        primary_branch = "ray"
     payload: dict[str, Any] = {
         "topk_indices": np.asarray(topk_all, dtype=object),
         "topm_indices": np.asarray(topm_all, dtype=object),
@@ -514,21 +736,19 @@ def evaluate_scene_training_free(
         "primary_pose_branch": primary_branch,
         "config": config,
     }
-    for branch in ("cam_dec", "ray"):
-        if branch_rotation_errors[branch]:
-            payload[f"rotation_errors_{branch}"] = np.asarray(
-                branch_rotation_errors[branch], dtype=np.float32
-            )
+    for branch in ("cam_dec", "ray", "relpose_head"):
+        errs = branch_rotation_errors.get(branch, [])
+        if errs:
+            payload[f"rotation_errors_{branch}"] = np.asarray(errs, dtype=np.float32)
             payload[f"translation_errors_{branch}"] = np.asarray(
                 branch_translation_errors[branch], dtype=np.float32
             )
             payload[f"effective_anchor_modes_{branch}"] = np.asarray(
                 branch_effective_modes[branch], dtype=object
             )
-    if query_poses_by_branch["cam_dec"]:
-        payload["query_poses_cam_dec"] = np.stack(query_poses_by_branch["cam_dec"], axis=0)
-    if query_poses_by_branch["ray"]:
-        payload["query_poses_ray"] = np.stack(query_poses_by_branch["ray"], axis=0)
+        poses = query_poses_by_branch.get(branch, [])
+        if poses:
+            payload[f"query_poses_{branch}"] = np.stack(poses, axis=0)
     payload["rotation_errors"] = payload[f"rotation_errors_{primary_branch}"]
     payload["translation_errors"] = payload[f"translation_errors_{primary_branch}"]
     payload["effective_anchor_modes"] = payload[f"effective_anchor_modes_{primary_branch}"]
@@ -667,8 +887,11 @@ def align_query_pose_top1_anchor(pred_group: np.ndarray, ref_gt: np.ndarray) -> 
 
 
 def main() -> None:
+    global _SCALE_DIAG_ENABLED, _SCALE_DIAG_LOG
     args = parse_args()
     validate_runtime_args(args)
+    _SCALE_DIAG_ENABLED = args.scale_diagnostics
+    _SCALE_DIAG_LOG = []
     runtime_device = resolve_runtime_device(args.device)
     target_size = (args.image_size[0], args.image_size[1])
     data_root = args.data_root or default_data_root(args.dataset)
@@ -682,7 +905,31 @@ def main() -> None:
         pose_pipeline, config = build_pose_pipeline(
             args.unified_config, args.unified_checkpoint, runtime_device,
         )
-        retriever = load_dino_salad_retriever(args.salad_checkpoint, runtime_device)
+        if args.retriever_backend == "netvlad":
+            retriever = load_netvlad_retriever(runtime_device)
+        else:
+            retriever = load_dino_salad_retriever(args.salad_checkpoint, runtime_device)
+
+    # Load RelPoseHead if requested.
+    if args.pose_path == "relpose_head" and args.relpose_checkpoint:
+        from depth_anything_3.model.rel_pose_head import RelPoseHead
+        from depth_anything_3.model.unified_pipeline_helper import _unwrap_checkpoint_state_dict
+
+        model_cfg = config.get("model", config)
+        token_dim = model_cfg.get("rel_pose_head", {}).get("token_dim", 1536)
+        head = RelPoseHead(token_dim=token_dim)
+        ckpt = torch.load(args.relpose_checkpoint, map_location="cpu")
+        sd = _unwrap_checkpoint_state_dict(ckpt)
+        # Try prefixed keys first (Lightning wraps as "rel_pose_head.xxx").
+        from depth_anything_3.model.unified_pipeline_helper import extract_prefixed_state_dict
+        head_sd = extract_prefixed_state_dict(sd, ("rel_pose_head.",))
+        if head_sd:
+            head.load_state_dict(head_sd, strict=True)
+        else:
+            head.load_state_dict(sd, strict=False)
+        head.to(runtime_device).eval()
+        pose_pipeline.rel_pose_head = head
+        print(f"[INFO] Loaded RelPoseHead from {args.relpose_checkpoint}")
 
     db_entries = load_scene_images_and_poses(args.dataset, args.scene, "train", data_root=data_root)
     query_entries = load_scene_images_and_poses(args.dataset, args.scene, "test", data_root=data_root)
@@ -741,6 +988,9 @@ def main() -> None:
     )
     save_result_payload(result, output_path)
     print(f"Saved results to: {output_path}")
+
+    if _SCALE_DIAG_ENABLED:
+        summarize_scale_diagnostics()
 
 
 if __name__ == "__main__":

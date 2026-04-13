@@ -1,5 +1,7 @@
 # DA3 AUX Layer Fusion Design
 
+> **SUPERSEDED (2026-04-06):** Earlier design iteration. Current work is tracked in [`2026-04-06-relpose-head-training-spec.md`](2026-04-06-relpose-head-training-spec.md).
+
 ## 1. Goal
 
 Add a training-free retrieval ablation to the existing DA3 + SALAD evaluation path by allowing multiple DA3 auxiliary transformer layers to be combined into a single feature map before entering the unchanged SALAD aggregator.

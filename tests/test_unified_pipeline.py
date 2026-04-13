@@ -104,6 +104,7 @@ def test_build_unified_pipeline_uses_v11_constructor_without_cross_view_fusion(m
             cam_dec,
             aux_layer=5,
             pose_top_m=3,
+            rel_pose_head=None,
         ):
             super().__init__()
             captured["aux_layer"] = aux_layer

@@ -192,6 +192,23 @@ def build_unified_pipeline(config: dict, device: str = "cpu") -> UnifiedPipeline
     aux_layer = model_config.get("aux_layer", 5)
     pose_top_m = model_config.get("pose_top_m", 3)
 
+    # 3b. Build RelPoseHead if configured
+    rel_pose_head = None
+    rel_pose_cfg = model_config.get("rel_pose_head")
+    if rel_pose_cfg:
+        from depth_anything_3.model.rel_pose_head import RelPoseHead
+        token_dim = rel_pose_cfg.get("token_dim", 1536)
+        rel_pose_head = RelPoseHead(token_dim=token_dim)
+        ckpt_path = rel_pose_cfg.get("checkpoint")
+        if ckpt_path and Path(ckpt_path).is_file():
+            ckpt = torch.load(Path(ckpt_path), map_location="cpu")
+            sd = _unwrap_checkpoint_state_dict(ckpt)
+            head_sd = extract_prefixed_state_dict(sd, ("rel_pose_head.",))
+            if head_sd:
+                rel_pose_head.load_state_dict(head_sd, strict=True)
+            else:
+                rel_pose_head.load_state_dict(sd, strict=False)
+
     # 4. Assemble pipeline
     pipeline = UnifiedPipeline(
         da3_backbone=backbone,
@@ -202,6 +219,7 @@ def build_unified_pipeline(config: dict, device: str = "cpu") -> UnifiedPipeline
         cam_dec=cam_dec,
         aux_layer=aux_layer,
         pose_top_m=pose_top_m,
+        rel_pose_head=rel_pose_head,
     )
 
     # 5. Apply freeze

@@ -36,6 +36,7 @@ class UnifiedPipeline(nn.Module):
         cam_dec: nn.Module,
         aux_layer: int = 5,
         pose_top_m: int = 3,
+        rel_pose_head: nn.Module | None = None,
     ):
         super().__init__()
         self.da3_backbone = da3_backbone
@@ -46,6 +47,7 @@ class UnifiedPipeline(nn.Module):
         self.cam_dec = cam_dec
         self.aux_layer = aux_layer
         self.pose_top_m = pose_top_m
+        self.rel_pose_head = rel_pose_head
 
     # ----- Stage 1: Retrieval -----
 
@@ -272,6 +274,29 @@ class UnifiedPipeline(nn.Module):
                 output.ray_intrinsics = ray_out.get("intrinsics")
 
         return output
+
+    def pairwise_relpose(
+        self,
+        query_image: torch.Tensor,
+        db_image: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict pairwise relative pose (query-to-db) via RelPoseHead.
+
+        Args:
+            query_image: [B, 1, 3, H, W] ImageNet-normalized query.
+            db_image: [B, 1, 3, H, W] ImageNet-normalized database image.
+
+        Returns:
+            [B, 4, 4] relative pose matrix (query-to-db transform).
+        """
+        if self.rel_pose_head is None:
+            raise RuntimeError("rel_pose_head is not available in this pipeline.")
+        multi_view = torch.cat([query_image, db_image], dim=1)  # [B, 2, 3, H, W]
+        with torch.no_grad():
+            feats, _h, _w = self._run_backbone_multiview(multi_view)
+            cam_tokens = feats[-1][1]  # [B, 2, C]
+        cam_query, cam_db = cam_tokens[:, 0], cam_tokens[:, 1]
+        return self.rel_pose_head(cam_query, cam_db)
 
     @torch.no_grad()
     def extract_database_features(self, images: torch.Tensor) -> torch.Tensor:

@@ -1,5 +1,7 @@
 # Unified Visual Localization Pipeline v1.1 Design Spec
 
+> **SUPERSEDED (2026-04-06):** Earlier design iteration. Current work is tracked in [`2026-04-06-relpose-head-training-spec.md`](2026-04-06-relpose-head-training-spec.md).
+
 ## Problem Statement
 
 v1.0 of the unified pipeline uses a post-backbone `CrossViewFusion` module (2-layer cross-attention) to fuse query and candidate features. This fundamentally cannot replicate what DA3's backbone does internally: **alternate attention** across views at every other transformer layer from `alt_start` onward. The result is that the camera token fed to `cam_dec` lacks multi-view geometric information, making absolute pose regression impossible regardless of training.

@@ -1,0 +1,43 @@
+# Training config for RelPoseHead on DA3 frozen backbone.
+# Hardware: 4x RTX3090 (24GB), DDP.
+#
+# Usage:
+#   cd LoopAnything/.worktrees/unified_pipeline1.1
+#   torchrun --nproc_per_node=4 train/train_relpose_head.py --config configs/train_relpose_head.yaml
+
+model:
+  # DA3 backbone config (frozen, used only for feature extraction).
+  unified_config: configs/unified_pipeline.yaml
+  # RelPoseHead input dimension (must match DA3 camera token dim).
+  # DA3-BASE with cat_token: 768*2=1536. DA3-Large: 1024*2=2048.
+  token_dim: 1536
+
+training:
+  # Use "dummy" for local smoke tests, "reloc3r" for real training on server.
+  dataset_mode: reloc3r
+
+  batch_size: 8          # per GPU
+  gradient_accum: 2      # effective batch = 8 * 4_gpus * 2 = 64
+  num_workers: 4
+  max_epochs: 100
+
+  optimizer:
+    name: adamw
+    lr: 3.0e-4
+    min_lr: 1.0e-6
+    weight_decay: 0.05
+    betas: [0.9, 0.95]
+
+  scheduler:
+    name: cosine
+    warmup_epochs: 5
+
+  precision: 16-mixed     # FP16 mixed precision (SVD in FP32)
+  gradient_clip_val: 1.0
+
+  # Checkpoint saving.
+  save_every_n_epochs: 10
+  output_dir: checkpoints/relpose_head
+
+  # Validation.
+  val_check_interval: 5   # validate every N epochs

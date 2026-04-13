@@ -1,5 +1,7 @@
 # DINO SALAD Intermediate-Layer Ablation Design
 
+> **SUPERSEDED (2026-04-06):** Earlier design iteration. Current work is tracked in [`2026-04-06-relpose-head-training-spec.md`](2026-04-06-relpose-head-training-spec.md).
+
 ## Goal
 Build a general DINOv2 intermediate-layer ablation training framework for SALAD, with the first target experiment defined as:
 

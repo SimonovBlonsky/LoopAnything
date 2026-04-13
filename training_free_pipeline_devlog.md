@@ -487,3 +487,49 @@ This devlog amendment documents a post-completion local code update made after t
 - original baseline commit history still ends at `99d87b5`
 - this fairness-alignment update was recorded in the worktree and verified locally
 - no new git commit had been created yet at the time this devlog entry was added
+
+## Post-Completion Update: 2026-04-04 Preprocessing Bug Fix
+
+### Motivation
+
+A full code review comparing [`ablation/eval_training_free_visloc.py`](/home/chenguyuan/code/NeurIPS26/LoopAnything/.worktrees/unified_pipeline1.1/ablation/eval_training_free_visloc.py) against [`reloc3r/eval_visloc.py`](/home/chenguyuan/code/NeurIPS26/reloc3r/eval_visloc.py) found two bugs in the image preprocessing path. The review also confirmed that the pose convention (q2d), motion averaging interface, c2w extraction, error metrics, and train/test split definitions are all correct and consistent with reloc3r.
+
+### Bug 1 (Critical): Missing ImageNet Normalization
+
+The DA3 backbone is based on DINOv2, which requires ImageNet normalization as defined in `src/depth_anything_3/utils/io/input_processor.py`:
+
+```python
+NORMALIZE = T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+```
+
+The `preprocess_image` function (previously delegated to `eval_unified_visloc.preprocess_image`) only performed `/ 255.0` scaling to the `[0, 1]` range without subtracting the ImageNet mean or dividing by the ImageNet std. This meant the DA3 backbone received incorrectly normalized inputs throughout all prior experiments, degrading feature quality and directly inflating all reported error metrics.
+
+### Bug 2 (Minor): `cv2.resize` H/W Dimension Order
+
+`cv2.resize(img, dsize)` interprets `dsize` as `(width, height)`. The `target_size` parameter was semantically `(H, W)` (matching `--image-size H W`), but was passed directly to `cv2.resize` without swapping. With the default 504×504 this had no effect, but non-square sizes would have been silently transposed.
+
+### Fix Applied
+
+Both bugs were fixed inside [`ablation/eval_training_free_visloc.py`](/home/chenguyuan/code/NeurIPS26/LoopAnything/.worktrees/unified_pipeline1.1/ablation/eval_training_free_visloc.py) only, without modifying any model or network code:
+
+- `preprocess_image` was rewritten as a self-contained function (no longer delegates to `eval_unified_visloc`).
+- Added `IMAGENET_MEAN` and `IMAGENET_STD` constants matching DA3's `InputProcessor.NORMALIZE`.
+- After `/ 255.0`, the function now applies `(img - IMAGENET_MEAN) / IMAGENET_STD`.
+- The `cv2.resize` call now explicitly swaps `target_size` from `(H, W)` to `(W, H)`: `cv2.resize(img, (target_size[1], target_size[0]))`.
+
+### Verification
+
+All existing tests pass after the fix:
+
+```bash
+cd /home/chenguyuan/code/NeurIPS26/LoopAnything/.worktrees/unified_pipeline1.1
+PYTHONPATH=src conda run -n da3 python -m pytest tests/test_training_free_visloc.py tests/test_unified_pipeline.py -q
+```
+
+Observed result:
+
+- `26 passed, 1 warning in 2.42s`
+
+### Impact
+
+All previously reported error metrics (translation and rotation) from the training-free baseline were obtained without ImageNet normalization and are therefore invalid. Re-running experiments with the fix is expected to produce significantly improved numbers.

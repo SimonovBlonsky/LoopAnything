@@ -1,5 +1,7 @@
 # DA3 Dual-Branch VPR Adapter Design
 
+> **SUPERSEDED (2026-04-06):** Earlier design iteration. Current work is tracked in [`2026-04-06-relpose-head-training-spec.md`](2026-04-06-relpose-head-training-spec.md).
+
 ## Goal
 Add a lightweight retrieval adapter on top of frozen `DA3-BASE` layer-5 retrieval features so that the VPR path becomes:
 

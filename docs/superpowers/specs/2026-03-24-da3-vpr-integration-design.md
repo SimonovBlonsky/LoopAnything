@@ -1,5 +1,7 @@
 # DA3 VPR Integration Design
 
+> **SUPERSEDED (2026-04-06):** Earlier design iteration. Current work is tracked in [`2026-04-06-relpose-head-training-spec.md`](2026-04-06-relpose-head-training-spec.md).
+
 ## 1. Goal
 
 Integrate a retrieval-oriented VPR model into the DA3 codebase by reusing the existing Depth Anything 3 DINOv2 encoder and plugging its output features into a SALAD-style aggregator interface.

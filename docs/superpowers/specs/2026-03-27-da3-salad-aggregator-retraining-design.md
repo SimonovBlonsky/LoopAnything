@@ -1,5 +1,7 @@
 # DA3 SALAD Aggregator Retraining Design
 
+> **SUPERSEDED (2026-04-06):** Earlier design iteration. Current work is tracked in [`2026-04-06-relpose-head-training-spec.md`](2026-04-06-relpose-head-training-spec.md).
+
 ## Goal
 Train a new SALAD aggregator on top of a frozen DA3 backbone, using DA3-BASE layer-5 features for visual place recognition. The experiment must keep the SALAD aggregator architecture unchanged, reuse the existing `dino_salad_512_32.ckpt` as initialization, and modify only `LoopAnything/train/train_salad_aggregator.py`.
 

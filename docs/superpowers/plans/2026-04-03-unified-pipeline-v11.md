@@ -1,5 +1,11 @@
 # Unified Pipeline v1.1 Implementation Plan
 
+> **SUPERSEDED (2026-04-06):** Tasks 1-2 were completed; Task 3 (delete
+> cross_view_fusion.py) done during cleanup. Tasks 4-8 replaced by the
+> training-free baseline (`eval_training_free_visloc.py`) and the RelPoseHead
+> training pipeline. See successor spec:
+> [`2026-04-06-relpose-head-training-spec.md`](../specs/2026-04-06-relpose-head-training-spec.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Replace external CrossViewFusion with DA3's native multi-view alternate attention for pose estimation.
