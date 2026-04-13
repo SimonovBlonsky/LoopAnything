@@ -104,7 +104,11 @@ def _load_7scenes_split(root, scene, split):
             pose_path = str(frame_path).replace(".color.png", ".pose.txt")
             if Path(pose_path).exists():
                 pose = np.loadtxt(pose_path).astype(np.float32)
-                entries.append({"image_path": str(frame_path), "pose": pose})
+                entries.append({
+                    "image_path": str(frame_path),
+                    "pose": pose,
+                    "intrinsics": SEVEN_SCENES["intrinsics"].copy(),
+                })
     return entries
 
 
@@ -139,7 +143,12 @@ def _load_cambridge_split(root, scene, split):
             if img_path not in params_dict:
                 continue
             pose_c2w = params_dict[img_path]["pose_c2w"]
-            entries.append({"image_path": img_path, "pose": pose_c2w.astype(np.float32)})
+            intrinsics = params_dict[img_path]["intrinsics"]
+            entries.append({
+                "image_path": img_path,
+                "pose": pose_c2w.astype(np.float32),
+                "intrinsics": intrinsics,
+            })
     return entries
 
 
@@ -193,6 +202,12 @@ def _read_cambridge_nvm(scene_dir, nvm_file="reconstruction.nvm"):
         qvec = np.array([float(parts[k]) for k in range(2, 6)])
         center = np.array([float(parts[k]) for k in range(6, 9)])
 
+        # Per-image intrinsics from SfM (same as reloc3r cambridge.py).
+        import imagesize
+        width, height = imagesize.get(imname)
+        cx, cy = width / 2.0, height / 2.0
+        intrinsics = np.array([[focal, 0.0, cx], [0.0, focal, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+
         # NVM convention: qvec is w2c rotation, center is camera center in world.
         R = _rotation_from_quaternion(qvec)
         T = -R @ center
@@ -201,7 +216,7 @@ def _read_cambridge_nvm(scene_dir, nvm_file="reconstruction.nvm"):
         Rt[:3, 3] = T
         pose_c2w = np.linalg.inv(Rt)
 
-        params_dict[imname] = {"pose_c2w": pose_c2w}
+        params_dict[imname] = {"pose_c2w": pose_c2w, "intrinsics": intrinsics}
 
     return params_dict
 

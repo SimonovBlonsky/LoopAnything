@@ -68,11 +68,10 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
 
 def preprocess_image(image_path: str, target_size: tuple[int, int] = (504, 504)) -> torch.Tensor:
-    """Load and resize an image to [0, 1] range.
+    """Load and resize an image to [0, 1] range (for retrieval only).
 
     This function intentionally does NOT apply model-specific normalization.
-    Each consumer (retriever, pose pipeline) is responsible for its own
-    normalization requirements.
+    Each retriever (NetVLAD, DINO-SALAD, DA3-SALAD) handles its own norm.
 
     Args:
         image_path: path to the image file.
@@ -101,6 +100,113 @@ def _apply_imagenet_norm(images: torch.Tensor) -> torch.Tensor:
     mean = IMAGENET_MEAN.to(images.device)
     std = IMAGENET_STD.to(images.device)
     return (images - mean) / std
+
+
+# ---------------------------------------------------------------------------
+# Pose preprocessing: reloc3r-style crop + DA3 InputProcessor
+# This ensures the image content fed to DA3 for pose estimation matches
+# the preprocessing used by eval_relpose.py (ScanNet1500 benchmark).
+# ---------------------------------------------------------------------------
+_DA3_INPUT_PROCESSOR = None
+
+
+def _get_da3_input_processor():
+    """Lazy-load the DA3 InputProcessor singleton."""
+    global _DA3_INPUT_PROCESSOR
+    if _DA3_INPUT_PROCESSOR is None:
+        from depth_anything_3.utils.io.input_processor import InputProcessor
+        _DA3_INPUT_PROCESSOR = InputProcessor()
+    return _DA3_INPUT_PROCESSOR
+
+
+def _crop_resize_reloc3r(image_path: str, intrinsics: np.ndarray,
+                         resolution: tuple[int, int] = (512, 384)) -> np.ndarray:
+    """Apply reloc3r's principal-point-centered crop + resize.
+
+    Replicates BaseStereoViewDataset._crop_resize_if_necessary exactly.
+
+    Args:
+        image_path: path to the image file.
+        intrinsics: [3, 3] camera intrinsic matrix.
+        resolution: (width, height) target resolution (width >= height).
+
+    Returns:
+        Cropped and resized image as numpy uint8 RGB array.
+    """
+    import copy
+    import PIL.Image
+    from utils.image import imread_cv2
+    import datasets.utils.cropping as cropping
+
+    img = imread_cv2(image_path)  # numpy RGB uint8
+    if not isinstance(img, PIL.Image.Image):
+        img = PIL.Image.fromarray(img)
+
+    K = copy.deepcopy(intrinsics)
+
+    # Step 1: crop centered on principal point (same as reloc3r).
+    W, H = img.size
+    cx, cy = K[:2, 2].round().astype(int)
+    min_margin_x = min(cx, W - cx)
+    min_margin_y = min(cy, H - cy)
+    l, t = cx - min_margin_x, cy - min_margin_y
+    r, b = cx + min_margin_x, cy + min_margin_y
+    img, K = cropping.crop_image(img, K, (l, t, r, b))
+
+    # Step 2: transpose resolution if image is portrait.
+    W, H = img.size
+    res = resolution
+    assert res[0] >= res[1]
+    if H > 1.1 * W:
+        res = res[::-1]
+
+    # Step 3: Lanczos rescale so that output >= target resolution.
+    img, K = cropping.rescale_image(img, K, np.array(res))
+
+    # Step 4: final center crop to exact resolution.
+    K2 = cropping.camera_matrix_of_crop(K, img.size, res, offset_factor=0.5)
+    crop_bbox = cropping.bbox_from_intrinsics_in_out(K, K2, res)
+    img, _ = cropping.crop_image(img, K, crop_bbox)
+
+    return np.asarray(img, dtype=np.uint8)
+
+
+def preprocess_image_for_pose(
+    image_path: str,
+    intrinsics: np.ndarray,
+    crop_resolution: tuple[int, int] = (512, 384),
+    da3_process_res: int = 504,
+) -> torch.Tensor:
+    """Full pose preprocessing: reloc3r crop → DA3 InputProcessor.
+
+    This matches the preprocessing chain in eval_relpose.py exactly:
+    1. reloc3r principal-point crop + resize to crop_resolution
+    2. DA3 InputProcessor (patch-aligned resize + ImageNet normalization)
+
+    Args:
+        image_path: path to the image file.
+        intrinsics: [3, 3] camera intrinsic matrix.
+        crop_resolution: reloc3r crop target (width, height), default (512, 384).
+        da3_process_res: DA3 InputProcessor resolution, default 504.
+
+    Returns:
+        [3, H, W] float32 tensor, ImageNet-normalized, patch-aligned.
+    """
+    # Step 1: reloc3r-style crop + resize.
+    cropped = _crop_resize_reloc3r(image_path, intrinsics, crop_resolution)
+
+    # Step 2: DA3 InputProcessor (resize to fit da3_process_res, patch-align, ImageNet norm).
+    processor = _get_da3_input_processor()
+    tensor, _, _ = processor(
+        [cropped],
+        process_res=da3_process_res,
+        process_res_method="upper_bound_resize",
+        num_workers=1,
+        print_progress=False,
+        sequential=True,
+        desc=None,
+    )
+    return tensor.squeeze(0).squeeze(0).float()  # [3, H, W]
 
 
 def get_rot_err(rot_a: np.ndarray, rot_b: np.ndarray) -> float:
@@ -616,10 +722,18 @@ def evaluate_scene_training_free(
     query_poses_by_branch: dict[str, list[np.ndarray]] = {"cam_dec": [], "ray": []}
 
     for q_entry in tqdm(query_entries, desc="Evaluating queries"):
+        # Retrieval: simple resize to target_size, [0,1] range.
         query_img = preprocess_image(q_entry["image_path"], target_size).to(device)
         query_input = query_img.unsqueeze(0).unsqueeze(0)  # [1, 1, 3, H, W]
         query_desc = retriever(query_input)  # [1, D]
         gt_pose = np.asarray(q_entry["pose"], dtype=np.float64)
+
+        # Pose: reloc3r-style crop + DA3 InputProcessor (already ImageNet-normalized).
+        query_intrinsics = q_entry.get("intrinsics")
+        query_pose_img = preprocess_image_for_pose(
+            q_entry["image_path"], query_intrinsics,
+        ).to(device)
+        query_pose_input = query_pose_img.unsqueeze(0).unsqueeze(0)  # [1, 1, 3, H, W]
 
         sims = F.cosine_similarity(query_desc[0].unsqueeze(0), db_desc_device, dim=1)
         topk_indices_t, topm_indices_t = select_topk_topm(sims, top_k=top_k, top_m=top_m)
@@ -639,11 +753,13 @@ def evaluate_scene_training_free(
                 # RelPoseHead: directly predict pairwise q2d relative pose.
                 relposes_q2d_list: list[np.ndarray] = []
                 for db_idx in pose_indices.tolist():
-                    candidate_image = preprocess_image(db_entries[db_idx]["image_path"], target_size)
-                    candidate_input = candidate_image.unsqueeze(0).unsqueeze(0).to(device)
+                    cand_pose_img = preprocess_image_for_pose(
+                        db_entries[db_idx]["image_path"],
+                        db_entries[db_idx].get("intrinsics"),
+                    ).to(device)
+                    cand_pose_input = cand_pose_img.unsqueeze(0).unsqueeze(0)
                     rel_pose = pose_pipeline.pairwise_relpose(
-                        _apply_imagenet_norm(query_input),
-                        _apply_imagenet_norm(candidate_input),
+                        query_pose_input, cand_pose_input,
                     )
                     relposes_q2d_list.append(rel_pose[0].detach().cpu().numpy().astype(np.float64))
 
@@ -664,12 +780,15 @@ def evaluate_scene_training_free(
             relposes_by_branch: dict[str, list[np.ndarray]] = {"cam_dec": [], "ray": []}
 
             for db_idx in pose_indices.tolist():
-                candidate_image = preprocess_image(db_entries[db_idx]["image_path"], target_size)
-                candidate_input = candidate_image.unsqueeze(0).unsqueeze(0).to(device)
+                cand_pose_img = preprocess_image_for_pose(
+                    db_entries[db_idx]["image_path"],
+                    db_entries[db_idx].get("intrinsics"),
+                ).to(device)
+                cand_pose_input = cand_pose_img.unsqueeze(0).unsqueeze(0)
 
-                # DA3 backbone requires ImageNet normalization.
+                # Images are already ImageNet-normalized by preprocess_image_for_pose.
                 output = pose_pipeline.pose_only(
-                    _apply_imagenet_norm(query_input), _apply_imagenet_norm(candidate_input),
+                    query_pose_input, cand_pose_input,
                     pose_path=pose_path,
                 )
                 resolved = resolve_pose_output(output, pose_path)
@@ -698,14 +817,17 @@ def evaluate_scene_training_free(
             continue
 
         topm_all.append(topm_indices)
-        candidate_images = [
-            preprocess_image(db_entries[idx]["image_path"], target_size) for idx in topm_indices.tolist()
+        candidate_pose_images = [
+            preprocess_image_for_pose(
+                db_entries[idx]["image_path"],
+                db_entries[idx].get("intrinsics"),
+            ) for idx in topm_indices.tolist()
         ]
-        candidate_input = torch.stack(candidate_images, dim=0).unsqueeze(0).to(device)
+        candidate_pose_input = torch.stack(candidate_pose_images, dim=0).unsqueeze(0).to(device)
 
-        # DA3 backbone requires ImageNet normalization.
+        # Images are already ImageNet-normalized by preprocess_image_for_pose.
         output = pose_pipeline.pose_only(
-            _apply_imagenet_norm(query_input), _apply_imagenet_norm(candidate_input),
+            query_pose_input, candidate_pose_input,
             pose_path=pose_path,
         )
         resolved = resolve_pose_output(output, pose_path)

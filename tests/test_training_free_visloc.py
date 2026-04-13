@@ -354,6 +354,7 @@ def test_evaluate_scene_training_free_returns_audit_payload(monkeypatch):
             )
 
     monkeypatch.setattr(module, "preprocess_image", lambda _p, target_size: torch.zeros(3, *target_size))
+    monkeypatch.setattr(module, "preprocess_image_for_pose", lambda _p, _k, **kw: torch.zeros(3, 8, 8))
     monkeypatch.setattr(module, "get_rot_err", lambda _a, _b: 0.0)
 
     # Force cam_dec c2w recovery through pose_enc (not output.extrinsics)
@@ -447,6 +448,7 @@ def test_pairwise_motion_averaging_uses_full_topk_for_pose(monkeypatch):
     query_entries = [{"image_path": "q0.png", "pose": gt_query.astype(np.float32)}]
 
     monkeypatch.setattr(module, "preprocess_image", lambda _p, target_size: torch.zeros(3, *target_size))
+    monkeypatch.setattr(module, "preprocess_image_for_pose", lambda _p, _k, **kw: torch.zeros(3, 8, 8))
     monkeypatch.setattr(module, "get_rot_err", lambda _a, _b: 0.0)
     monkeypatch.setattr(
         module,
