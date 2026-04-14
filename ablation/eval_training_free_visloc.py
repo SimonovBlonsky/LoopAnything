@@ -52,15 +52,164 @@ def build_unified_pipeline(config: dict[str, Any], device: str = "cpu"):
     return _builder(config, device=device)
 
 
+# ---------------------------------------------------------------------------
+# Dataset configs and loaders (self-contained, no dependency on eval_unified_visloc.py)
+# ---------------------------------------------------------------------------
+SEVEN_SCENES_CONFIG = {
+    "scenes": ["chess", "fire", "heads", "office", "pumpkin", "redkitchen", "stairs"],
+    "intrinsics": np.array([[525.0, 0.0, 320.0], [0.0, 525.0, 240.0], [0.0, 0.0, 1.0]], dtype=np.float32),
+}
+CAMBRIDGE_CONFIG = {
+    "scenes": ["GreatCourt", "KingsCollege", "OldHospital", "ShopFacade", "StMarysChurch"],
+}
+
+
+def default_data_root(dataset: str) -> str:
+    """Resolve reloc3r dataset roots relative to the NeurIPS26 workspace."""
+    dataset_dir = "7scenes" if dataset == "7scenes" else "cambridge"
+    return str(REPO_ROOT / "reloc3r" / "data" / dataset_dir)
+
+
 def load_scene_images_and_poses(
     dataset_name: str,
     scene: str,
     split: str,
     data_root: str | None = None,
-):
-    from eval_unified_visloc import load_scene_images_and_poses as _loader
+) -> list[dict[str, Any]]:
+    """Load all images and GT poses for a scene split.
 
-    return _loader(dataset_name, scene, split, data_root=data_root)
+    Returns list of dicts with keys: image_path, pose (4x4 c2w), intrinsics (3x3).
+    """
+    root = data_root if data_root else default_data_root(dataset_name)
+    if dataset_name == "7scenes":
+        return _load_7scenes_split(root, scene, split)
+    elif dataset_name == "cambridge":
+        return _load_cambridge_split(root, scene, split)
+    raise ValueError(f"Unknown dataset: {dataset_name}")
+
+
+def _load_7scenes_split(root: str, scene: str, split: str) -> list[dict[str, Any]]:
+    from pathlib import Path as _Path
+    scene_dir = _Path(root) / scene
+    split_map = {"train": "TrainSplit.txt", "test": "TestSplit.txt"}
+    split_file = scene_dir / split_map[split]
+    if not split_file.exists():
+        raise FileNotFoundError(f"Split file not found: {split_file}")
+
+    allowed_seqs = set()
+    with open(split_file) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                seq_num = int(line.replace("sequence", ""))
+                allowed_seqs.add(f"seq-{seq_num:02d}")
+
+    intrinsics = SEVEN_SCENES_CONFIG["intrinsics"]
+    entries = []
+    for seq_dir in sorted(d for d in scene_dir.iterdir() if d.is_dir() and d.name.startswith("seq-")):
+        if seq_dir.name not in allowed_seqs:
+            continue
+        for frame_path in sorted(seq_dir.glob("*.color.png")):
+            pose_path = str(frame_path).replace(".color.png", ".pose.txt")
+            if _Path(pose_path).exists():
+                pose = np.loadtxt(pose_path).astype(np.float32)
+                entries.append({
+                    "image_path": str(frame_path),
+                    "pose": pose,
+                    "intrinsics": intrinsics.copy(),
+                })
+    return entries
+
+
+def _rotation_from_quaternion(quad: np.ndarray) -> np.ndarray:
+    """Convert quaternion [w, x, y, z] to 3x3 rotation matrix."""
+    norm = np.linalg.norm(quad)
+    if norm < 1e-10:
+        raise ValueError(f"Degenerate quaternion with norm {norm}")
+    quad = quad / norm
+    qr, qi, qj, qk = quad[0], quad[1], quad[2], quad[3]
+    R = np.zeros((3, 3))
+    R[0, 0] = 1 - 2 * (qj ** 2 + qk ** 2)
+    R[0, 1] = 2 * (qi * qj - qk * qr)
+    R[0, 2] = 2 * (qi * qk + qj * qr)
+    R[1, 0] = 2 * (qi * qj + qk * qr)
+    R[1, 1] = 1 - 2 * (qi ** 2 + qk ** 2)
+    R[1, 2] = 2 * (qj * qk - qi * qr)
+    R[2, 0] = 2 * (qi * qk - qj * qr)
+    R[2, 1] = 2 * (qj * qk + qi * qr)
+    R[2, 2] = 1 - 2 * (qi ** 2 + qj ** 2)
+    return R
+
+
+def _read_cambridge_nvm(scene_dir: str, nvm_file: str = "reconstruction.nvm") -> dict:
+    """Read camera params from VisualSfM NVM file.
+
+    Returns dict mapping absolute image path -> {pose_c2w, intrinsics}.
+    """
+    import os
+    from PIL import Image as _PILImage
+
+    nvm_path = os.path.join(scene_dir, nvm_file)
+    if not os.path.exists(nvm_path):
+        raise FileNotFoundError(f"NVM file not found: {nvm_path}")
+    with open(nvm_path) as f:
+        lines = f.readlines()
+
+    counter = 2
+    n_images = int(lines[counter].strip())
+    counter += 1
+
+    params_dict = {}
+    for _ in range(n_images):
+        parts = lines[counter].strip().split()
+        counter += 1
+        imname = os.path.join(scene_dir, parts[0]).replace(".jpg", ".png")
+        focal = float(parts[1])
+        qvec = np.array([float(parts[k]) for k in range(2, 6)])
+        center = np.array([float(parts[k]) for k in range(6, 9)])
+
+        width, height = _PILImage.open(imname).size
+        cx, cy = width / 2.0, height / 2.0
+        intrinsics = np.array([[focal, 0.0, cx], [0.0, focal, cy], [0.0, 0.0, 1.0]], dtype=np.float32)
+
+        R = _rotation_from_quaternion(qvec)
+        T = -R @ center
+        Rt = np.eye(4)
+        Rt[:3, :3] = R
+        Rt[:3, 3] = T
+        pose_c2w = np.linalg.inv(Rt)
+        params_dict[imname] = {"pose_c2w": pose_c2w, "intrinsics": intrinsics}
+
+    return params_dict
+
+
+def _load_cambridge_split(root: str, scene: str, split: str) -> list[dict[str, Any]]:
+    from pathlib import Path as _Path
+    scene_dir = _Path(root) / scene
+    params_dict = _read_cambridge_nvm(str(scene_dir))
+
+    split_file = scene_dir / f"dataset_{split}.txt"
+    if not split_file.exists():
+        raise FileNotFoundError(f"Split file not found: {split_file}")
+
+    entries = []
+    with open(split_file) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#") or line.startswith("Visual") or line.startswith("Image"):
+                continue
+            parts = line.split()
+            if not parts:
+                continue
+            img_path = str(scene_dir / parts[0])
+            if img_path not in params_dict:
+                continue
+            entries.append({
+                "image_path": img_path,
+                "pose": params_dict[img_path]["pose_c2w"].astype(np.float32),
+                "intrinsics": params_dict[img_path]["intrinsics"],
+            })
+    return entries
 
 
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -282,12 +431,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     args.retriever_backend = validate_retrieval_backend(args.retriever_backend)
     args.backend = args.retriever_backend  # backward compatibility for tests/scripts
     return args
-
-
-def default_data_root(dataset: str) -> str:
-    """Resolve reloc3r dataset roots relative to the NeurIPS26 workspace."""
-    dataset_dir = "7scenes" if dataset == "7scenes" else "cambridge"
-    return str(REPO_ROOT / "reloc3r" / "data" / dataset_dir)
 
 
 def select_topk_topm(
