@@ -44,3 +44,5 @@ logs/
 .worktrees/
 
 checkpoints
+data/
+da3_streaming/weights

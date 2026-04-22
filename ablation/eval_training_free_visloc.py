@@ -65,7 +65,15 @@ CAMBRIDGE_CONFIG = {
 
 
 def default_data_root(dataset: str) -> str:
-    """Resolve reloc3r dataset roots relative to the NeurIPS26 workspace."""
+    """Resolve dataset roots relative to the NeurIPS26 workspace."""
+    if dataset == "kitti":
+        return str(PROJECT_ROOT / "data" / "kitti_visloc")
+    if dataset == "euroc":
+        return str(PROJECT_ROOT / "data" / "euroc_visloc")
+    if dataset == "eth3d":
+        return str(PROJECT_ROOT / "data" / "eth3d_visloc")
+    if dataset == "cmu":
+        return str(PROJECT_ROOT / "data" / "cmu_visloc")
     dataset_dir = "7scenes" if dataset == "7scenes" else "cambridge"
     return str(REPO_ROOT / "reloc3r" / "data" / dataset_dir)
 
@@ -85,6 +93,8 @@ def load_scene_images_and_poses(
         return _load_7scenes_split(root, scene, split)
     elif dataset_name == "cambridge":
         return _load_cambridge_split(root, scene, split)
+    elif dataset_name in ("kitti", "euroc", "eth3d", "cmu"):
+        return _load_kitti_split(root, scene, split)  # same format
     raise ValueError(f"Unknown dataset: {dataset_name}")
 
 
@@ -212,31 +222,67 @@ def _load_cambridge_split(root: str, scene: str, split: str) -> list[dict[str, A
     return entries
 
 
+def _load_kitti_split(root: str, scene: str, split: str) -> list[dict[str, Any]]:
+    """Load KITTI visloc dataset (produced by prepare_kitti_visloc.py)."""
+    from pathlib import Path as _Path
+    scene_dir = _Path(root) / scene
+    frames_dir = scene_dir / "frames"
+    split_map = {"train": "TrainSplit.txt", "test": "TestSplit.txt"}
+    split_file = scene_dir / split_map[split]
+    if not split_file.exists():
+        raise FileNotFoundError(f"Split file not found: {split_file}")
+
+    intrinsics_file = scene_dir / "intrinsics.txt"
+    K = np.loadtxt(str(intrinsics_file)).astype(np.float32) if intrinsics_file.exists() else None
+
+    frame_ids = []
+    with open(split_file) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                frame_ids.append(line)
+
+    entries = []
+    for fid in frame_ids:
+        img_path = frames_dir / f"{fid}.color.png"
+        pose_path = frames_dir / f"{fid}.pose.txt"
+        if not img_path.exists() or not pose_path.exists():
+            continue
+        pose = np.loadtxt(str(pose_path)).astype(np.float32)
+        entry = {"image_path": str(img_path), "pose": pose}
+        if K is not None:
+            entry["intrinsics"] = K.copy()
+        entries.append(entry)
+    return entries
+
+
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(3, 1, 1)
 
 
-def preprocess_image(image_path: str, target_size: tuple[int, int] = (504, 504)) -> torch.Tensor:
-    """Load and resize an image to [0, 1] range (for retrieval only).
+def preprocess_image(image_path: str, target_size: tuple[int, int] | None = None) -> torch.Tensor:
+    """Load an image for retrieval, matching reloc3r's SevenScenesRetrieval.load_image.
 
-    This function intentionally does NOT apply model-specific normalization.
-    Each retriever (NetVLAD, DINO-SALAD, DA3-SALAD) handles its own norm.
+    Preprocessing: BGR color order, per-image min-max normalization to [0, 1],
+    original resolution (no resize by default). This ensures the NetVLAD
+    descriptors are identical to those produced by reloc3r's retrieval pipeline.
 
     Args:
         image_path: path to the image file.
-        target_size: (H, W) target dimensions.
+        target_size: optional (H, W) to resize. None keeps original resolution.
 
     Returns:
-        [3, H, W] float32 tensor in [0, 1] range.
+        [3, H, W] float32 tensor in [0, 1] range, BGR channel order.
     """
     import cv2
-    from utils.image import imread_cv2
 
-    img = imread_cv2(image_path)
-    # cv2.resize expects (width, height); target_size is (H, W).
-    img = cv2.resize(img, (target_size[1], target_size[0]))
-    img = img.astype(np.float32) / 255.0
-    img = torch.from_numpy(img).permute(2, 0, 1)  # [3, H, W]
+    img = cv2.imread(image_path)  # BGR, uint8 — same as reloc3r
+    if img is None:
+        raise IOError(f"Could not load image: {image_path}")
+    if target_size is not None:
+        img = cv2.resize(img, (target_size[1], target_size[0]))
+    img = torch.from_numpy(img).float().permute(2, 0, 1)  # [3, H, W], BGR
+    img = (img - img.min()) / (img.max() - img.min())  # per-image min-max [0, 1]
     return img
 
 
@@ -386,7 +432,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--salad-checkpoint", type=str, default=None)
     parser.add_argument("--relpose-checkpoint", type=str, default=None,
                         help="Path to trained RelPoseHead checkpoint (required for --pose-path relpose_head)")
-    parser.add_argument("--dataset", type=str, required=True, choices=["7scenes", "cambridge"])
+    parser.add_argument("--dataset", type=str, required=True,
+                        choices=["7scenes", "cambridge", "kitti", "euroc", "eth3d", "cmu"])
     parser.add_argument("--scene", type=str, required=True)
     parser.add_argument(
         "--retriever-backend",
@@ -427,10 +474,70 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=False,
         help="Enable per-query scale diagnostics comparing pred vs GT translation norms.",
     )
+    parser.add_argument(
+        "--save-failure-cases",
+        type=int,
+        default=0,
+        metavar="N",
+        help="Save top-N worst failure cases (by pose error) with images and diagnostics.",
+    )
+    parser.add_argument(
+        "--oracle-retrieval",
+        type=str,
+        default=None,
+        choices=["position", "combined"],
+        help="Bypass visual retrieval and use GT pose for nearest-neighbor selection. "
+             "position: rank by translation distance. "
+             "combined: rank by translation + rotation angular distance.",
+    )
     args = parser.parse_args(argv)
     args.retriever_backend = validate_retrieval_backend(args.retriever_backend)
     args.backend = args.retriever_backend  # backward compatibility for tests/scripts
     return args
+
+
+def compute_oracle_topk(
+    db_entries: list[dict[str, Any]],
+    query_entries: list[dict[str, Any]],
+    top_k: int,
+    mode: str = "combined",
+) -> np.ndarray:
+    """Compute top-K DB indices for each query using GT poses (no visual features).
+
+    Args:
+        db_entries, query_entries: entries with 'pose' (4x4 c2w).
+        top_k: number of DB indices to return per query.
+        mode: 'position' (translation distance only) or 'combined' (translation + rotation).
+
+    Returns:
+        [Q, K] int64 array of DB indices ranked by GT distance.
+    """
+    db_pos = np.array([e["pose"][:3, 3] for e in db_entries], dtype=np.float64)
+    db_rot = np.array([e["pose"][:3, :3] for e in db_entries], dtype=np.float64)
+
+    out = np.zeros((len(query_entries), top_k), dtype=np.int64)
+    for qi, q in enumerate(query_entries):
+        q_pos = np.asarray(q["pose"][:3, 3], dtype=np.float64)
+        q_rot = np.asarray(q["pose"][:3, :3], dtype=np.float64)
+
+        pos_d = np.linalg.norm(db_pos - q_pos, axis=1)
+
+        if mode == "position":
+            scores = pos_d
+        elif mode == "combined":
+            # Angular rotation distance (in radians).
+            R_rel = np.einsum("ij,njk->nik", q_rot.T, db_rot)
+            trace = np.einsum("nii->n", R_rel)
+            cosang = np.clip((trace - 1) / 2, -1.0 + 1e-8, 1.0 - 1e-8)
+            rot_d = np.arccos(cosang)  # radians
+            # Weight: 1m ≈ 1 radian (~57deg). Tunable but reasonable for mixed scales.
+            scores = pos_d + rot_d
+        else:
+            raise ValueError(f"Unknown oracle mode: {mode}")
+
+        topk_idx = np.argsort(scores)[: min(top_k, len(scores))]
+        out[qi, : len(topk_idx)] = topk_idx
+    return out
 
 
 def select_topk_topm(
@@ -502,10 +609,12 @@ def validate_runtime_args(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("top_m must be <= top_k")
     if args.anchor_mode not in SUPPORTED_ANCHOR_MODES:
         raise ValueError(f"Unsupported anchor-mode: {args.anchor_mode}")
-    if args.retriever_backend == "dino_salad" and not args.salad_checkpoint:
-        raise ValueError("dino_salad backend requires --salad-checkpoint")
-    if args.retriever_backend == "netvlad" and args.salad_checkpoint:
-        print("[INFO] --salad-checkpoint is ignored for the netvlad backend.")
+    # Oracle retrieval bypasses the visual retriever; skip retriever-specific checks.
+    if args.oracle_retrieval is None:
+        if args.retriever_backend == "dino_salad" and not args.salad_checkpoint:
+            raise ValueError("dino_salad backend requires --salad-checkpoint")
+        if args.retriever_backend == "netvlad" and args.salad_checkpoint:
+            print("[INFO] --salad-checkpoint is ignored for the netvlad backend.")
     if args.pose_path == "relpose_head" and not args.relpose_checkpoint:
         raise ValueError("relpose_head pose path requires --relpose-checkpoint")
     if args.pose_path == "relpose_head" and args.anchor_mode != "reloc3r_motion_averaging":
@@ -549,7 +658,19 @@ def build_da3_salad_retriever(unified_config: str, unified_checkpoint: str | Non
 
     @torch.no_grad()
     def retriever(images: torch.Tensor) -> torch.Tensor:
-        return pipeline.retrieval_only(_apply_imagenet_norm(images).to(device))
+        # Input is BGR min-max [0,1] from preprocess_image.
+        # DA3 backbone needs RGB ImageNet-normalized + patch-aligned (H,W % 14 == 0).
+        imgs = images.to(device)
+        if imgs.ndim == 5:
+            imgs = imgs[:, 0]
+        imgs = imgs.flip(1)  # BGR → RGB
+        imgs = _apply_imagenet_norm(imgs)
+        _, _, h, w = imgs.shape
+        new_h = max((h // 14) * 14, 14)
+        new_w = max((w // 14) * 14, 14)
+        if new_h != h or new_w != w:
+            imgs = F.interpolate(imgs, size=(new_h, new_w), mode="bilinear", align_corners=False)
+        return pipeline.retrieval_only(imgs.unsqueeze(1))
 
     return pipeline, retriever
 
@@ -598,22 +719,38 @@ def load_dino_salad_retriever(salad_checkpoint: str, device: str):
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"SALAD checkpoint not found: {salad_checkpoint}")
 
+    # Force torch.hub to use local cache (avoids GitHub network check).
+    # When source="local", the first arg must be a local directory path.
+    import torch.hub as _hub
+    _dinov2_cache = Path(_hub.get_dir()) / "facebookresearch_dinov2_main"
+    _orig_load = _hub.load
+
+    def _local_hub_load(repo, *a, **kw):
+        if "dinov2" in str(repo):
+            return _orig_load(str(_dinov2_cache), *a, source="local", **kw)
+        return _orig_load(repo, *a, **kw)
+
+    _hub.load = _local_hub_load
+
     # Match the local SALAD checkpoint recipe used by the bundled eval script.
-    model = VPRModel(
-        backbone_arch="dinov2_vitb14",
-        backbone_config={
-            "num_trainable_blocks": 4,
-            "return_token": True,
-            "norm_layer": True,
-        },
-        agg_arch="SALAD",
-        agg_config={
-            "num_channels": 768,
-            "num_clusters": 16,
-            "cluster_dim": 32,
-            "token_dim": 32,
-        },
-    )
+    try:
+        model = VPRModel(
+            backbone_arch="dinov2_vitb14",
+            backbone_config={
+                "num_trainable_blocks": 4,
+                "return_token": True,
+                "norm_layer": True,
+            },
+            agg_arch="SALAD",
+            agg_config={
+                "num_channels": 768,
+                "num_clusters": 16,
+                "cluster_dim": 32,
+                "token_dim": 32,
+            },
+        )
+    finally:
+        _hub.load = _orig_load
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     state_dict = checkpoint.get("state_dict", checkpoint)
     model.load_state_dict(state_dict, strict=True)
@@ -623,9 +760,20 @@ def load_dino_salad_retriever(salad_checkpoint: str, device: str):
 
     @torch.no_grad()
     def retriever(images: torch.Tensor) -> torch.Tensor:
-        if images.ndim == 5:
-            images = images[:, 0]
-        return model(_apply_imagenet_norm(images).to(device))
+        # Input is BGR min-max [0,1] from preprocess_image.
+        # DINOv2 backbone needs RGB ImageNet-normalized + patch-aligned (H,W % 14 == 0).
+        imgs = images.to(device)
+        if imgs.ndim == 5:
+            imgs = imgs[:, 0]
+        imgs = imgs.flip(1)  # BGR → RGB
+        imgs = _apply_imagenet_norm(imgs)
+        # Resize to nearest multiple of 14 (DINOv2 patch size).
+        _, _, h, w = imgs.shape
+        new_h = max((h // 14) * 14, 14)
+        new_w = max((w // 14) * 14, 14)
+        if new_h != h or new_w != w:
+            imgs = F.interpolate(imgs, size=(new_h, new_w), mode="bilinear", align_corners=False)
+        return model(imgs)
 
     return retriever
 
@@ -633,7 +781,7 @@ def load_dino_salad_retriever(salad_checkpoint: str, device: str):
 def load_netvlad_retriever(device: str):
     """Load the VGG16-NetVLAD-Pitts30K retriever (same model as reloc3r).
 
-    NetVLAD expects images in [0, 1] range and applies its own MATLAB-based
+    NetVLAD expects images in [0, 1] BGR range and applies its own MATLAB-based
     mean subtraction internally. Since ``preprocess_image`` already produces
     [0, 1] tensors, no additional normalization is needed here.
     """
@@ -663,9 +811,14 @@ def extract_descriptors(
     entries: list[dict[str, Any]],
     retriever,
     device: str,
-    batch_size: int = 16,
-    target_size: tuple[int, int] = (504, 504),
+    batch_size: int = 1,
+    target_size: tuple[int, int] | None = None,
 ) -> torch.Tensor:
+    """Extract retrieval descriptors for all entries.
+
+    Uses per-image loading (batch_size=1 by default) because images may have
+    different resolutions when target_size is None (original resolution).
+    """
     descriptors = []
     for i in tqdm(range(0, len(entries), batch_size), desc="Extracting descriptors"):
         batch_entries = entries[i : i + batch_size]
@@ -851,6 +1004,7 @@ def evaluate_scene_training_free(
     target_size: tuple[int, int],
     config: dict[str, Any],
     retriever_backend: str,
+    oracle_topk: np.ndarray | None = None,
 ) -> dict[str, Any]:
     db_desc_device = db_descriptors
     if isinstance(db_desc_device, np.ndarray):
@@ -863,12 +1017,10 @@ def evaluate_scene_training_free(
     branch_translation_errors: dict[str, list[float]] = {"cam_dec": [], "ray": []}
     branch_effective_modes: dict[str, list[str]] = {"cam_dec": [], "ray": []}
     query_poses_by_branch: dict[str, list[np.ndarray]] = {"cam_dec": [], "ray": []}
+    # Per-query metadata for failure case analysis.
+    _per_query_info: list[dict] = []
 
-    for q_entry in tqdm(query_entries, desc="Evaluating queries"):
-        # Retrieval: simple resize to target_size, [0,1] range.
-        query_img = preprocess_image(q_entry["image_path"], target_size).to(device)
-        query_input = query_img.unsqueeze(0).unsqueeze(0)  # [1, 1, 3, H, W]
-        query_desc = retriever(query_input)  # [1, D]
+    for qi, q_entry in enumerate(tqdm(query_entries, desc="Evaluating queries")):
         gt_pose = np.asarray(q_entry["pose"], dtype=np.float64)
 
         # Pose: reloc3r-style crop + DA3 InputProcessor (already ImageNet-normalized).
@@ -878,10 +1030,19 @@ def evaluate_scene_training_free(
         ).to(device)
         query_pose_input = query_pose_img.unsqueeze(0).unsqueeze(0)  # [1, 1, 3, H, W]
 
-        sims = F.cosine_similarity(query_desc[0].unsqueeze(0), db_desc_device, dim=1)
-        topk_indices_t, topm_indices_t = select_topk_topm(sims, top_k=top_k, top_m=top_m)
-        topk_indices = topk_indices_t.detach().cpu().numpy().astype(np.int64)
-        topm_indices = topm_indices_t.detach().cpu().numpy().astype(np.int64)
+        if oracle_topk is not None:
+            # Oracle retrieval: top-K from GT poses (no visual features used).
+            topk_indices = oracle_topk[qi][:top_k].astype(np.int64)
+            topm_indices = topk_indices[: min(top_m, len(topk_indices))]
+        else:
+            # Visual retrieval via the configured retriever.
+            query_img = preprocess_image(q_entry["image_path"]).to(device)
+            query_input = query_img.unsqueeze(0).unsqueeze(0)  # [1, 1, 3, H, W]
+            query_desc = retriever(query_input)  # [1, D]
+            sims = F.cosine_similarity(query_desc[0].unsqueeze(0), db_desc_device, dim=1)
+            topk_indices_t, topm_indices_t = select_topk_topm(sims, top_k=top_k, top_m=top_m)
+            topk_indices = topk_indices_t.detach().cpu().numpy().astype(np.int64)
+            topm_indices = topm_indices_t.detach().cpu().numpy().astype(np.int64)
         topk_all.append(topk_indices)
         if anchor_mode == "reloc3r_motion_averaging":
             # Use the full retrieved top-K set for pairwise relpose + motion averaging.
@@ -1044,6 +1205,125 @@ def summarize_result_medians(payload: dict[str, Any]) -> list[dict[str, float | 
     return summaries
 
 
+def save_failure_cases(
+    payload: dict[str, Any],
+    db_entries: list[dict[str, Any]],
+    query_entries: list[dict[str, Any]],
+    output_dir: str | Path,
+    top_n: int = 10,
+) -> None:
+    """Save the top-N worst failure cases with images and diagnostics.
+
+    For each failure case, saves:
+    - query image + retrieved candidate images
+    - GT and predicted poses
+    - rotation/translation errors
+    - retrieval distances (spatial)
+    """
+    import shutil
+    import json
+
+    primary_branch = payload["primary_pose_branch"]
+    rot_errs = payload.get(f"rotation_errors_{primary_branch}")
+    trans_errs = payload.get(f"translation_errors_{primary_branch}")
+    topk_indices = payload.get("topk_indices")
+
+    if rot_errs is None or trans_errs is None or topk_indices is None:
+        print("[WARN] Cannot save failure cases: missing error data.")
+        return
+
+    # Rank by combined error (max of normalized rot and trans).
+    rot_errs = np.asarray(rot_errs, dtype=np.float32)
+    trans_errs = np.asarray(trans_errs, dtype=np.float32)
+    # Combined score: rotation (deg) + translation (m) * 10 (rough weighting)
+    combined = rot_errs + trans_errs * 10.0
+    worst_indices = np.argsort(combined)[::-1][:top_n]
+
+    fc_dir = Path(output_dir) / "failure_cases"
+    fc_dir.mkdir(parents=True, exist_ok=True)
+
+    db_positions = np.array([e["pose"][:3, 3] for e in db_entries])
+
+    summary_rows = []
+    for rank, qi in enumerate(worst_indices):
+        case_dir = fc_dir / f"rank{rank:02d}_query{qi:04d}"
+        case_dir.mkdir(parents=True, exist_ok=True)
+
+        q_entry = query_entries[qi]
+        gt_pose = np.asarray(q_entry["pose"], dtype=np.float64)
+        q_pos = gt_pose[:3, 3]
+
+        # Copy query image.
+        q_img_src = q_entry["image_path"]
+        shutil.copy2(q_img_src, case_dir / f"query_{Path(q_img_src).name}")
+
+        # Copy retrieved candidate images and compute spatial distances.
+        tk = topk_indices[qi]
+        retrieval_info = []
+        for k, db_idx in enumerate(tk):
+            db_entry = db_entries[db_idx]
+            db_img_src = db_entry["image_path"]
+            shutil.copy2(db_img_src, case_dir / f"candidate_top{k}_{Path(db_img_src).name}")
+
+            db_pos = np.asarray(db_entry["pose"], dtype=np.float64)[:3, 3]
+            spatial_dist = float(np.linalg.norm(q_pos - db_pos))
+
+            # GT relative pose.
+            gt_rel = np.linalg.inv(db_entry["pose"].astype(np.float64)) @ gt_pose
+            gt_t_norm = float(np.linalg.norm(gt_rel[:3, 3]))
+
+            retrieval_info.append({
+                "rank": k,
+                "db_index": int(db_idx),
+                "db_image": Path(db_img_src).name,
+                "spatial_distance_m": round(spatial_dist, 3),
+                "gt_relative_t_norm_m": round(gt_t_norm, 3),
+            })
+
+        # Nearest DB frame (spatial ground truth).
+        nn_dist = float(np.linalg.norm(db_positions - q_pos, axis=1).min())
+        nn_idx = int(np.linalg.norm(db_positions - q_pos, axis=1).argmin())
+
+        # Predicted pose (if available).
+        pred_key = f"query_poses_{primary_branch}"
+        pred_pose = payload[pred_key][qi] if pred_key in payload else None
+
+        case_info = {
+            "rank": rank,
+            "query_index": int(qi),
+            "query_image": Path(q_img_src).name,
+            "rotation_error_deg": round(float(rot_errs[qi]), 3),
+            "translation_error_m": round(float(trans_errs[qi]), 3),
+            "combined_score": round(float(combined[qi]), 3),
+            "gt_position": q_pos.tolist(),
+            "nearest_db_distance_m": round(nn_dist, 3),
+            "nearest_db_index": nn_idx,
+            "retrieved_candidates": retrieval_info,
+        }
+
+        if pred_pose is not None:
+            case_info["pred_position"] = pred_pose[:3, 3].tolist()
+            case_info["position_error_vector"] = (pred_pose[:3, 3] - gt_pose[:3, 3]).tolist()
+            np.savetxt(case_dir / "gt_pose.txt", gt_pose, fmt="%.8f")
+            np.savetxt(case_dir / "pred_pose.txt", pred_pose, fmt="%.8f")
+
+        with open(case_dir / "info.json", "w") as f:
+            json.dump(case_info, f, indent=2)
+
+        summary_rows.append(case_info)
+
+    # Save summary.
+    with open(fc_dir / "summary.json", "w") as f:
+        json.dump(summary_rows, f, indent=2)
+
+    print(f"[Failure Cases] Saved {len(worst_indices)} cases to {fc_dir}/")
+    for row in summary_rows[:5]:
+        print(f"  rank={row['rank']} q={row['query_index']}: "
+              f"t_err={row['translation_error_m']:.2f}m, r_err={row['rotation_error_deg']:.1f}°, "
+              f"nn_dist={row['nearest_db_distance_m']:.1f}m, "
+              f"top1_spatial={row['retrieved_candidates'][0]['spatial_distance_m']:.1f}m")
+
+
 def build_output_path(
     output_dir: str | Path,
     retriever_backend: str,
@@ -1161,7 +1441,13 @@ def main() -> None:
     target_size = (args.image_size[0], args.image_size[1])
     data_root = args.data_root or default_data_root(args.dataset)
 
-    if args.retriever_backend == "da3_salad":
+    # Oracle mode: skip visual retriever entirely.
+    if args.oracle_retrieval is not None:
+        pose_pipeline, config = build_pose_pipeline(
+            args.unified_config, args.unified_checkpoint, runtime_device,
+        )
+        retriever = None
+    elif args.retriever_backend == "da3_salad":
         pose_pipeline, retriever = build_da3_salad_retriever(
             args.unified_config, args.unified_checkpoint, runtime_device,
         )
@@ -1212,13 +1498,21 @@ def main() -> None:
             "(set --cpu-fallback-max-queries <= 0 to disable)."
         )
 
-    db_descriptors = extract_descriptors(
-        db_entries,
-        retriever,
-        device=runtime_device,
-        batch_size=args.batch_size,
-        target_size=target_size,
-    )
+    # Compute retrieval: either oracle (GT-based) or visual (descriptors).
+    oracle_topk = None
+    if args.oracle_retrieval is not None:
+        print(f"[INFO] Oracle retrieval ({args.oracle_retrieval}): bypassing visual retriever.")
+        oracle_topk = compute_oracle_topk(
+            db_entries, query_entries, args.top_k, mode=args.oracle_retrieval,
+        )
+        db_descriptors = torch.zeros(len(db_entries), 1)  # placeholder
+    else:
+        db_descriptors = extract_descriptors(
+            db_entries,
+            retriever,
+            device=runtime_device,
+            batch_size=1,
+        )
 
     result = evaluate_scene_training_free(
         pose_pipeline=pose_pipeline,
@@ -1234,18 +1528,20 @@ def main() -> None:
         target_size=target_size,
         config=config,
         retriever_backend=args.retriever_backend,
+        oracle_topk=oracle_topk,
     )
 
+    retrieval_tag = f"oracle-{args.oracle_retrieval}" if args.oracle_retrieval else args.retriever_backend
     for summary in summarize_result_medians(result):
         print(
-            f"[Training-Free][{args.retriever_backend}][{summary['branch']}] Scene {args.scene} "
+            f"[Training-Free][{retrieval_tag}][{summary['branch']}] Scene {args.scene} "
             f"median pose error: {summary['median_translation']:.2f} m  "
             f"{summary['median_rotation']:.2f} deg"
         )
 
     output_path = build_output_path(
         output_dir=args.output_dir,
-        retriever_backend=args.retriever_backend,
+        retriever_backend=retrieval_tag,
         dataset=args.dataset,
         scene=args.scene,
         pose_path=args.pose_path,
@@ -1256,6 +1552,15 @@ def main() -> None:
 
     if _SCALE_DIAG_ENABLED:
         summarize_scale_diagnostics()
+
+    if args.save_failure_cases > 0:
+        save_failure_cases(
+            payload=result,
+            db_entries=db_entries,
+            query_entries=query_entries,
+            output_dir=args.output_dir,
+            top_n=args.save_failure_cases,
+        )
 
 
 if __name__ == "__main__":

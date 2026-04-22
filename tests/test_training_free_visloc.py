@@ -307,7 +307,8 @@ def test_load_dino_salad_retriever_uses_local_vprmodel_recipe(monkeypatch, tmp_p
     assert captured["init"]["agg_config"]["cluster_dim"] == 32
     assert captured["strict"] is True
     assert captured["device"] == "cpu"
-    assert captured["shape"] == (2, 3, 8, 8)
+    # DINOv2 patch alignment: 8x8 input is resized up to 14x14 (patch_size=14).
+    assert captured["shape"] == (2, 3, 14, 14)
     assert os.environ["XFORMERS_DISABLED"] == "1"
 
 
@@ -353,7 +354,7 @@ def test_evaluate_scene_training_free_returns_audit_payload(monkeypatch):
                 ray_intrinsics=torch.eye(3)[None, None].repeat(1, 3, 1, 1),
             )
 
-    monkeypatch.setattr(module, "preprocess_image", lambda _p, target_size: torch.zeros(3, *target_size))
+    monkeypatch.setattr(module, "preprocess_image", lambda _p, target_size=None: torch.zeros(3, 8, 8))
     monkeypatch.setattr(module, "preprocess_image_for_pose", lambda _p, _k, **kw: torch.zeros(3, 8, 8))
     monkeypatch.setattr(module, "get_rot_err", lambda _a, _b: 0.0)
 
@@ -447,7 +448,7 @@ def test_pairwise_motion_averaging_uses_full_topk_for_pose(monkeypatch):
     ]
     query_entries = [{"image_path": "q0.png", "pose": gt_query.astype(np.float32)}]
 
-    monkeypatch.setattr(module, "preprocess_image", lambda _p, target_size: torch.zeros(3, *target_size))
+    monkeypatch.setattr(module, "preprocess_image", lambda _p, target_size=None: torch.zeros(3, 8, 8))
     monkeypatch.setattr(module, "preprocess_image_for_pose", lambda _p, _k, **kw: torch.zeros(3, 8, 8))
     monkeypatch.setattr(module, "get_rot_err", lambda _a, _b: 0.0)
     monkeypatch.setattr(

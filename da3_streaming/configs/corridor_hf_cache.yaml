@@ -1,0 +1,6 @@
+inherit_from: ./configs/base_config.yaml
+
+Weights:
+  DA3: /home/chenguyuan/.cache/huggingface/hub/models--depth-anything--DA3-LARGE-1.1/snapshots/0e109ae307c5982f319a67cf6f9f99ccdc0ec97c/model.safetensors
+  DA3_CONFIG: /home/chenguyuan/.cache/huggingface/hub/models--depth-anything--DA3-LARGE-1.1/snapshots/0e109ae307c5982f319a67cf6f9f99ccdc0ec97c/config.json
+  SALAD: ./weights/dino_salad.ckpt

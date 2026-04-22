@@ -533,3 +533,54 @@ Observed result:
 ### Impact
 
 All previously reported error metrics (translation and rotation) from the training-free baseline were obtained without ImageNet normalization and are therefore invalid. Re-running experiments with the fix is expected to produce significantly improved numbers.
+
+## Post-Completion Update: 2026-04-14 Preprocessing Overhaul + Final Benchmark
+
+### Motivation
+
+A comprehensive review comparing `eval_training_free_visloc.py` against `reloc3r/eval_visloc.py` revealed that the previous preprocessing was fundamentally different from reloc3r's pipeline. DA3 images were resized to 504×504 (distorting the 4:3 aspect ratio), while reloc3r uses principal-point-centered cropping to (512, 384) preserving aspect ratio. Since DA3 was trained with aspect-ratio-preserving inputs, the distortion was degrading pose quality.
+
+### Changes Applied
+
+1. **Added `preprocess_image_for_pose()`**: A new preprocessing chain for the pose path that matches `eval_relpose.py` (the ScanNet1500 benchmark script where DA3 achieves Reloc3r-comparable AUC):
+   - reloc3r-style principal-point crop via `_crop_resize_reloc3r()` to (512, 384)
+   - DA3 InputProcessor (`process_res=504, upper_bound_resize`) → ~504×378 patch-aligned
+   - ImageNet normalization applied by InputProcessor
+
+2. **Separated retrieval and pose preprocessing**: Retrieval uses `preprocess_image()` (simple resize to [0,1]), pose uses `preprocess_image_for_pose()` (reloc3r crop + DA3 InputProcessor). Each path gets its correct preprocessing.
+
+3. **Self-contained data loading**: Moved all data loading functions (`load_scene_images_and_poses`, `_load_7scenes_split`, `_load_cambridge_split`, `_read_cambridge_nvm`) into `eval_training_free_visloc.py`, eliminating the dependency on the stale `eval_unified_visloc.py` which was deleted.
+
+4. **Intrinsics in entries**: Both 7Scenes and Cambridge entries now include per-image `intrinsics` (needed for the principal-point crop).
+
+### Final Benchmark Results (2026-04-14)
+
+All results use `reloc3r_motion_averaging` anchor mode, `top-K=10`, `cam_dec` pose path.
+
+#### 7Scenes (median trans m / rot deg)
+
+| Scene | NetVLAD+Reloc3r-512 | NetVLAD+DA3-LARGE-1.1 | DINO-SALAD+DA3-LARGE-1.1 |
+|-------|--------------------|-----------------------|--------------------------|
+| chess | 0.03 / 0.88 | 0.03 / 0.87 | 0.03 / 0.73 |
+| fire | 0.03 / 0.81 | 0.02 / 0.93 | 0.02 / 0.88 |
+| heads | 0.01 / 0.92 | 0.02 / 0.94 | 0.02 / 0.97 |
+| office | 0.04 / 0.88 | 0.04 / 0.86 | 0.08 / 1.43 |
+| pumpkin | 0.06 / 1.05 | 0.06 / 1.17 | 0.08 / 1.02 |
+| redkitchen | 0.04 / 1.24 | 0.04 / 1.25 | 0.05 / 1.15 |
+| stairs | 0.07 / 1.36 | 0.06 / 1.17 | 0.09 / 1.30 |
+| **Average** | **0.04 / 1.02** | **0.04 / 1.03** | **0.05 / 1.07** |
+
+#### Cambridge (median trans m / rot deg)
+
+| Scene | NetVLAD+Reloc3r-512 | NetVLAD+DA3-LARGE-1.1 | DINO-SALAD+DA3-LARGE-1.1 |
+|-------|--------------------|-----------------------|--------------------------|
+| GreatCourt | 1.23 / 0.70 | 0.66 / 0.56 | 0.55 / 0.49 |
+| KingsCollege | 0.45 / 0.37 | 0.35 / 0.48 | 0.39 / 0.41 |
+| OldHospital | 0.69 / 0.53 | 0.70 / 0.59 | 0.60 / 0.56 |
+| ShopFacade | 0.13 / 0.54 | 0.08 / 0.41 | 0.09 / 0.41 |
+| StMarysChurch | 0.34 / 0.56 | 0.27 / 0.57 | 0.26 / 0.50 |
+| **Average** | **0.57 / 0.54** | **0.41 / 0.52** | **0.38 / 0.47** |
+
+### Conclusion
+
+DA3-LARGE-1.1 cam_dec (training-free, no relative pose supervision) matches Reloc3r-512 on 7Scenes and outperforms it on Cambridge (0.41m vs 0.57m translation, 0.52° vs 0.54° rotation with NetVLAD retrieval). The previous performance gap was entirely caused by incorrect image preprocessing (504×504 square distortion). With proper aspect-ratio-preserving preprocessing matching the ScanNet1500 evaluation protocol, DA3's backbone features prove at least as strong as Reloc3r's for pairwise relative pose estimation.
