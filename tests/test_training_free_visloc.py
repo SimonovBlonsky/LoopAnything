@@ -24,6 +24,7 @@ from ablation.eval_training_free_visloc import (
     evaluate_scene_training_free,
     estimate_query_pose_motion_averaging,
     group_to_query_to_db_relative_pose,
+    group_to_all_query_to_db_relative_poses,
     load_dino_salad_retriever,
     _purge_salad_modules,
     parse_args,
@@ -532,3 +533,111 @@ def test_summarize_result_medians_reports_all_available_branches():
     assert summaries[0]["median_rotation"] == pytest.approx(2.0)
     assert summaries[1]["median_translation"] == pytest.approx(2.0)
     assert summaries[1]["median_rotation"] == pytest.approx(6.0)
+
+
+def test_group_to_all_query_to_db_relative_poses_matches_reloc3r_convention():
+    query_pose = _pose(_rotz(15.0), np.array([0.3, -0.2, 1.1]))
+    db1_pose = _pose(_rotz(-25.0), np.array([1.7, 0.4, -0.6]))
+    db2_pose = _pose(_rotz(40.0), np.array([-0.3, 0.8, 0.2]))
+    pred_group = np.stack([query_pose, db1_pose, db2_pose], axis=0)
+
+    relposes = group_to_all_query_to_db_relative_poses(pred_group)
+
+    assert relposes.shape == (2, 4, 4)
+    assert np.allclose(relposes[0], np.linalg.inv(db1_pose) @ query_pose, atol=1e-6)
+    assert np.allclose(relposes[1], np.linalg.inv(db2_pose) @ query_pose, atol=1e-6)
+
+
+def test_multiview_motion_averaging_uses_single_pose_only_forward(monkeypatch):
+    from ablation import eval_training_free_visloc as module
+
+    class FakePipeline:
+        def __init__(self):
+            self.pose_only_calls = 0
+            self.last_candidate_count = None
+
+        def pose_only(self, query_image, candidate_images, pose_path="cam_dec"):
+            self.pose_only_calls += 1
+            assert pose_path == "cam_dec"
+            assert query_image.shape[1] == 1
+            self.last_candidate_count = int(candidate_images.shape[1])
+            return Dict(
+                extrinsics=torch.eye(4)[None, None].repeat(1, 1 + self.last_candidate_count, 1, 1),
+                intrinsics=torch.eye(3)[None, None].repeat(1, 1 + self.last_candidate_count, 1, 1),
+            )
+
+    fake_pipeline = FakePipeline()
+
+    gt_query = np.eye(4, dtype=np.float64)
+    gt_ref0 = _pose(_rotz(10.0), np.array([1.0, 0.0, 0.0]))
+    gt_ref1 = _pose(_rotz(-5.0), np.array([0.0, 1.0, 0.0]))
+    gt_ref2 = _pose(_rotz(20.0), np.array([0.0, 0.0, 1.0]))
+
+    db_entries = [
+        {"image_path": "db0.png", "pose": gt_ref0.astype(np.float32)},
+        {"image_path": "db1.png", "pose": gt_ref1.astype(np.float32)},
+        {"image_path": "db2.png", "pose": gt_ref2.astype(np.float32)},
+    ]
+    query_entries = [{"image_path": "q0.png", "pose": gt_query.astype(np.float32)}]
+
+    monkeypatch.setattr(module, "preprocess_image", lambda _p, target_size=None: torch.zeros(3, 8, 8))
+    monkeypatch.setattr(module, "preprocess_image_for_pose", lambda _p, _k, **kw: torch.zeros(3, 8, 8))
+    monkeypatch.setattr(module, "get_rot_err", lambda _a, _b: 0.0)
+    monkeypatch.setattr(
+        module,
+        "_extract_group_c2w",
+        lambda _resolved, _branch, _hw: np.stack(
+            [np.stack([gt_query, gt_ref0, gt_ref1, gt_ref2], axis=0)], axis=0,
+        ),
+    )
+
+    captured = {}
+
+    def fake_motion_averaging(relposes_q2d, ref_gt):
+        captured["num_relposes"] = relposes_q2d.shape[0]
+        captured["num_refs"] = ref_gt.shape[0]
+        return gt_query
+
+    monkeypatch.setattr(module, "estimate_query_pose_motion_averaging", fake_motion_averaging)
+
+    def retriever(query_input):
+        return torch.tensor([[1.0, 0.0]], dtype=torch.float32).repeat(query_input.shape[0], 1)
+
+    db_descriptors = torch.tensor(
+        [[1.0, 0.0], [0.8, 0.0], [0.7, 0.0]],
+        dtype=torch.float32,
+    )
+
+    payload = evaluate_scene_training_free(
+        pose_pipeline=fake_pipeline,
+        retriever=retriever,
+        db_entries=db_entries,
+        query_entries=query_entries,
+        db_descriptors=db_descriptors,
+        device="cpu",
+        top_k=3,
+        top_m=2,  # top_m is ignored by this mode; top_k drives the multi-view forward.
+        pose_path="cam_dec",
+        anchor_mode="multiview_motion_averaging",
+        target_size=(8, 8),
+        config={"model": {"x": 1}},
+        retriever_backend="da3_salad",
+    )
+
+    assert fake_pipeline.pose_only_calls == 1  # single multi-view forward, not K
+    assert fake_pipeline.last_candidate_count == 3
+    assert captured["num_relposes"] == 3
+    assert captured["num_refs"] == 3
+    assert payload["topm_indices"][0].tolist() == [0, 1, 2]
+    assert payload["effective_anchor_modes_cam_dec"][0] == "multiview_motion_averaging"
+
+
+def test_parse_args_accepts_multiview_motion_averaging():
+    args = parse_args(
+        [
+            "--dataset", "7scenes",
+            "--scene", "heads",
+            "--anchor-mode", "multiview_motion_averaging",
+        ]
+    )
+    assert args.anchor_mode == "multiview_motion_averaging"

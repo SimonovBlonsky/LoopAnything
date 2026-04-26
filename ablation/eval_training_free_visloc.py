@@ -14,7 +14,12 @@ from tqdm import tqdm
 
 SUPPORTED_BACKENDS = ("dino_salad", "da3_salad", "netvlad")
 SUPPORTED_POSE_PATHS = ("cam_dec", "ray", "both", "relpose_head")
-SUPPORTED_ANCHOR_MODES = ("reloc3r_motion_averaging", "multi_ref_alignment", "top1_anchor")
+SUPPORTED_ANCHOR_MODES = (
+    "reloc3r_motion_averaging",
+    "multiview_motion_averaging",
+    "multi_ref_alignment",
+    "top1_anchor",
+)
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
 REPO_ROOT = PROJECT_ROOT.parents[2]
@@ -619,6 +624,8 @@ def validate_runtime_args(args: argparse.Namespace) -> argparse.Namespace:
         raise ValueError("relpose_head pose path requires --relpose-checkpoint")
     if args.pose_path == "relpose_head" and args.anchor_mode != "reloc3r_motion_averaging":
         raise ValueError("relpose_head only supports reloc3r_motion_averaging anchor mode")
+    if args.anchor_mode == "multiview_motion_averaging" and args.pose_path == "relpose_head":
+        raise ValueError("multiview_motion_averaging requires backbone pose (cam_dec/ray/both), not relpose_head")
     return args
 
 
@@ -1120,6 +1127,50 @@ def evaluate_scene_training_free(
                 branch_effective_modes[branch].append(anchor_mode)
             continue
 
+        if anchor_mode == "multiview_motion_averaging":
+            # Single multi-view forward over [query, top-K candidates]; derive K q->db
+            # relposes from the predicted group, then run reloc3r motion averaging.
+            pose_indices = topk_indices
+            topm_all.append(pose_indices)
+
+            candidate_pose_images = [
+                preprocess_image_for_pose(
+                    db_entries[idx]["image_path"],
+                    db_entries[idx].get("intrinsics"),
+                ) for idx in pose_indices.tolist()
+            ]
+            candidate_pose_input = torch.stack(candidate_pose_images, dim=0).unsqueeze(0).to(device)
+
+            output = pose_pipeline.pose_only(
+                query_pose_input, candidate_pose_input,
+                pose_path=pose_path,
+            )
+            resolved = resolve_pose_output(output, pose_path)
+
+            ref_gt = np.stack(
+                [db_entries[idx]["pose"] for idx in pose_indices.tolist()],
+                axis=0,
+            ).astype(np.float64)
+
+            for branch in resolved.keys():
+                pred_group = _extract_group_c2w(resolved, branch, target_size)[0]
+                relposes_q2d = group_to_all_query_to_db_relative_poses(pred_group)
+
+                if _SCALE_DIAG_ENABLED:
+                    _log_scale_diagnostics(
+                        relposes_q2d, ref_gt, gt_pose, branch,
+                        query_idx=len(topk_all) - 1,
+                    )
+
+                query_pose = estimate_query_pose_motion_averaging(relposes_q2d, ref_gt)
+                query_poses_by_branch[branch].append(query_pose)
+                branch_rotation_errors[branch].append(get_rot_err(query_pose[:3, :3], gt_pose[:3, :3]))
+                branch_translation_errors[branch].append(
+                    float(np.linalg.norm(query_pose[:3, 3] - gt_pose[:3, 3]))
+                )
+                branch_effective_modes[branch].append(anchor_mode)
+            continue
+
         topm_all.append(topm_indices)
         candidate_pose_images = [
             preprocess_image_for_pose(
@@ -1387,6 +1438,20 @@ def group_to_query_to_db_relative_pose(pred_group: np.ndarray) -> np.ndarray:
     if pred_group.shape[0] != 2:
         raise ValueError("pred_group must contain exactly [query, db] poses for pairwise relpose.")
     return np.linalg.inv(pred_group[1]) @ pred_group[0]
+
+
+def group_to_all_query_to_db_relative_poses(pred_group: np.ndarray) -> np.ndarray:
+    """Convert a [1+K, 4, 4] group [query, db_1, ..., db_K] into K q->db relative poses.
+
+    Each rel_i = inv(c2w_db_i) @ c2w_query maps points from query camera frame to
+    db_i camera frame (reloc3r's q2d convention), suitable for motion averaging.
+    """
+    pred_group = _as_pose_array(pred_group, "pred_group")
+    if pred_group.shape[0] < 2:
+        raise ValueError("pred_group must contain query plus at least one db pose.")
+    q_pred = pred_group[0]
+    db_preds = pred_group[1:]
+    return np.linalg.inv(db_preds) @ q_pred  # [K, 4, 4]
 
 
 def estimate_query_pose_motion_averaging(
