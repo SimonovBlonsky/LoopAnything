@@ -72,9 +72,10 @@ class CrossViewFusion(nn.Module):
 
         self.cam_cross_attn = _CrossAttentionLayer(embed_dim, num_heads, dropout)
 
-        # Zero-initialized gates: at init, fusion output = original query tokens
+        # Patch gate zero-init: patch fusion currently has no gradient from pose loss
         self.patch_gate = nn.Parameter(torch.zeros(1))
-        self.cam_gate = nn.Parameter(torch.zeros(1))
+        # Cam gate init to 1.0: let fusion contribute fully from the start
+        self.cam_gate = nn.Parameter(torch.ones(1))
 
     def forward(
         self,
