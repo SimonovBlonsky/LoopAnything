@@ -22,10 +22,12 @@ SUPPORTED_ANCHOR_MODES = (
 )
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = PROJECT_ROOT / "src"
-REPO_ROOT = PROJECT_ROOT.parents[2]
+REPO_ROOT = PROJECT_ROOT.parents[0]
 RELOC3R_ROOT = REPO_ROOT / "reloc3r"
 SALAD_ROOT = PROJECT_ROOT / "da3_streaming" / "loop_utils" / "salad"
 NETVLAD_ROOT = REPO_ROOT / "netvlad_image_retrieval"
+print(f"PROJECT_ROOT:{PROJECT_ROOT}")
+print(f"REPO_ROOT:{REPO_ROOT}")
 
 
 def _bootstrap_import_paths(sys_path: list[str] | None = None) -> list[str]:
