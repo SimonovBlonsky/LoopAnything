@@ -13,17 +13,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-EVAL_SCRIPT="ablation/eval_training_free_visloc.py"
-UNIFIED_CONFIG="configs/unified_pipeline_large.yaml"
-DINO_SALAD_CKPT="da3_streaming/loop_utils/salad/weights/dino_salad_512_32.ckpt"
+EVAL_SCRIPT="../ablation/eval_training_free_visloc.py"
+UNIFIED_CONFIG="../configs/unified_pipeline_large.yaml"
+DINO_SALAD_CKPT="../da3_streaming/loop_utils/salad/weights/dino_salad_512_32.ckpt"
 
-BACKENDS=("netvlad" "dino_salad")
+BACKENDS=("dino_salad")
 POSE_PATH="cam_dec"
-ANCHOR_MODE="reloc3r_motion_averaging"
+ANCHOR_MODE="multiview_motion_averaging"
 TOP_K=10
 TOP_M=3
 DEVICE="cuda"
-OUTPUT_DIR="workspace/ablation_results"
+OUTPUT_DIR="../workspace/da3_cambridge_multiview"
 
 CSV_FILE="da3_large_results.csv"
 
