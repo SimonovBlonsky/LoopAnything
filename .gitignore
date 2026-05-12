@@ -37,8 +37,10 @@ temp*.png
 AGENTS.md
 DepthAnything3.md
 dev*.md
-docs/superpowers
-tests/
+
+tests/legacy
+tests/loop_policy/__pycache__/
+tests/loop_policy/*.py[cod]
 log*.md
 logs/
 .worktrees/
