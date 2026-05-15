@@ -1,3 +1,21 @@
+# LEGACY: Learned Loop Policy Stage0 Design
+
+Status: legacy as of 2026-05-15.
+
+This document is retained only as a historical record. The learned-policy
+Stage0 design is not considered converged and must not be used as the basis for
+the active robust loop verifier.
+
+Do not use this document's labels, hard gates, feature schema, thresholds,
+support rules, score definitions, or data contracts as priors for robust loop
+verifier design or implementation. In particular, do not use
+`safe_loop_factor_v1`, `x_geom`, or any learned-policy cache outputs to define
+ground truth or verifier acceptance. The learned-policy direction is deferred
+until an interpretable training-free robust loop verifier is completed and
+achieves strong experimental results.
+
+---
+
 # Causal Loop Policy Dataset Builder Design
 
 Date: 2026-05-11

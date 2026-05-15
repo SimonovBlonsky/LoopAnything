@@ -45,7 +45,10 @@ def write_jsonl(path: Path, records: Iterable[Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
         for record in records:
-            handle.write(json.dumps(dataclass_to_json_dict(record), sort_keys=True) + "\n")
+            handle.write(
+                json.dumps(dataclass_to_json_dict(record), sort_keys=True, allow_nan=False)
+                + "\n"
+            )
 
 
 def read_tum_trajectory(path: Path) -> List[PoseRecord]:
@@ -88,7 +91,7 @@ def _read_keyframes(path: Path) -> List[KeyframeRecord]:
         if keyframe_idx is None:
             raise ValueError(f"{path}:{line_no}: missing keyframe_idx or idx in {row!r}")
 
-        trajectory_idx = row.get("trajectory_idx")
+        trajectory_idx = row.get("trajectory_idx", row.get("trajectory_row"))
         try:
             parsed_keyframe_idx = int(keyframe_idx)
         except (TypeError, ValueError) as exc:
@@ -119,7 +122,11 @@ def load_aster_raw_sequence(raw_dir: Path) -> AsterRawSequence:
     raw_dir = Path(raw_dir)
     meta_path = raw_dir / "sequence_meta.json"
     keyframes_path = raw_dir / "keyframes_with_images.jsonl"
-    trajectory_path = raw_dir / "trajectory.txt"
+    trajectory_path = (
+        raw_dir / "trajectory_keyframes.txt"
+        if (raw_dir / "trajectory_keyframes.txt").exists()
+        else raw_dir / "trajectory.txt"
+    )
 
     for required_path in (meta_path, keyframes_path, trajectory_path):
         if not required_path.exists():

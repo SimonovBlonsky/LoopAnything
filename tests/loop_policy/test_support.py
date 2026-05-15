@@ -17,7 +17,7 @@ def _camera_poses():
     return {i: make_transform(np.eye(3), np.array([float(i), 0.0, 0.0])) for i in range(8)}
 
 
-def test_select_supports_is_causal_and_sorts_by_baseline_desc_then_index():
+def test_select_supports_is_causal_and_sorts_by_candidate_distance_then_index():
     keyframes = _keyframes()
     query = keyframes[7]
     candidate = keyframes[3]
@@ -35,8 +35,8 @@ def test_select_supports_is_causal_and_sorts_by_baseline_desc_then_index():
     )
 
     assert decision.rejected is False
-    assert decision.selected_support_indices == [0, 1]
-    assert decision.selected_support_timestamps == [100.0, 101.0]
+    assert decision.selected_support_indices == [2, 4]
+    assert decision.selected_support_timestamps == [102.0, 104.0]
     assert decision.support_count == 2
     assert decision.support_snapshot_max_idx == 6
 
@@ -146,8 +146,8 @@ def test_select_supports_filters_invalid_snapshot_and_support_pose_entries():
         min_support_baseline_m=0.5,
     )
 
-    assert decision.selected_support_indices == [0, 5]
-    assert decision.selected_support_timestamps == [100.0, 105.0]
-    assert decision.selected_support_baselines == [3.0, 2.0]
+    assert decision.selected_support_indices == [5, 0]
+    assert decision.selected_support_timestamps == [105.0, 100.0]
+    assert decision.selected_support_baselines == [2.0, 3.0]
     assert decision.support_snapshot_max_idx == 6
     assert decision.support_snapshot_max_timestamp == 106.0

@@ -51,7 +51,7 @@ def select_supports(
             continue
         scored.append((baseline, support.keyframe_idx, support.timestamp))
 
-    scored.sort(key=lambda item: (-item[0], item[1]))
+    scored.sort(key=lambda item: (abs(item[1] - candidate.keyframe_idx), item[1]))
     selected = scored[:support_count]
     rejected = len(selected) == 0
 

@@ -223,6 +223,37 @@ def test_load_aster_raw_sequence_reads_required_files(synthetic_raw_sequence):
     assert sequence.t_camera_lidar.shape == (4, 4)
 
 
+def test_load_aster_raw_sequence_prefers_keyframe_trajectory_and_trajectory_row(
+    synthetic_raw_sequence,
+):
+    lines = []
+    for idx in range(6):
+        lines.append(
+            json.dumps(
+                {
+                    "keyframe_idx": idx,
+                    "timestamp": 100.0 + idx,
+                    "trajectory_row": idx,
+                    "image_path": f"keyframe_images/{idx:06d}.jpg",
+                }
+            )
+        )
+    (synthetic_raw_sequence / "keyframes_with_images.jsonl").write_text(
+        "\n".join(lines) + "\n",
+        encoding="utf-8",
+    )
+    (synthetic_raw_sequence / "trajectory.txt").write_text(
+        "\n".join(f"{100.0 + idx:.3f} {idx:.3f} 0 0 0 0 0 1" for idx in range(20)) + "\n",
+        encoding="utf-8",
+    )
+
+    sequence = load_aster_raw_sequence(synthetic_raw_sequence)
+
+    assert len(sequence.trajectory) == 6
+    assert sequence.keyframes[5].trajectory_idx == 5
+    assert sequence.trajectory[5].position == (5.0, 0.0, 0.0)
+
+
 def test_load_aster_raw_sequence_accepts_flat_camera_lidar_matrix(synthetic_raw_sequence):
     meta_path = synthetic_raw_sequence / "sequence_meta.json"
     meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -278,6 +309,7 @@ def test_read_keyframes_accepts_idx_fallback_and_trajectory_idx_optional(tmp_pat
         [
             {"idx": 4, "timestamp": 10.0, "trajectory_idx": None},
             {"idx": 5, "timestamp": 11.0, "trajectory_idx": "8"},
+            {"idx": 6, "timestamp": 12.0, "trajectory_row": "9"},
         ],
     )
 
@@ -287,6 +319,8 @@ def test_read_keyframes_accepts_idx_fallback_and_trajectory_idx_optional(tmp_pat
     assert records[0].trajectory_idx is None
     assert records[1].keyframe_idx == 5
     assert records[1].trajectory_idx == 8
+    assert records[2].keyframe_idx == 6
+    assert records[2].trajectory_idx == 9
 
 
 def test_read_keyframes_reports_path_and_line_when_keyframe_id_missing(tmp_path):

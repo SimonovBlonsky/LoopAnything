@@ -1,3 +1,5 @@
+import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -6,6 +8,7 @@ import pytest
 from loop_policy.retrieval import (
     DescriptorCache,
     DescriptorExtractor,
+    DinoSaladDescriptorExtractor,
     PrecomputedDescriptorExtractor,
     causal_retrieval_database,
     load_descriptor_cache,
@@ -248,3 +251,155 @@ def test_rank_causal_topk_rejects_missing_query_descriptor():
             runtime_top_k=2,
             exclude_recent_keyframes=1,
         )
+
+
+def test_dino_salad_descriptor_extractor_batches_and_returns_numpy(monkeypatch, tmp_path):
+    import torch
+
+    class FakeImage:
+        def __init__(self, path):
+            self.path = Path(path)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def convert(self, mode):
+            assert mode == "RGB"
+            return self
+
+    class FakeImageModule:
+        @staticmethod
+        def open(path):
+            return FakeImage(path)
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.batch_sizes = []
+
+        def forward(self, batch):
+            self.batch_sizes.append(batch.shape[0])
+            return torch.cat([batch, batch + 10.0], dim=1)
+
+    fake_model = FakeModel()
+    extractor = DinoSaladDescriptorExtractor(
+        checkpoint=tmp_path / "unused.ckpt",
+        device="cpu",
+        batch_size=2,
+    )
+    monkeypatch.setitem(sys.modules, "PIL", type("FakePIL", (), {"Image": FakeImageModule}))
+    monkeypatch.setattr(extractor, "_load_model", lambda: fake_model)
+    monkeypatch.setattr(
+        extractor,
+        "_transform",
+        lambda: lambda image: torch.tensor([float(image.path.stem)], dtype=torch.float32),
+    )
+
+    descriptors = extractor.extract([Path("1.jpg"), Path("2.jpg"), Path("3.jpg")])
+
+    assert fake_model.batch_sizes == [2, 1]
+    assert descriptors.shape == (3, 2)
+    np.testing.assert_allclose(descriptors, [[1.0, 11.0], [2.0, 12.0], [3.0, 13.0]])
+
+
+def test_dino_salad_load_model_strips_common_checkpoint_prefix(tmp_path):
+    import torch
+
+    checkpoint = tmp_path / "prefixed.ckpt"
+    torch.save({"state_dict": {"model.weight": torch.tensor([[2.0, 3.0]])}}, checkpoint)
+    extractor = DinoSaladDescriptorExtractor(checkpoint=checkpoint, device="cpu")
+    extractor._build_model = lambda: torch.nn.Linear(2, 1, bias=False)
+
+    model = extractor._load_model()
+
+    np.testing.assert_allclose(model.weight.detach().numpy(), [[2.0, 3.0]])
+
+
+def test_dino_salad_load_model_rejects_checkpoint_with_no_matching_keys(tmp_path):
+    import torch
+
+    checkpoint = tmp_path / "unmatched.ckpt"
+    torch.save({"state_dict": {"unrelated.weight": torch.tensor([[2.0, 3.0]])}}, checkpoint)
+    extractor = DinoSaladDescriptorExtractor(checkpoint=checkpoint, device="cpu")
+    extractor._build_model = lambda: torch.nn.Linear(2, 1, bias=False)
+
+    with pytest.raises(ValueError, match="did not match any model parameters"):
+        extractor._load_model()
+
+
+def test_dino_salad_load_model_rejects_partial_one_key_checkpoint(tmp_path):
+    import torch
+
+    class MultiParameterModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.nn.Linear(2, 2)
+            self.aggregator = torch.nn.Linear(2, 2)
+            self.projection = torch.nn.Linear(2, 1)
+
+    checkpoint = tmp_path / "partial.ckpt"
+    torch.save({"state_dict": {"backbone.weight": torch.ones(2, 2)}}, checkpoint)
+    extractor = DinoSaladDescriptorExtractor(checkpoint=checkpoint, device="cpu")
+    extractor._build_model = MultiParameterModel
+
+    with pytest.raises(ValueError, match="matched 1/6"):
+        extractor._load_model()
+
+
+def test_dino_salad_load_model_prefers_best_prefixed_candidate_over_partial_unprefixed(
+    tmp_path,
+):
+    import torch
+
+    checkpoint = tmp_path / "mixed.ckpt"
+    torch.save(
+        {
+            "state_dict": {
+                "weight": torch.tensor([[99.0, 99.0]]),
+                "model.weight": torch.tensor([[2.0, 3.0]]),
+                "model.bias": torch.tensor([4.0]),
+            }
+        },
+        checkpoint,
+    )
+    extractor = DinoSaladDescriptorExtractor(checkpoint=checkpoint, device="cpu")
+    extractor._build_model = lambda: torch.nn.Linear(2, 1)
+
+    model = extractor._load_model()
+
+    np.testing.assert_allclose(model.weight.detach().numpy(), [[2.0, 3.0]])
+    np.testing.assert_allclose(model.bias.detach().numpy(), [4.0])
+
+
+def test_dino_salad_build_model_fallback_does_not_import_vpr_model(monkeypatch, tmp_path):
+    import torch
+
+    helper = types.ModuleType("models.helper")
+
+    def get_backbone(name, config):
+        assert name == "dinov2_vitb14"
+        assert config["return_token"] is True
+        return torch.nn.Identity()
+
+    def get_aggregator(name, config):
+        assert name == "SALAD"
+        assert config["num_clusters"] == 64
+        return torch.nn.Identity()
+
+    helper.get_backbone = get_backbone
+    helper.get_aggregator = get_aggregator
+    models = types.ModuleType("models")
+    models.__path__ = []
+    monkeypatch.setitem(sys.modules, "models", models)
+    monkeypatch.setitem(sys.modules, "models.helper", helper)
+    monkeypatch.delitem(sys.modules, "vpr_model", raising=False)
+
+    extractor = DinoSaladDescriptorExtractor(checkpoint=tmp_path / "unused.ckpt", device="cpu")
+
+    model = extractor._build_model()
+
+    assert "vpr_model" not in sys.modules
+    assert torch.equal(model(torch.tensor([1.0])), torch.tensor([1.0]))

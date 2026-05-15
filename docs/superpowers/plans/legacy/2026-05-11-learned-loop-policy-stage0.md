@@ -1,3 +1,21 @@
+# LEGACY: Learned Loop Policy Stage0 Plan
+
+Status: legacy as of 2026-05-15.
+
+This document is retained only as a historical record. The learned-policy
+Stage0 direction is not considered converged and must not be used as the basis
+for the active robust loop verifier.
+
+Do not use this document's labels, hard gates, feature schema, thresholds,
+support rules, score definitions, or implementation plan as priors for robust
+loop verifier design or implementation. In particular, do not use
+`safe_loop_factor_v1`, `x_geom`, or any learned-policy cache outputs to define
+ground truth or verifier acceptance. The learned-policy direction is deferred
+until an interpretable training-free robust loop verifier is completed and
+achieves strong experimental results.
+
+---
+
 # Causal Loop Policy Dataset Builder Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
@@ -23,6 +41,191 @@
   after vague labels such as `stage0`, `stage_0`, `stage 0`, `stage1`,
   `task1`, or `task 2`; use names like `LoopPolicyDatasetConfig`,
   `dataset_builder.py`, `sequence_summary.json`, and `dataset_manifest.json`.
+
+## Post-Implementation Bugfix Log
+
+### 2026-05-12: DA3 Pose Convention And Reference-View Ordering
+
+Symptom: the `handheld_escalator00` oracle loop pair `query=137`, `candidate=63`
+with supports such as `59` or `64` initially produced bad Sim3 alignment at low
+runtime-smoke resolution, including incorrect candidate-query/candidate-support
+edge ratios and many `sim3_scale_out_of_range` rejections.
+
+Root causes found during debugging:
+
+- DA3 API `prediction.extrinsics` is native world-to-camera (`w2c`); the
+  offline builder CLI default had treated DA3 output as `c2w`, unlike
+  AsterSLAM's `da3_pose_node.py`, which inverts DA3 `w2c` output before
+  publishing `predicted_group_c2w`.
+- DA3 reference-view selection can reorder the internal view sequence before
+  camera decoding. The offline runner must not rely on the default
+  `saddle_balanced` strategy unless output order is explicitly restored.
+  Use `ref_view_strategy="first"` for query/candidate/support slot stability,
+  matching the AsterSLAM runtime default.
+- `process_res=112` is valid only for pipeline smoke tests. It can severely
+  degrade DA3 pose geometry and should not be used for Sim3/label-quality
+  conclusions. Use the normal DA3 runtime resolution such as `504` for oracle
+  geometry checks and real label generation.
+
+Implemented fix:
+
+- `DepthAnything3Runner` now carries a configurable `ref_view_strategy` and
+  defaults to `"first"`.
+- `loop_policy.dataset_builder` now defaults `--da3-extrinsics-convention` to
+  `w2c` and adds `--da3-ref-view-strategy`, defaulting to `"first"`.
+- `scripts/oracle_sim3_check.py` defaults to `process_res=504`,
+  `ref_view_strategy="first"`, and the corrected DA3 `w2c -> c2w` path.
+
+Regression coverage and verification:
+
+```bash
+cd /home/chenguyuan/code/NeurIPS26/LoopAnything
+PYTHONPATH=src /home/chenguyuan/anaconda3/envs/da3/bin/python -m pytest tests/loop_policy -q
+python3 -m py_compile src/loop_policy/da3_runner.py src/loop_policy/dataset_builder.py scripts/oracle_sim3_check.py
+```
+
+Oracle recheck:
+
+```bash
+cd /home/chenguyuan/code/NeurIPS26/LoopAnything
+env -u ALL_PROXY -u all_proxy XFORMERS_DISABLED=1 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+  MPLCONFIGDIR=/tmp/matplotlib-loop-policy PYTHONPATH=src \
+  /home/chenguyuan/anaconda3/envs/da3/bin/python scripts/oracle_sim3_check.py --support-idx 59
+```
+
+Observed after the fix: `query=137`, `candidate=63`, `support=59` is accepted
+on the corrected path, with aligned query-vs-odom residual about `0.112m /
+0.83deg` and support alignment RMSE about `0.173m`.
+
+### 2026-05-13: DA3 Scale Is Not A Hard Label Or Prior Rejection Condition
+
+Symptom: after fixing DA3 pose convention/reference-view ordering and changing
+support selection to nearest-candidate supports, many visually and odometry
+consistent loop candidates still failed only because DA3's Sim3 scale was not
+near metric scale. In `handheld_escalator00`, removing the label-only
+`abs_log_sim3_scale` gate raised safe labels from `0` to `288`; additionally
+removing Task 8's `sim3_scale_out_of_range` hard precondition raised safe labels
+to `339` on the same cached DA3 outputs.
+
+Reasoning:
+
+- DA3 does not produce metric-scale camera translations. A large Sim3 scale is
+  expected when aligning DA3 local poses to odometry and is not by itself a
+  loop-quality failure.
+- `sim3_scale` and `abs_log_sim3_scale` remain useful diagnostics and learned
+  features in `x_geom`, but they must not be hard gates for
+  `safe_loop_factor_v1`.
+- Task 8 should still reject invalid scale values, such as non-finite or
+  non-positive scale, because those make alignment undefined. It should not
+  reject merely because a finite positive scale is outside the historical
+  `[0.05, 20.0]` bounds.
+
+Implemented fix:
+
+- `compute_safe_loop_factor_v1()` no longer requires
+  `abs_log_sim3_scale <= abs_log_sim3_scale_thr`; `sim3_quality_good` is now
+  based on support alignment RMSE and direction consistency.
+- `align_da3_poses_with_candidate_support_prior()` no longer emits
+  `sim3_scale_out_of_range` as a rejection reason. It only rejects non-finite
+  or non-positive scale as `invalid_sim3_scale`.
+
+Runtime re-label check on cached
+`handheld_escalator00` output
+`/tmp/loop_policy_stage0_handheld_escalator00_20260513_2111_gpu_nearest_support`:
+
+```text
+features=601
+new_precondition_valid=442
+sim3_quality_good=442
+odom_consistent_loose=354
+safe_loop_factor_v1=339
+```
+
+Odometry-threshold breakdown after the scale hard-gate removal:
+
+```text
+<=0.5m && <=15deg: 49 candidates, safe=48
+<=1.0m && <=15deg: 99 candidates, safe=97
+<=2.0m && <=20deg: 216 candidates, safe=214
+<=5.0m && <=30deg: 292 candidates, safe=288
+```
+
+Known oracle pairs after re-labeling:
+
+```text
+q=137,c=63,s=62 -> safe=true, aligned residual 0.201m / 0.79deg
+q=137,c=64,s=63 -> safe=true, aligned residual 0.094m / 1.18deg
+q=123,c=46,s=45 -> safe=true, aligned residual 0.057m / 2.07deg
+q=99,c=23,s=22 -> safe=true, aligned residual 0.196m / 3.02deg
+```
+
+### 2026-05-13: Visualization Audit Shows False Safe Loops
+
+Status: implementation work for Tasks 1-12 is complete, but the offline learned
+loop-policy Stage0 labeling is not converged. Do not treat the current
+`safe_loop_factor_v1` distribution as final training labels.
+
+Added visualization support:
+
+- `loop_policy.dataset_builder` can write per-feature visual records with
+  `--write-visualization-records`.
+- Each visual record copies `query.png`, `candidate.png`, `support_*.png`, and a
+  `record.json` payload into a boolean tree:
+
+```text
+visual_records/
+  new_precondition_valid|new_precondition_invalid/
+    sim3_quality_good|sim3_quality_bad/
+      odom_consistent_loose|odom_consistent_not_loose/
+        safe_loop_factor_v1|safe_loop_factor_negative/
+          q000137_c000063_s000062/
+```
+
+Fresh `handheld_escalator00` run with visualization:
+
+```text
+output_root=/tmp/loop_policy_stage0_handheld_escalator00_20260513_2147_gpu_visual
+candidate_features=601
+visual_record_json=601
+safe_loop_factor_positive_count=325
+```
+
+Visualization tree counts:
+
+```text
+new_precondition_valid/sim3_quality_good/odom_consistent_loose/safe_loop_factor_v1: 325
+new_precondition_valid/sim3_quality_good/odom_consistent_not_loose/safe_loop_factor_negative: 115
+new_precondition_invalid/sim3_quality_bad/odom_consistent_loose/safe_loop_factor_negative: 16
+new_precondition_invalid/sim3_quality_bad/odom_consistent_not_loose/safe_loop_factor_negative: 145
+```
+
+Manual audit finding:
+
+- Several records currently labeled `safe_loop_factor_v1` are visually false
+  loops: query and candidate are clearly not the same place, with little or no
+  overlap.
+- Concrete examples observed from the visualization tree:
+
+```text
+q000049_c000015_s000014
+q000080_c000010_s000009
+q000093_c000062_s000061
+q000093_c000061_s000060
+q000094_c000015_s000014
+```
+
+Interpretation:
+
+- The current gates can accept retrieval false positives when DA3/Sim3 and
+  odometry residuals appear numerically consistent.
+- This likely means the current `safe_loop_factor_v1` definition is missing a
+  direct visual-overlap or retrieval-quality rejection condition, or the
+  odometry-consistency proxy is insufficient for this sequence.
+- Next work should analyze these false-safe examples before using the labels for
+  training. Candidate directions include adding a visual-overlap/appearance
+  consistency gate, checking whether odometry residual is being computed against
+  the intended relative pose, tightening candidate acceptance with retrieval
+  margins, or adding a manual-audit blacklist/debug set for Stage0 calibration.
 
 ## File Structure
 
@@ -1749,6 +1952,15 @@ PYTHONPATH=src pytest tests/loop_policy/test_sim3_prior.py -q
 
 Expected: PASS. Before using real training output, compare this module against AsterSLAM's `alignDa3PosesWithCandidateSupportPrior` on one known exported candidate and adjust this module if a sign convention mismatch is found.
 
+Current AsterSLAM alignment status as of 2026-05-13:
+
+- Single-support/default runtime behavior is geometrically aligned with AsterSLAM for the Sim3 rotation convention, candidate-anchored translation, DA3 offset rotation, and finite-pose rejection.
+- Scale bounds are intentionally no longer a hard rejection in the offline learned-policy builder. DA3 has no metric translation scale, so finite positive Sim3 scale is retained as a feature/diagnostic instead of rejecting as `sim3_scale_out_of_range`.
+- Multi-support behavior is intentionally not fully aligned yet. This Python module estimates scale with the median of all candidate-support baseline ratios, while AsterSLAM uses the first support as the scale/direction anchor.
+- Multi-support RMSE semantics also need an explicit decision before enabling `support_count > 1`: this Python module computes RMSE across all supports, while AsterSLAM's implementation is structured around the first support as the Sim3 anchor and additional supports as consistency checks.
+- Default alignment RMSE threshold is not fully aligned: this Python plan/module uses `max_support_align_rmse_m=1.0`, while AsterSLAM's `Da3PosePriorAlignmentConfig::max_prior_alignment_rmse` defaults to `2.0`.
+- Do not treat Task 8 as a byte-for-byte or multi-support semantic port until these differences are resolved. With the current default `support_count=1`, the divergence is latent for runtime smoke tests.
+
 - [ ] **Step 6: Check the edit set**
 
 Run:
@@ -1927,10 +2139,8 @@ def compute_safe_loop_factor_v1(
     config: LoopPolicyDatasetConfig,
 ) -> Dict[str, bool]:
     sim3_quality_good = (
-        _finite(metrics.get("abs_log_sim3_scale"))
-        and _finite(metrics.get("support_align_rmse"))
+        _finite(metrics.get("support_align_rmse"))
         and _finite(metrics.get("direction_error_deg"))
-        and float(metrics["abs_log_sim3_scale"]) <= config.abs_log_sim3_scale_thr
         and float(metrics["support_align_rmse"]) <= config.support_align_rmse_thr
         and float(metrics["direction_error_deg"]) <= config.direction_error_thr_deg
     )
@@ -2852,6 +3062,7 @@ Expected: black completes, `git diff --check` has no output, and pytest passes.
 
 ## Self-Review Checklist
 
+- [ ] Convergence status: Tasks 1-12 are implemented, but Stage0 labeling is not converged. Visualization audit found false `safe_loop_factor_v1` positives that must be resolved before treating labels as final.
 - [ ] Spec coverage: package boundary, inputs, causal retrieval, support selection, output files, `x_geom[32]`, DA3 group semantics, Sim3 prior, labels, augmentation-compatible metadata, error handling, and validation are covered by Tasks 1-12.
 - [ ] Placeholder scan: run a ripgrep check for the disallowed filler phrases listed in the `writing-plans` skill and confirm there are no matches in this plan.
 - [ ] Type consistency: `KeyframeRecord`, `LoopPolicyDatasetConfig`, `RetrievalRecord`, `SupportDecision`, `CandidateFeatureRecord`, `Da3GroupResult`, and `Sim3PriorResult` names are consistent across tests and implementation steps.

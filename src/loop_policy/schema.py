@@ -23,6 +23,7 @@ class LoopPolicyDatasetConfig:
     min_support_baseline_m: float = 0.3
     retrieval_pool_size: int = 50
     runtime_top_k: int = 4
+    write_visualization_records: bool = False
     write_empty_queries: bool = False
     query_limit: Optional[int] = None
     abs_log_sim3_scale_thr: float = 0.4
