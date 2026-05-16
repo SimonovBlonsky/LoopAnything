@@ -57,7 +57,7 @@ Homepage = "https://github.com/ByteDance-Seed/Depth-Anything-3"
 source = "vcs"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/depth_anything_3", "src/loop_policy"]
+packages = ["src/depth_anything_3", "src/loop_policy", "src/robust_loop_verifier"]
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -65,6 +65,7 @@ include = [
   "/pyproject.toml",
   "/src/depth_anything_3",
   "/src/loop_policy",
+  "/src/robust_loop_verifier",
 ]
 
 [tool.hatch.metadata]
