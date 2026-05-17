@@ -68,6 +68,25 @@ def test_config_rejects_negative_recent_exclusion(tmp_path: Path):
         RobustLoopVerifierConfig.from_yaml(path)
 
 
+def test_config_defaults_positive_max_rotation_to_45_degrees(tmp_path: Path):
+    path = tmp_path / "config.yaml"
+    write_yaml(path, _valid_config(tmp_path))
+
+    config = RobustLoopVerifierConfig.from_yaml(path)
+
+    assert config.positive_max_rotation_deg == 45.0
+
+
+def test_config_rejects_invalid_positive_max_rotation(tmp_path: Path):
+    path = tmp_path / "config.yaml"
+    data = _valid_config(tmp_path)
+    data["positive_max_rotation_deg"] = -1.0
+    write_yaml(path, data)
+
+    with pytest.raises(ValueError, match="positive_max_rotation_deg"):
+        RobustLoopVerifierConfig.from_yaml(path)
+
+
 def test_config_rejects_pgo_vector_with_wrong_length(tmp_path: Path):
     path = tmp_path / "config.yaml"
     data = _valid_config(tmp_path)

@@ -2,15 +2,62 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+**Status:** Stage 1 offline baseline converged on 2026-05-17. The
+implementation is accepted as a working foundation and now enters an
+improvement phase.
+
 **Goal:** Build the FusionPortableV2 Stage 1 offline DA3-ROVER verifier from `2026-05-15-robust-loop-verifier-design.md`.
 
-**Architecture:** Add a new `robust_loop_verifier` package under `LoopAnything/src/` with no dependency on legacy `loop_policy`. The package builds an online-causal VPR cache, runs SALAD retrieval, selects candidate-neighborhood supports, converts DA3 triplets into metric loop factors, scores each candidate with full-prefix GTSAM PGO trajectory deformation, and writes metrics plus visual artifacts.
+**Architecture:** Add a new `robust_loop_verifier` package under `LoopAnything/src/` with no dependency on legacy `loop_policy`. The package builds an online-causal VPR cache, runs SALAD retrieval, selects candidate-neighborhood supports, converts DA3 triplets into metric loop factors, scores each candidate with full-prefix GTSAM PGO trajectory diagnostics, and writes metrics plus visual artifacts.
 
 **Source Isolation Constraint:** Do not reference, import, copy, or use `LoopAnything/src/loop_policy` or `LoopAnything/tests/loop_policy` while implementing this plan. Those modules and tests belong to the deferred learned-loop-policy draft, which is explicitly not converged as recorded in commit `626131774e1533c55e81d248a09e102b4c8609cf`. The causal direction must remain: the robust loop verifier is an experiment-backed system that will later guide loop-policy design, not a system contaminated by unvalidated loop-policy priors.
 
 **Tech Stack:** Python 3.9+, NumPy, PyYAML/OmegaConf-compatible YAML parsing, Pillow, OpenCV, Matplotlib, PyTorch/DA3 for real inference, Python GTSAM 4.1.1, pytest.
 
 **Git Policy:** Do not commit during execution unless the user explicitly requests it. Each task ends with `git status --short` as a checkpoint.
+
+---
+
+## Convergence Review 2026-05-17
+
+Lightweight review against the spec found no blocker to converging this plan as
+the Stage 1 offline baseline:
+
+- The implementation is isolated under `src/robust_loop_verifier` and does not
+  import legacy `loop_policy`.
+- The pipeline runs the intended offline path: FusionPortableV2 cache
+  preprocess, SALAD historical retrieval, support selection, real DA3 triplets,
+  candidate-support Sim3 alignment, full-prefix Python GTSAM PGO, candidate
+  records, AP, and MR@100 precision.
+- FusionPortableV2 `handheld` and `legged` default to AsterSLAM
+  `raw/trajectory_keyframes.txt` as the GT label pose source. This avoids the
+  external GT timestamp gaps and missing orientation observed in those
+  platforms.
+- Positive generation now uses translation plus configurable rotation overlap
+  for pure-visual labels: `positive_radius_m`, `positive_max_rotation_deg`
+  defaulting to `45.0`, and `recent_exclusion_keyframes`.
+- Real `handheld_escalator00` cache regeneration produced 184 keyframes, 77
+  positive queries, and 553 positive pairs with
+  `gt_label_source=aster_slam_trajectory_keyframes`.
+
+The real run at
+`workspace/robust_loop_verifier_runs/FusionPortableV2/handheld/handheld_escalator00/20260517_211913/metrics.json`
+reported:
+
+```text
+SALAD score only: AP=0.8339, MR@100P=0.0867
+SALAD + DA3/Sim3 self-consistency score: AP=0.2923, MR@100P=0.0000
+SALAD + DA3-ROVER full-prefix trajectory score: AP=0.7642, MR@100P=0.0665
+```
+
+The main remaining finding is methodological rather than a blocker: deformation
+alone is not a sufficient ROVER-like score with the current GTSAM setup. False
+loops can remain as high-residual constraints without strongly deforming the
+optimized trajectory. Post-analysis on the same candidate records showed that
+`deformation + log1p(pgo_error_after)` improves the run to approximately
+`AP=0.907` and `MR@100P=0.252`. The improvement phase should therefore focus
+on residual-aware trajectory-prior scoring, PGO noise sweeps, top-k ablations,
+and richer visualization/curve artifacts.
 
 ---
 
@@ -2373,16 +2420,21 @@ Expected: PASS.
 Run:
 
 ```bash
-cd /home/chenguyuan/code/NeurIPS26/LoopAnything
-PYTHONPATH=src /home/chenguyuan/anaconda3/envs/da3/bin/python -m robust_loop_verifier.cli preprocess-fusionportable \
-  --config configs/robust_loop_verifier/fusionportablev2_handheld.yaml \
-  --raw-dir /data/datasets/FusionPortable/fusionportable_loop_dataset/handheld/handheld_escalator00/raw \
-  --gt-trajectory-file /data/datasets/FusionPortable/handheld/handheld_escalator00/handheld_escalator00.txt \
-  --sequence-name handheld_escalator00 \
-  --max-gt-delta-sec 0.06
+cd /home/chenguyuan/code/NeurIPS26
+bash LoopAnything/robust_loop_verification_scripts/generate_fusionportable_dataset_cache.sh handheld_escalator00
 ```
 
 Expected: output path under `/data/datasets/FusionPortable/robust_loop_verifier_cache/FusionPortableV2/handheld/handheld_escalator00` with `manifest.json`, `keyframes.jsonl`, `positives.jsonl`, and `images/`.
+
+For `handheld` and `legged`, the script uses:
+
+```text
+gt_trajectory_file=/data/datasets/FusionPortable/fusionportable_loop_dataset/<platform>/<sequence>/raw/trajectory_keyframes.txt
+gt_label_source=aster_slam_trajectory_keyframes
+```
+
+External GT/reference trajectories remain available for other platforms, but
+are not the default label source for `handheld` or `legged`.
 
 - [ ] **Step 5: Run cached sequence smoke with query limit**
 
@@ -2446,7 +2498,9 @@ Run the real preprocess and `run-cache --query-limit 20` commands from Task 13.
 
 Expected:
 
-- `positives.jsonl` exists and contains only GT-position positives.
+- `positives.jsonl` exists and contains positives generated only from the
+  selected GT/reference trajectory source, translation radius, configurable
+  rotation threshold, and recent exclusion.
 - `candidate_records.jsonl` includes a larger-is-better score for every retrieved candidate and every reported method.
 - failed method scores are not excluded from `metrics.json`.
 - `metrics.md` reports `SALAD score only`, `SALAD + DA3/Sim3 self-consistency score`, and `SALAD + DA3-ROVER full-prefix trajectory score`.
@@ -2479,13 +2533,18 @@ Expected: shows all implementation files. Do not commit unless the user explicit
 
 - Spec coverage:
   - FusionPortableV2 preprocess: Task 3 and Task 13.
-  - Explicit GT radius/recent exclusion and GT-only labels: Task 1, Task 3, Task 14.
+  - Explicit GT radius, rotation threshold, recent exclusion, and GT/reference
+    trajectory-only labels: Task 1, Task 3, Task 13, and Task 14.
+  - `handheld`/`legged` AsterSLAM keyframe-trajectory GT label source: Task 13
+    and Convergence Review 2026-05-17.
   - Online-causal SALAD retrieval top10/top5/top20: Task 4 and Task 13.
   - Nearest-candidate support selection: Task 5.
   - DA3 `w2c -> c2w`, `ref_view_strategy="first"`, `process_res=504`: Task 6 and Task 12.
   - Candidate-support Sim3 metric loop factor: Task 6.
   - Full-prefix GTSAM PGO: Task 7.
   - ROVER larger-is-better canonical score: Task 7 and Task 8.
+  - Residual-aware ROVER-style scoring is intentionally deferred to the
+    improvement phase based on the 2026-05-17 runtime analysis.
   - AP/MR@100P and failure worst-score handling: Task 8.
   - Artifacts and visualizations: Task 9 and Task 13.
   - No AsterSLAM online port: plan contains no AsterSLAM source edits.

@@ -17,24 +17,32 @@ from robust_loop_verifier.schema import RobustLoopVerifierConfig
 
 def preprocess_fusionportable_sequence(
     raw_dir: Path,
-    gt_trajectory_file: Path,
+    gt_trajectory_file: Optional[Path],
     sequence_name: str,
     config: RobustLoopVerifierConfig,
     max_gt_delta_sec: float = 0.05,
 ) -> Path:
     raw_dir = Path(raw_dir)
-    gt_trajectory_file = Path(gt_trajectory_file)
 
     odom_trajectory_file = raw_dir / "trajectory_keyframes.txt"
     keyframe_rows = list(read_jsonl(raw_dir / "keyframes_with_images.jsonl"))
     odom_records = read_tum_trajectory(odom_trajectory_file)
-    gt_records = read_tum_trajectory(gt_trajectory_file)
 
     _validate_keyframe_stream_order(keyframe_rows)
     _validate_odom_keyframe_alignment(keyframe_rows, odom_records)
     dataset_name = _safe_path_segment(config.dataset_name, "dataset_name")
     platform = _safe_path_segment(config.platform, "platform")
     sequence_name = _safe_path_segment(sequence_name, "sequence_name")
+    if _uses_aster_slam_label_trajectory(platform):
+        gt_trajectory_file = odom_trajectory_file
+        gt_records = odom_records
+        gt_label_source = "aster_slam_trajectory_keyframes"
+    else:
+        if gt_trajectory_file is None:
+            raise ValueError("gt_trajectory_file is required for non-handheld/legged platforms")
+        gt_trajectory_file = Path(gt_trajectory_file)
+        gt_records = read_tum_trajectory(gt_trajectory_file)
+        gt_label_source = "external_trajectory_timestamp_association"
 
     out_dir, image_out_dir = _prepare_output_dir(
         config.output_root,
@@ -47,7 +55,10 @@ def preprocess_fusionportable_sequence(
     for row, odom_record in zip(keyframe_rows, odom_records):
         idx = int(row["keyframe_idx"])
         timestamp = float(row["timestamp"])
-        gt_record = associate_tum_by_timestamp(gt_records, timestamp, max_gt_delta_sec)
+        if gt_label_source == "aster_slam_trajectory_keyframes":
+            gt_record = odom_record
+        else:
+            gt_record = associate_tum_by_timestamp(gt_records, timestamp, max_gt_delta_sec)
         image_path = _link_image(raw_dir, image_out_dir, idx, row)
 
         keyframes.append(
@@ -59,12 +70,14 @@ def preprocess_fusionportable_sequence(
                 "gt_pose": _flatten_pose(gt_record.pose),
                 "source_raw_dir": str(raw_dir),
                 "source_gt_trajectory_file": str(gt_trajectory_file),
+                "gt_label_source": gt_label_source,
             }
         )
 
     positives = _build_online_causal_positives(
         keyframes,
         positive_radius_m=config.positive_radius_m,
+        positive_max_rotation_deg=config.positive_max_rotation_deg,
         recent_exclusion_keyframes=config.recent_exclusion_keyframes,
     )
 
@@ -79,7 +92,9 @@ def preprocess_fusionportable_sequence(
             "keyframe_count": len(keyframes),
             "raw_dir": str(raw_dir),
             "gt_trajectory_file": str(gt_trajectory_file),
+            "gt_label_source": gt_label_source,
             "positive_radius_m": config.positive_radius_m,
+            "positive_max_rotation_deg": config.positive_max_rotation_deg,
             "recent_exclusion_keyframes": config.recent_exclusion_keyframes,
         },
     )
@@ -87,26 +102,32 @@ def preprocess_fusionportable_sequence(
     return out_dir
 
 
+def _uses_aster_slam_label_trajectory(platform: str) -> bool:
+    return platform.lower() in {"handheld", "legged"}
+
+
 def _build_online_causal_positives(
     keyframes: List[Mapping[str, Any]],
     positive_radius_m: float,
+    positive_max_rotation_deg: float,
     recent_exclusion_keyframes: int,
 ) -> List[Dict[str, Any]]:
     positives = []
-    gt_positions = [
-        np.asarray(keyframe["gt_pose"], dtype=np.float64).reshape(4, 4)[:3, 3]
+    gt_poses = [
+        np.asarray(keyframe["gt_pose"], dtype=np.float64).reshape(4, 4)
         for keyframe in keyframes
     ]
 
-    for query_position, query_keyframe in zip(gt_positions, keyframes):
+    for query_pose, query_keyframe in zip(gt_poses, keyframes):
         query_idx = int(query_keyframe["idx"])
         positive_indices = []
-        for candidate_position, candidate_keyframe in zip(gt_positions, keyframes):
+        for candidate_pose, candidate_keyframe in zip(gt_poses, keyframes):
             candidate_idx = int(candidate_keyframe["idx"])
             if candidate_idx >= query_idx - recent_exclusion_keyframes:
                 continue
-            distance = float(np.linalg.norm(query_position - candidate_position))
-            if distance <= positive_radius_m:
+            distance = float(np.linalg.norm(query_pose[:3, 3] - candidate_pose[:3, 3]))
+            rotation_deg = _rotation_angle_deg(query_pose[:3, :3], candidate_pose[:3, :3])
+            if distance <= positive_radius_m and rotation_deg <= positive_max_rotation_deg:
                 positive_indices.append(candidate_idx)
         positives.append(
             {
@@ -116,6 +137,12 @@ def _build_online_causal_positives(
         )
 
     return positives
+
+
+def _rotation_angle_deg(query_rotation: np.ndarray, candidate_rotation: np.ndarray) -> float:
+    relative_rotation = query_rotation.T @ candidate_rotation
+    cosine = (float(np.trace(relative_rotation)) - 1.0) * 0.5
+    return float(np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0))))
 
 
 def _safe_path_segment(value: Any, field_name: str) -> str:

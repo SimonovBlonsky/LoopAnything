@@ -1,6 +1,7 @@
 # Robust Loop Verifier Offline Design
 
-Status: active design, approved 2026-05-15.
+Status: Stage 1 offline baseline converged on 2026-05-17; entering
+improvement phase.
 
 This spec defines the first offline stage of the robust loop verifier project.
 The target is an interpretable, training-free, ROVER-like loop verification
@@ -8,13 +9,51 @@ system:
 
 ```text
 online-causal VPR cache -> SALAD retrieval -> DA3 metric loop factor
--> full-prefix temporary GTSAM PGO -> ROVER-style trajectory deformation score
+-> full-prefix temporary GTSAM PGO -> ROVER-style trajectory diagnostics
 -> AP / MR@100 precision
 ```
 
 The first implementation focuses on FusionPortableV2. KITTI and GEODE are
 explicitly deferred until FusionPortableV2 is stable and diagnostically useful.
 AsterSLAM online integration is out of scope for this spec.
+
+## 2026-05-17 Convergence Review
+
+The Stage 1 implementation is considered converged as an offline baseline:
+
+- The `robust_loop_verifier` package is implemented independently of legacy
+  learned-loop-policy code.
+- FusionPortableV2 `handheld_escalator00` can be preprocessed into an
+  online-causal cache and evaluated end-to-end with real SALAD retrieval, DA3
+  triplet pose estimation, candidate-support Sim3 alignment, and full-prefix
+  Python GTSAM PGO.
+- Unit coverage exists for schema/IO, FusionPortable preprocess, retrieval,
+  support selection, DA3 pose conversion, Sim3 loop factors, PGO, metrics,
+  artifacts, CLI, and pipeline behavior.
+
+The first real run on
+`/data/datasets/FusionPortable/robust_loop_verifier_cache/FusionPortableV2/handheld/handheld_escalator00`
+wrote metrics to
+`workspace/robust_loop_verifier_runs/FusionPortableV2/handheld/handheld_escalator00/20260517_211913/metrics.json`:
+
+```text
+SALAD score only: AP=0.8339, MR@100P=0.0867
+SALAD + DA3/Sim3 self-consistency score: AP=0.2923, MR@100P=0.0000
+SALAD + DA3-ROVER full-prefix trajectory score: AP=0.7642, MR@100P=0.0665
+```
+
+Lightweight post-analysis on the same candidate records showed that
+`trajectory_deformation_rmse` alone is insufficient: GTSAM can leave a false
+loop as a high-residual constraint without catastrophically deforming the
+optimized trajectory. A residual-aware diagnostic score such as
+`deformation + log1p(pgo_error_after)` improved the same run to approximately
+`AP=0.907` and `MR@100P=0.252`. This is not yet the Stage 1 main reported
+method, but it is the primary improvement target.
+
+Therefore this spec is no longer an open construction plan. The current
+baseline is accepted as the foundation for the next phase, whose focus is
+improving the verifier score, parameter sweeps, richer artifacts, and broader
+dataset coverage.
 
 ## Non-Goals And Forbidden Priors
 
@@ -102,6 +141,12 @@ Required config fields:
 `positive_radius_m` and `recent_exclusion_keyframes` must be explicit. There are
 no hidden defaults for ground-truth label generation.
 
+For pure-visual FusionPortableV2 labels, the preprocess also supports
+`positive_max_rotation_deg`, defaulting to `45.0` degrees. This avoids marking
+same-position but opposite-viewpoint pairs as positives when the current
+retrieval input is image-only. This is a dataset-labeling constraint, not a
+verifier acceptance rule.
+
 The preprocess output is an online-causal sequence cache, not a fixed
 SALAD-style `ref/query` split. It preserves keyframe order and writes:
 
@@ -123,13 +168,29 @@ high-precision reference trajectories:
 ```text
 c.idx < q.idx - recent_exclusion_keyframes
 norm(p_gt(q) - p_gt(c)) <= positive_radius_m
+rotation_angle(R_gt(q), R_gt(c)) <= positive_max_rotation_deg
 ```
 
-Ground truth uses position only. It must not use viewpoint, yaw, rotation,
-DA3, Sim3, odometry consistency, retrieval score, verifier score, or any
-learned-policy output. The rationale is that a true loop is defined by revisiting
-the same physical place; viewpoint is a method difficulty factor, not the GT
-definition.
+Ground truth must not use DA3, Sim3, odometry consistency, retrieval score,
+verifier score, or any learned-policy output.
+
+FusionPortableV2 `handheld` and `legged` are a special data-source case. Their
+external reference trajectory files have timestamp gaps and no usable camera
+orientation. For these two platforms, the cache preprocessor defaults to the
+AsterSLAM-exported keyframe trajectory:
+
+```text
+<sequence>/raw/trajectory_keyframes.txt
+```
+
+The manifest records this as:
+
+```text
+gt_label_source = "aster_slam_trajectory_keyframes"
+```
+
+Other platforms continue to use explicitly provided external GT/reference
+trajectories with timestamp association.
 
 Sequences without usable GT are skipped. Private dog data is out of scope for
 this spec because it will be manually annotated separately.
@@ -261,13 +322,13 @@ It is not:
 current AsterSLAM backend defaults -> offline verifier definition
 ```
 
-## ROVER-Style Score
+## ROVER-Style Score And Diagnostics
 
 Let `X` be the original prefix trajectory and `X*` be the trajectory after
 temporary PGO with the candidate loop factor. Let `P` and `P*` be their
 translation point sets at matching keyframe timestamps.
 
-Stage 1 computes the ROVER-style score:
+The converged Stage 1 baseline computes the ROVER-style score:
 
 1. Find the best Sim3 alignment from `P*` to `P`.
 2. Compute translation RMSE after alignment.
@@ -276,6 +337,13 @@ Stage 1 computes the ROVER-style score:
 
 Rotation residuals are not part of the Stage 1 main score. They may be logged
 only as diagnostics if useful, but they must not affect the main ROVER baseline.
+
+The improvement phase must explicitly evaluate residual-aware trajectory-prior
+scores. The first diagnostic evidence shows that `pgo_error_after` carries
+strong false-loop information that deformation-only scoring misses. Candidate
+records already log `pgo_error_before`, `pgo_error_after`, and
+`trajectory_deformation_rmse`; future scores should sweep combinations of these
+signals and SALAD score without introducing learned-policy priors.
 
 ## Methods In Stage 1 Table
 
@@ -315,19 +383,16 @@ the metric computation to produce the precision-recall curve.
 Report metrics for:
 
 - Main `top10` setting.
-- `top5` retrieval ablation.
-- `top20` retrieval ablation.
+- `top5` retrieval ablation in the improvement phase.
+- `top20` retrieval ablation in the improvement phase.
 - Dataset/platform selected configs.
 
 ## Artifacts
 
-Each run writes:
+The converged baseline run writes:
 
 ```text
 <run_root>/
-  run_config.yaml
-  run_manifest.json
-  sequence_summaries.jsonl
   candidate_records.jsonl
   metrics.json
   metrics.md
@@ -335,6 +400,11 @@ Each run writes:
   visual_records/
   trajectory_plots/
 ```
+
+`pr_curves/`, `visual_records/`, and `trajectory_plots/` are created as
+artifact directories in the baseline implementation. Populating them with full
+curve files, triplet sheets, and before/after trajectory plots is part of the
+improvement phase.
 
 `candidate_records.jsonl` includes at least:
 
@@ -349,10 +419,10 @@ Each run writes:
 - GT label
 - method scores
 
-`visual_records/` stores `(query, candidate, support)` triplets for manual false
-positive and false negative inspection.
+`visual_records/` should store `(query, candidate, support)` triplets for manual
+false positive and false negative inspection.
 
-`trajectory_plots/` stores original-vs-optimized prefix trajectory plots for
+`trajectory_plots/` should store original-vs-optimized prefix trajectory plots for
 sampled high-score true positives, high-score false positives, and false
 negatives near the decision frontier.
 
@@ -396,12 +466,10 @@ The Stage 1 implementation is acceptable when it can:
 - Preprocess FusionPortableV2 into an online-causal VPR cache with explicit
   positive lists.
 - Generate GT positive lists only from dataset GT or high-precision reference
-  trajectory positions, `positive_radius_m`, and
-  `recent_exclusion_keyframes`; do not use viewpoint, yaw, rotation, DA3, Sim3,
-  odometry consistency, retrieval score, verifier score, or learned-policy
-  artifacts for GT labels.
-- Run SALAD historical retrieval with top10 main setting and top5/top20
-  ablations.
+  trajectories, `positive_radius_m`, `positive_max_rotation_deg`, and
+  `recent_exclusion_keyframes`; do not use DA3, Sim3, odometry consistency,
+  retrieval score, verifier score, or learned-policy artifacts for GT labels.
+- Run SALAD historical retrieval with the top10 main setting.
 - Run DA3 triplets using `w2c -> c2w`, `ref_view_strategy="first"`, and
   non-smoke DA3 resolution.
 - Select supports by nearest candidate keyframe index after validity and
@@ -414,8 +482,8 @@ The Stage 1 implementation is acceptable when it can:
 - Assign a larger-is-better canonical score to every retrieved candidate for
   every reported method, with computation failures ranked after all normal
   scores rather than excluded.
-- Save candidate records, PR curve data, triplet visualizations, and trajectory
-  plots.
+- Save candidate records, metrics, and artifact directories for PR curves,
+  triplet visualizations, and trajectory plots.
 - Avoid all legacy learned-policy labels, features, hard gates, score rules, and
   cache artifacts.
 - Avoid AsterSLAM online runtime implementation.

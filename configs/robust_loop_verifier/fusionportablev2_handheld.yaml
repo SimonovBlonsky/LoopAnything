@@ -4,6 +4,7 @@ input_root: /data/datasets/FusionPortable/fusionportable_loop_dataset
 gt_root: /data/datasets/FusionPortable/handheld
 output_root: /data/datasets/FusionPortable/robust_loop_verifier_cache
 positive_radius_m: 2.0
+positive_max_rotation_deg: 45.0
 recent_exclusion_keyframes: 30
 retrieval_top_k_main: 10
 retrieval_top_k_ablations: [5, 20]

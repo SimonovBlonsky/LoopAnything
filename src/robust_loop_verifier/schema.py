@@ -50,6 +50,7 @@ class RobustLoopVerifierConfig:
     output_root: Path
     gt_root: Path
     positive_radius_m: float
+    positive_max_rotation_deg: float
     recent_exclusion_keyframes: int
     retrieval_top_k_main: int
     retrieval_top_k_ablations: List[int]
@@ -66,9 +67,16 @@ class RobustLoopVerifierConfig:
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "RobustLoopVerifierConfig":
         positive_radius_m = float(_required(data, "positive_radius_m"))
+        positive_max_rotation_deg = float(data.get("positive_max_rotation_deg", 45.0))
         recent_exclusion_keyframes = int(_required(data, "recent_exclusion_keyframes"))
         if positive_radius_m <= 0.0:
             raise ValueError("positive_radius_m must be positive")
+        if (
+            not np.isfinite(positive_max_rotation_deg)
+            or positive_max_rotation_deg < 0.0
+            or positive_max_rotation_deg > 180.0
+        ):
+            raise ValueError("positive_max_rotation_deg must be in [0, 180]")
         if recent_exclusion_keyframes < 0:
             raise ValueError("recent_exclusion_keyframes must be non-negative")
 
@@ -79,6 +87,7 @@ class RobustLoopVerifierConfig:
             output_root=Path(str(_required(data, "output_root"))),
             gt_root=Path(str(_required(data, "gt_root"))),
             positive_radius_m=positive_radius_m,
+            positive_max_rotation_deg=positive_max_rotation_deg,
             recent_exclusion_keyframes=recent_exclusion_keyframes,
             retrieval_top_k_main=int(_required(data, "retrieval_top_k_main")),
             retrieval_top_k_ablations=[
