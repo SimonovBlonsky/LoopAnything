@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import importlib
+from os.path import basename
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, List, Protocol, Sequence
+from urllib.parse import urlparse
 
 import numpy as np
 
@@ -108,21 +111,22 @@ def _build_local_salad_model(salad_repo: Path, backbone: str):
                 f"Parameter `backbone` is set to {backbone} but it must be one of "
                 f"{list(dinov2_archs.keys())}"
             )
-        return vpr_module.VPRModel(
-            backbone_arch=backbone,
-            backbone_config={
-                "num_trainable_blocks": 4,
-                "return_token": True,
-                "norm_layer": True,
-            },
-            agg_arch="SALAD",
-            agg_config={
-                "num_channels": dinov2_archs[backbone],
-                "num_clusters": 64,
-                "cluster_dim": 128,
-                "token_dim": 256,
-            },
-        )
+        with _redirect_torch_hub_repo_to_local_cache("facebookresearch/dinov2"):
+            return vpr_module.VPRModel(
+                backbone_arch=backbone,
+                backbone_config={
+                    "num_trainable_blocks": 4,
+                    "return_token": True,
+                    "norm_layer": True,
+                },
+                agg_arch="SALAD",
+                agg_config={
+                    "num_channels": dinov2_archs[backbone],
+                    "num_clusters": 64,
+                    "cluster_dim": 128,
+                    "token_dim": 256,
+                },
+            )
     finally:
         sys.path[:] = saved_path
         for name in module_names:
@@ -130,6 +134,67 @@ def _build_local_salad_model(salad_repo: Path, backbone: str):
                 sys.modules.pop(name, None)
             else:
                 sys.modules[name] = saved_modules[name]
+
+
+@contextmanager
+def _redirect_torch_hub_repo_to_local_cache(repo_id: str):
+    """Force vendored torch.hub calls to use already-cached local files."""
+
+    import torch
+
+    hub_dir = Path(torch.hub.get_dir()).expanduser()
+    local_repo = _resolve_local_torch_hub_repo(repo_id, hub_dir)
+    original_load = torch.hub.load
+    original_load_state_dict_from_url = torch.hub.load_state_dict_from_url
+
+    def offline_load(repo_or_dir, model, *args, **kwargs):
+        if repo_or_dir != repo_id:
+            return original_load(repo_or_dir, model, *args, **kwargs)
+        if local_repo is None:
+            raise FileNotFoundError(
+                f"local torch hub cache for {repo_id} was not found under {hub_dir}"
+            )
+        kwargs.pop("source", None)
+        return original_load(str(local_repo), model, *args, source="local", **kwargs)
+
+    def offline_load_state_dict_from_url(url, *args, **kwargs):
+        checkpoint_dir = Path(kwargs.get("model_dir") or hub_dir / "checkpoints")
+        filename = kwargs.get("file_name") or basename(urlparse(str(url)).path)
+        checkpoint_path = checkpoint_dir / filename
+        if not checkpoint_path.is_file():
+            raise FileNotFoundError(
+                f"local torch hub checkpoint was not found: {checkpoint_path}"
+            )
+        kwargs["model_dir"] = str(checkpoint_dir)
+        return original_load_state_dict_from_url(url, *args, **kwargs)
+
+    torch.hub.load = offline_load
+    torch.hub.load_state_dict_from_url = offline_load_state_dict_from_url
+    try:
+        yield
+    finally:
+        torch.hub.load = original_load
+        torch.hub.load_state_dict_from_url = original_load_state_dict_from_url
+
+
+def _resolve_local_torch_hub_repo(repo_id: str, hub_dir: Path) -> Path | None:
+    if "/" not in repo_id:
+        raise ValueError("repo_id must have the form 'owner/repo'")
+    owner, repo = repo_id.split("/", 1)
+    prefix = f"{owner}_{repo}_"
+    preferred = [
+        Path(hub_dir) / f"{prefix}main",
+        Path(hub_dir) / f"{prefix}master",
+    ]
+    for path in preferred:
+        if path.is_dir():
+            return path
+    if not Path(hub_dir).is_dir():
+        return None
+    candidates = sorted(
+        path for path in Path(hub_dir).iterdir() if path.is_dir() and path.name.startswith(prefix)
+    )
+    return candidates[-1] if candidates else None
 
 
 class SaladDescriptorBackend:

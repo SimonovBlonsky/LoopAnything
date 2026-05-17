@@ -10,6 +10,7 @@ from robust_loop_verifier.da3_runner import (
 from robust_loop_verifier.retrieval import (
     SaladDescriptorBackend,
     SaladDescriptorBackendConfig,
+    _build_local_salad_model,
     _strip_checkpoint_prefixes,
 )
 
@@ -173,6 +174,127 @@ class VPRModel:
 
     assert model.loaded_keys == ["weight"]
     assert model.device == "cpu"
+
+
+def test_salad_model_redirects_dinov2_torch_hub_to_local_cache(tmp_path, monkeypatch):
+    salad_repo = tmp_path / "salad"
+    (salad_repo / "models" / "backbones").mkdir(parents=True)
+    (salad_repo / "vpr_model.py").write_text(
+        """
+from models.backbones.dinov2 import DINOv2
+
+class VPRModel:
+    def __init__(self, **kwargs):
+        self.backbone = DINOv2(kwargs["backbone_arch"])
+""",
+        encoding="utf-8",
+    )
+    (salad_repo / "models" / "__init__.py").write_text("", encoding="utf-8")
+    (salad_repo / "models" / "backbones" / "__init__.py").write_text("", encoding="utf-8")
+    (salad_repo / "models" / "backbones" / "dinov2.py").write_text(
+        """
+import torch
+
+DINOV2_ARCHS = {"dinov2_vitb14": 768}
+
+class DINOv2:
+    def __init__(self, model_name):
+        self.model = torch.hub.load("facebookresearch/dinov2", model_name)
+""",
+        encoding="utf-8",
+    )
+    hub_dir = tmp_path / "torch_hub"
+    local_repo = hub_dir / "facebookresearch_dinov2_main"
+    local_repo.mkdir(parents=True)
+    captured = {}
+
+    import torch
+
+    monkeypatch.setattr(torch.hub, "get_dir", lambda: str(hub_dir))
+
+    def fake_torch_hub_load(repo_or_dir, model_name, **kwargs):
+        captured["repo_or_dir"] = repo_or_dir
+        captured["model_name"] = model_name
+        captured["kwargs"] = kwargs
+        return object()
+
+    monkeypatch.setattr(torch.hub, "load", fake_torch_hub_load)
+
+    _build_local_salad_model(salad_repo, "dinov2_vitb14")
+
+    assert captured == {
+        "repo_or_dir": str(local_repo),
+        "model_name": "dinov2_vitb14",
+        "kwargs": {"source": "local"},
+    }
+
+
+def test_salad_model_missing_local_dinov2_cache_fails_before_network(
+    tmp_path,
+    monkeypatch,
+):
+    salad_repo = tmp_path / "salad"
+    (salad_repo / "models" / "backbones").mkdir(parents=True)
+    (salad_repo / "vpr_model.py").write_text(
+        """
+from models.backbones.dinov2 import DINOv2
+
+class VPRModel:
+    def __init__(self, **kwargs):
+        self.backbone = DINOv2(kwargs["backbone_arch"])
+""",
+        encoding="utf-8",
+    )
+    (salad_repo / "models" / "__init__.py").write_text("", encoding="utf-8")
+    (salad_repo / "models" / "backbones" / "__init__.py").write_text("", encoding="utf-8")
+    (salad_repo / "models" / "backbones" / "dinov2.py").write_text(
+        """
+import torch
+
+DINOV2_ARCHS = {"dinov2_vitb14": 768}
+
+class DINOv2:
+    def __init__(self, model_name):
+        self.model = torch.hub.load("facebookresearch/dinov2", model_name)
+""",
+        encoding="utf-8",
+    )
+
+    import torch
+
+    monkeypatch.setattr(torch.hub, "get_dir", lambda: str(tmp_path / "torch_hub"))
+    monkeypatch.setattr(
+        torch.hub,
+        "load",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("network torch.hub.load called")
+        ),
+    )
+
+    with pytest.raises(FileNotFoundError, match="local torch hub cache"):
+        _build_local_salad_model(salad_repo, "dinov2_vitb14")
+
+
+def test_real_da3_runner_missing_local_snapshot_fails_before_hf(
+    tmp_path,
+    monkeypatch,
+):
+    import depth_anything_3.api as da3_api
+
+    monkeypatch.setattr(
+        da3_api.DepthAnything3,
+        "from_pretrained",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("huggingface from_pretrained called")
+        ),
+    )
+
+    runner = RealDa3Runner(
+        RealDa3RunnerConfig(cache_dir=tmp_path / "empty_hf_cache", device="cpu")
+    )
+
+    with pytest.raises(FileNotFoundError, match="local DA3 snapshot"):
+        runner._load_model()
 
 
 def test_real_da3_runner_accepts_injected_model_and_returns_c2w(tmp_path):

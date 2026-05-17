@@ -149,6 +149,7 @@ class RealDa3Runner:
             model_name_or_path = resolve_local_da3_model_name_or_path(
                 self.config.model_name,
                 cache_dir=self.config.cache_dir,
+                require_local=self.config.local_files_only,
             )
             self._model = (
                 DepthAnything3.from_pretrained(
@@ -218,23 +219,32 @@ def resolve_local_da3_model_name_or_path(
     model_name_or_path: str,
     *,
     cache_dir: Path | None = None,
+    require_local: bool = False,
 ) -> str:
     """Return a local HF snapshot path when it is already cached.
 
     Passing the snapshot directory to ``from_pretrained`` avoids proxy/network
-    code paths entirely. If the snapshot cannot be resolved, the original model
-    id/path is returned; ``local_files_only=True`` still prevents downloads.
+    code paths entirely. If ``require_local`` is true and the snapshot cannot be
+    resolved, fail before handing a repo id to Hugging Face.
     """
 
     model_path = Path(model_name_or_path).expanduser()
     if model_path.exists():
         return str(model_path)
     if "/" not in model_name_or_path:
+        if require_local:
+            raise FileNotFoundError(
+                f"local DA3 snapshot/path was not found: {model_name_or_path}"
+            )
         return model_name_or_path
 
     repo_cache = _huggingface_repo_cache_dir(model_name_or_path, cache_dir=cache_dir)
     snapshots_dir = repo_cache / "snapshots"
     if not snapshots_dir.is_dir():
+        if require_local:
+            raise FileNotFoundError(
+                f"local DA3 snapshot for {model_name_or_path} was not found under {repo_cache}"
+            )
         return model_name_or_path
 
     ref_path = repo_cache / "refs" / "main"
@@ -247,6 +257,10 @@ def resolve_local_da3_model_name_or_path(
 
     snapshots = sorted(path for path in snapshots_dir.iterdir() if path.is_dir())
     if not snapshots:
+        if require_local:
+            raise FileNotFoundError(
+                f"local DA3 snapshot for {model_name_or_path} was not found under {repo_cache}"
+            )
         return model_name_or_path
     return str(snapshots[-1])
 

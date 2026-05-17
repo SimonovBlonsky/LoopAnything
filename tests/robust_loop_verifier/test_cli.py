@@ -74,6 +74,7 @@ def test_cli_help():
     assert "preprocess-fusionportable" in result.stdout
     assert "run-mock" in result.stdout
     assert "run-cache" in result.stdout
+    assert "sweep-scores" in result.stdout
 
 
 def test_preprocess_fusionportable_help():
