@@ -82,6 +82,77 @@ def test_score_sweep_assigns_failed_candidates_worst_scores():
     assert result["positive_count"] == 3
 
 
+def test_score_sweep_reports_support_ensemble_score_when_present():
+    from robust_loop_verifier.score_sweep import compute_score_sweep
+
+    records = [
+        {
+            "label": True,
+            "score_salad": 0.90,
+            "trajectory_deformation_rmse": 0.90,
+            "pgo_error_after": 0.10517018598809245,
+            "score_support_ensemble": 0.96,
+        },
+        {
+            "label": False,
+            "score_salad": 0.95,
+            "trajectory_deformation_rmse": 0.05,
+            "pgo_error_after": 2.3201169227365472,
+            "score_support_ensemble": 0.20,
+        },
+        {
+            "label": True,
+            "score_salad": 0.80,
+            "trajectory_deformation_rmse": 0.10,
+            "pgo_error_after": 1.4596031111569499,
+            "score_support_ensemble": 0.75,
+        },
+    ]
+
+    result = compute_score_sweep(records, graph_weights=(1.0,), fusion_weights=(1.0,))
+
+    rows_by_name = {row["name"]: row for row in result["scores"]}
+    support_ensemble_row = rows_by_name["DA3-ROVER++ support ensemble graph evidence"]
+    assert math.isfinite(support_ensemble_row["AP"])
+    assert math.isfinite(support_ensemble_row["MR@100P"])
+
+
+def test_score_sweep_omits_support_ensemble_score_when_absent_or_all_none():
+    from robust_loop_verifier.score_sweep import compute_score_sweep
+
+    absent_result = compute_score_sweep(
+        _records(),
+        graph_weights=(1.0,),
+        fusion_weights=(1.0,),
+    )
+    none_records = [
+        {**record, "score_support_ensemble": None}
+        for record in _records()
+    ]
+    none_result = compute_score_sweep(
+        none_records,
+        graph_weights=(1.0,),
+        fusion_weights=(1.0,),
+    )
+
+    support_ensemble_name = "DA3-ROVER++ support ensemble graph evidence"
+    assert support_ensemble_name not in [row["name"] for row in absent_result["scores"]]
+    assert support_ensemble_name not in [row["name"] for row in none_result["scores"]]
+
+    mixed_records = [
+        {**record, "score_support_ensemble": None}
+        for record in _records()
+    ]
+    mixed_records[0]["score_support_ensemble"] = 0.5
+    mixed_result = compute_score_sweep(
+        mixed_records,
+        graph_weights=(1.0,),
+        fusion_weights=(1.0,),
+    )
+    mixed_rows_by_name = {row["name"]: row for row in mixed_result["scores"]}
+    assert math.isfinite(mixed_rows_by_name[support_ensemble_name]["AP"])
+
+
 def test_sweep_scores_cli_writes_json_and_markdown(tmp_path):
     records_path = tmp_path / "candidate_records.jsonl"
     output_root = tmp_path / "sweep"

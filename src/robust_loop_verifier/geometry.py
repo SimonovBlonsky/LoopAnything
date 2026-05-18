@@ -51,6 +51,114 @@ def make_transform(rotation, translation) -> np.ndarray:
     return transform
 
 
+def so3_log(rotation) -> np.ndarray:
+    rotation = np.asarray(rotation, dtype=np.float64)
+    if rotation.shape != (3, 3):
+        raise ValueError("Rotation must have shape (3, 3)")
+    if not np.all(np.isfinite(rotation)):
+        raise ValueError("Rotation must contain only finite values")
+    if not np.allclose(rotation.T @ rotation, np.eye(3), atol=_ROTATION_ATOL):
+        raise ValueError("Rotation must be orthonormal")
+    if not np.isclose(np.linalg.det(rotation), 1.0, atol=_ROTATION_ATOL):
+        raise ValueError("Rotation must have determinant 1")
+
+    cos_angle = (np.trace(rotation) - 1.0) * 0.5
+    angle = float(np.arccos(np.clip(cos_angle, -1.0, 1.0)))
+    if angle < 1e-12:
+        return np.zeros(3, dtype=np.float64)
+
+    skew_vector = np.array(
+        [
+            rotation[2, 1] - rotation[1, 2],
+            rotation[0, 2] - rotation[2, 0],
+            rotation[1, 0] - rotation[0, 1],
+        ],
+        dtype=np.float64,
+    )
+    sin_angle = np.sin(angle)
+    if abs(sin_angle) > 1e-8:
+        return angle * skew_vector / (2.0 * sin_angle)
+
+    axis = np.sqrt(np.maximum((np.diag(rotation) + 1.0) * 0.5, 0.0))
+    axis[0] = np.copysign(axis[0], rotation[2, 1] - rotation[1, 2])
+    axis[1] = np.copysign(axis[1], rotation[0, 2] - rotation[2, 0])
+    axis[2] = np.copysign(axis[2], rotation[1, 0] - rotation[0, 1])
+    axis_norm = np.linalg.norm(axis)
+    if axis_norm <= 0.0:
+        axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    else:
+        axis = axis / axis_norm
+    return angle * axis
+
+
+def se3_log(transform) -> np.ndarray:
+    transform = np.asarray(transform, dtype=np.float64)
+    invert_transform(transform)
+    residual = np.empty(6, dtype=np.float64)
+    residual[:3] = so3_log(transform[:3, :3])
+    residual[3:] = transform[:3, 3]
+    return residual
+
+
+def _project_rotation(rotation) -> np.ndarray:
+    rotation = np.asarray(rotation, dtype=np.float64)
+    if rotation.shape != (3, 3):
+        raise ValueError("Rotation must have shape (3, 3)")
+    if not np.all(np.isfinite(rotation)):
+        raise ValueError("Rotation must contain only finite values")
+
+    u_matrix, _, vt_matrix = np.linalg.svd(rotation)
+    projected = u_matrix @ vt_matrix
+    if np.linalg.det(projected) < 0.0:
+        u_matrix[:, -1] *= -1.0
+        projected = u_matrix @ vt_matrix
+    return projected
+
+
+def weighted_se3_mean(poses, weights, iterations: int = 3) -> np.ndarray:
+    try:
+        iterations_float = float(iterations)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("iterations must be a finite positive integer") from exc
+    if (
+        not np.isfinite(iterations_float)
+        or not iterations_float.is_integer()
+        or iterations_float <= 0.0
+    ):
+        raise ValueError("iterations must be a finite positive integer")
+    _iterations_count = int(iterations_float)
+
+    if len(poses) == 0:
+        raise ValueError("poses must be non-empty")
+
+    weights_array = np.asarray(weights, dtype=np.float64)
+    if weights_array.shape != (len(poses),):
+        raise ValueError("weights length must match poses")
+    if not np.all(np.isfinite(weights_array)):
+        raise ValueError("weights must contain only finite values")
+    if np.any(weights_array < 0.0):
+        raise ValueError("weights must be non-negative")
+
+    weight_sum = float(np.sum(weights_array))
+    if weight_sum <= 0.0:
+        raise ValueError("weights must include at least one positive value")
+    normalized_weights = weights_array / weight_sum
+
+    pose_matrices = []
+    for pose in poses:
+        pose_matrix = np.asarray(pose, dtype=np.float64)
+        invert_transform(pose_matrix)
+        pose_matrices.append(pose_matrix)
+
+    translations = np.stack([pose[:3, 3] for pose in pose_matrices], axis=0)
+    rotations = np.stack([pose[:3, :3] for pose in pose_matrices], axis=0)
+    mean_translation = np.sum(normalized_weights[:, None] * translations, axis=0)
+    mean_rotation = _project_rotation(
+        np.sum(normalized_weights[:, None, None] * rotations, axis=0)
+    )
+    return make_transform(mean_rotation, mean_translation)
+
+
 def invert_transform(transform) -> np.ndarray:
     transform = np.asarray(transform, dtype=np.float64)
     if transform.shape != (4, 4):

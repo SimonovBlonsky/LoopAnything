@@ -5,7 +5,12 @@ import numpy as np
 import pytest
 
 from robust_loop_verifier.geometry import make_transform
-from robust_loop_verifier.pgo import PgoNoise, run_full_prefix_pgo, trajectory_deformation_rmse
+from robust_loop_verifier.pgo import (
+    PgoNoise,
+    _between_chi2,
+    run_full_prefix_pgo,
+    trajectory_deformation_rmse,
+)
 
 
 def _require_gtsam():
@@ -28,6 +33,19 @@ def _bent_poses():
     return [make_transform(np.eye(3), translation) for translation in translations]
 
 
+def _rotation_z(angle):
+    cos_angle = np.cos(angle)
+    sin_angle = np.sin(angle)
+    return np.array(
+        [
+            [cos_angle, -sin_angle, 0.0],
+            [sin_angle, cos_angle, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float64,
+    )
+
+
 def _assert_structured_failure(result, original_poses):
     assert not result.converged
     assert result.error_before == np.inf
@@ -37,6 +55,18 @@ def _assert_structured_failure(result, original_poses):
     for original, returned in zip(original_poses, result.optimized_poses):
         assert returned is not original
         np.testing.assert_allclose(returned, original)
+
+
+def test_between_chi2_uses_rot_then_trans_sigma_order_for_known_residual():
+    left = np.eye(4)
+    right = make_transform(_rotation_z(np.pi / 2.0), [2.0, 0.0, 0.0])
+    measured = np.eye(4)
+    sigmas = (0.5, 1.0, 2.0, 4.0, 5.0, 6.0)
+
+    chi2 = _between_chi2(left, right, measured, sigmas)
+
+    expected = (np.pi / 2.0 / 2.0) ** 2 + (2.0 / 4.0) ** 2
+    assert np.isclose(chi2, expected)
 
 
 def test_full_prefix_pgo_true_loop_has_small_deformation():
@@ -69,6 +99,60 @@ def test_full_prefix_pgo_false_loop_has_larger_deformation():
     )
     assert result.converged
     assert trajectory_deformation_rmse(poses, result.optimized_poses) > 0.1
+
+
+def test_full_prefix_pgo_reports_loop_and_odom_chi2_diagnostics():
+    _require_gtsam()
+    poses = _poses(4)
+    loop_factor = np.linalg.inv(poses[3]) @ poses[0]
+
+    result = run_full_prefix_pgo(
+        prefix_indices=list(range(4)),
+        odom_poses=poses,
+        loop_from_idx=3,
+        loop_to_idx=0,
+        loop_factor=loop_factor,
+        noise=PgoNoise.default_for_tests(),
+    )
+
+    assert result.converged
+    assert result.loop_chi2_after is not None
+    assert result.odom_chi2_before is not None
+    assert result.odom_chi2_after is not None
+    assert result.odom_strain_chi2_after is not None
+    assert result.loop_chi2_after < 1e-6
+    assert result.odom_strain_chi2_after < 1e-6
+
+
+def test_full_prefix_pgo_accepts_loop_sigmas_override():
+    _require_gtsam()
+    poses = _bent_poses()
+    bad_loop = make_transform(np.eye(3), [-20.0, 0.0, 0.0])
+
+    tight = run_full_prefix_pgo(
+        prefix_indices=list(range(6)),
+        odom_poses=poses,
+        loop_from_idx=5,
+        loop_to_idx=0,
+        loop_factor=bad_loop,
+        noise=PgoNoise.default_for_tests(),
+        loop_sigmas_override=(0.01, 0.01, 0.01, 0.01, 0.01, 0.01),
+    )
+    loose = run_full_prefix_pgo(
+        prefix_indices=list(range(6)),
+        odom_poses=poses,
+        loop_from_idx=5,
+        loop_to_idx=0,
+        loop_factor=bad_loop,
+        noise=PgoNoise.default_for_tests(),
+        loop_sigmas_override=(10.0, 10.0, 10.0, 10.0, 10.0, 10.0),
+    )
+
+    assert tight.converged
+    assert loose.converged
+    assert tight.loop_chi2_after is not None
+    assert loose.loop_chi2_after is not None
+    assert loose.loop_chi2_after < tight.loop_chi2_after
 
 
 def test_full_prefix_pgo_rejects_prefix_pose_length_mismatch():
@@ -125,6 +209,27 @@ def test_full_prefix_pgo_rejects_nan_noise_sigma():
     assert "prior_sigmas" in result.failure_reason
 
 
+def test_full_prefix_pgo_rejects_non_numeric_base_noise_sigma_with_structured_failure():
+    poses = _poses(3)
+    noise = PgoNoise(
+        prior_sigmas=(1e-6, 1e-6, 1e-6, 1e-6, 1e-6, 1e-6),
+        odom_sigmas=("bad", 0.05, 0.05, 0.05, 0.05, 0.05),
+        loop_sigmas=(0.05, 0.05, 0.05, 0.05, 0.05, 0.05),
+    )
+
+    result = run_full_prefix_pgo(
+        prefix_indices=[0, 1, 2],
+        odom_poses=poses,
+        loop_from_idx=2,
+        loop_to_idx=0,
+        loop_factor=np.linalg.inv(poses[2]) @ poses[0],
+        noise=noise,
+    )
+
+    _assert_structured_failure(result, poses)
+    assert "odom_sigmas" in result.failure_reason
+
+
 @pytest.mark.parametrize(
     "sigmas",
     [
@@ -152,6 +257,33 @@ def test_full_prefix_pgo_rejects_bad_noise_sigma_shapes_and_values(sigmas):
 
     _assert_structured_failure(result, poses)
     assert "odom_sigmas" in result.failure_reason
+
+
+@pytest.mark.parametrize(
+    "loop_sigmas_override",
+    [
+        (0.05, 0.05, 0.05, 0.05, 0.05),
+        (0.05, 0.05, 0.05, 0.05, 0.05, np.nan),
+        (0.05, 0.05, 0.05, 0.05, 0.05, 0.0),
+        (0.05, 0.05, 0.05, 0.05, 0.05, -0.1),
+        ("bad", 1.0, 1.0, 1.0, 1.0, 1.0),
+    ],
+)
+def test_full_prefix_pgo_rejects_bad_loop_sigmas_override(loop_sigmas_override):
+    poses = _poses(3)
+
+    result = run_full_prefix_pgo(
+        prefix_indices=[0, 1, 2],
+        odom_poses=poses,
+        loop_from_idx=2,
+        loop_to_idx=0,
+        loop_factor=np.linalg.inv(poses[2]) @ poses[0],
+        noise=PgoNoise.default_for_tests(),
+        loop_sigmas_override=loop_sigmas_override,
+    )
+
+    _assert_structured_failure(result, poses)
+    assert "loop_sigmas_override" in result.failure_reason
 
 
 @pytest.mark.parametrize(

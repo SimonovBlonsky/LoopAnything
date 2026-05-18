@@ -5,7 +5,7 @@ from typing import Sequence
 
 import numpy as np
 
-from robust_loop_verifier.geometry import invert_transform, pose_between, sim3_align_points
+from robust_loop_verifier.geometry import invert_transform, pose_between, se3_log, sim3_align_points
 
 
 @dataclass(frozen=True)
@@ -30,6 +30,10 @@ class PgoResult:
     error_before: float
     error_after: float
     failure_reason: str | None
+    loop_chi2_after: float | None = None
+    odom_chi2_before: float | None = None
+    odom_chi2_after: float | None = None
+    odom_strain_chi2_after: float | None = None
 
 
 def run_full_prefix_pgo(
@@ -39,6 +43,7 @@ def run_full_prefix_pgo(
     loop_to_idx: int,
     loop_factor: np.ndarray,
     noise: PgoNoise,
+    loop_sigmas_override: Sequence[float] | None = None,
 ) -> PgoResult:
     original_poses = [_as_pose_matrix(pose) for pose in odom_poses]
     loop_factor = _as_pose_matrix(loop_factor)
@@ -52,6 +57,25 @@ def run_full_prefix_pgo(
     )
     if failure is not None:
         return _failed_result(original_poses, failure)
+
+    if loop_sigmas_override is None:
+        loop_sigmas = np.asarray(noise.loop_sigmas, dtype=np.float64)
+    else:
+        try:
+            loop_sigmas = np.asarray(loop_sigmas_override, dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            return _failed_result(
+                original_poses,
+                f"loop_sigmas_override must contain numeric values: {exc}",
+            )
+        failure = _validate_sigmas("loop_sigmas_override", loop_sigmas)
+        if failure is not None:
+            return _failed_result(original_poses, failure)
+
+    odom_measurements = [
+        pose_between(original_poses[position], original_poses[position + 1])
+        for position in range(len(original_poses) - 1)
+    ]
 
     try:
         import gtsam
@@ -69,9 +93,7 @@ def run_full_prefix_pgo(
         odom_noise = gtsam.noiseModel.Diagonal.Sigmas(
             np.asarray(noise.odom_sigmas, dtype=np.float64)
         )
-        loop_noise = gtsam.noiseModel.Diagonal.Sigmas(
-            np.asarray(noise.loop_sigmas, dtype=np.float64)
-        )
+        loop_noise = gtsam.noiseModel.Diagonal.Sigmas(loop_sigmas)
 
         for prefix_idx, pose in zip(prefix_indices, original_poses):
             initial.insert(key_by_index[prefix_idx], _to_gtsam_pose3(gtsam, pose))
@@ -88,7 +110,7 @@ def run_full_prefix_pgo(
         for position in range(len(original_poses) - 1):
             left_key = key_by_index[prefix_indices[position]]
             right_key = key_by_index[prefix_indices[position + 1]]
-            odom_factor = pose_between(original_poses[position], original_poses[position + 1])
+            odom_factor = odom_measurements[position]
             graph.add(
                 gtsam.BetweenFactorPose3(
                     left_key,
@@ -131,6 +153,24 @@ def run_full_prefix_pgo(
         failure = _validate_pose_sequence("optimized_poses", optimized_poses)
         if failure is not None:
             return _failed_result(original_poses, failure)
+
+        odom_chi2_before = _odom_chi2(
+            original_poses,
+            odom_measurements,
+            noise.odom_sigmas,
+        )
+        odom_chi2_after = _odom_chi2(
+            optimized_poses,
+            odom_measurements,
+            noise.odom_sigmas,
+        )
+        loop_chi2_after = _between_chi2(
+            optimized_poses[prefix_indices.index(loop_from_idx)],
+            optimized_poses[prefix_indices.index(loop_to_idx)],
+            loop_factor,
+            loop_sigmas,
+        )
+        odom_strain_chi2_after = max(0.0, odom_chi2_after - odom_chi2_before)
     except Exception as exc:
         return _failed_result(original_poses, f"{type(exc).__name__}: {exc}")
 
@@ -140,6 +180,10 @@ def run_full_prefix_pgo(
         error_before=error_before,
         error_after=error_after,
         failure_reason=None,
+        loop_chi2_after=loop_chi2_after,
+        odom_chi2_before=odom_chi2_before,
+        odom_chi2_after=odom_chi2_after,
+        odom_strain_chi2_after=odom_strain_chi2_after,
     )
 
 
@@ -220,14 +264,51 @@ def _validate_se3(name: str, transform: np.ndarray) -> str | None:
 
 def _validate_noise(noise: PgoNoise) -> str | None:
     for name in ("prior_sigmas", "odom_sigmas", "loop_sigmas"):
-        sigmas = np.asarray(getattr(noise, name), dtype=np.float64)
-        if sigmas.shape != (6,):
-            return f"{name} must contain exactly six values"
-        if not np.all(np.isfinite(sigmas)):
-            return f"{name} must contain only finite values"
-        if not np.all(sigmas > 0.0):
-            return f"{name} must contain only positive values"
+        try:
+            sigmas = np.asarray(getattr(noise, name), dtype=np.float64)
+        except (TypeError, ValueError) as exc:
+            return f"{name} must contain numeric values: {exc}"
+        failure = _validate_sigmas(name, sigmas)
+        if failure is not None:
+            return failure
     return None
+
+
+def _validate_sigmas(name: str, sigmas: np.ndarray) -> str | None:
+    if sigmas.shape != (6,):
+        return f"{name} must contain exactly six values"
+    if not np.all(np.isfinite(sigmas)):
+        return f"{name} must contain only finite values"
+    if not np.all(sigmas > 0.0):
+        return f"{name} must contain only positive values"
+    return None
+
+
+def _between_chi2(
+    left: np.ndarray,
+    right: np.ndarray,
+    measured: np.ndarray,
+    sigmas: Sequence[float],
+) -> float:
+    predicted = pose_between(left, right)
+    residual_transform = invert_transform(measured) @ predicted
+    residual = se3_log(residual_transform)
+    sigma_array = np.asarray(sigmas, dtype=np.float64)
+    normalized = residual / sigma_array
+    return float(np.dot(normalized, normalized))
+
+
+def _odom_chi2(
+    poses: Sequence[np.ndarray],
+    odom_measurements: Sequence[np.ndarray],
+    sigmas: Sequence[float],
+) -> float:
+    return float(
+        sum(
+            _between_chi2(poses[position], poses[position + 1], measurement, sigmas)
+            for position, measurement in enumerate(odom_measurements)
+        )
+    )
 
 
 def _failed_result(original_poses: Sequence[np.ndarray], reason: str) -> PgoResult:

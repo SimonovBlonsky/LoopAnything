@@ -48,6 +48,17 @@ def compute_score_sweep(
             [_negative(_log1p_or_none(record.get("pgo_error_after"))) for record in records],
         )
     )
+    support_ensemble_scores = [
+        _finite_float_or_none(record.get("score_support_ensemble")) for record in records
+    ]
+    if any(score is not None for score in support_ensemble_scores):
+        score_rows.append(
+            _metrics_row(
+                "DA3-ROVER++ support ensemble graph evidence",
+                labels,
+                support_ensemble_scores,
+            )
+        )
 
     graph_weights = _validated_weights(graph_weights, "graph_weights")
     fusion_weights = _validated_weights(fusion_weights, "fusion_weights")

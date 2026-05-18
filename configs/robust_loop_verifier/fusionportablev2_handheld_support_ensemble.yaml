@@ -12,8 +12,8 @@ support_window: 4
 support_count: 1
 min_support_baseline_m: 0.3
 support_ensemble:
-  enabled: false
-  support_count: 1
+  enabled: true
+  support_count: 4
   sigma_rot_floor: 0.05
   sigma_trans_floor: 0.25
   covariance_scale: 1.0

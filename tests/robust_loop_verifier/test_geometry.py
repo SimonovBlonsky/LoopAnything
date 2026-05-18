@@ -59,6 +59,84 @@ def test_invert_transform_rejects_non_finite_transform():
         invert_transform(transform)
 
 
+def test_se3_log_identity_is_zero():
+    from robust_loop_verifier.geometry import se3_log
+
+    residual = se3_log(np.eye(4))
+
+    np.testing.assert_allclose(residual, np.zeros(6))
+
+
+def test_se3_log_places_translation_in_last_three_components():
+    from robust_loop_verifier.geometry import make_transform, se3_log
+
+    transform = make_transform(np.eye(3), [1.5, -2.0, 0.25])
+
+    residual = se3_log(transform)
+
+    np.testing.assert_allclose(residual[:3], np.zeros(3))
+    np.testing.assert_allclose(residual[3:], [1.5, -2.0, 0.25])
+
+
+def test_se3_log_reports_known_rotation_about_z():
+    from robust_loop_verifier.geometry import make_transform, se3_log
+
+    rotation = np.array(
+        [
+            [0.0, -1.0, 0.0],
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ]
+    )
+    transform = make_transform(rotation, np.zeros(3))
+
+    residual = se3_log(transform)
+
+    np.testing.assert_allclose(residual[:3], [0.0, 0.0, np.pi / 2.0])
+    np.testing.assert_allclose(residual[3:], np.zeros(3))
+
+
+def test_weighted_se3_mean_uses_weighted_translation_and_ignores_zero_weight_outlier():
+    from robust_loop_verifier.geometry import make_transform, weighted_se3_mean
+
+    poses = [
+        make_transform(np.eye(3), [0.0, 0.0, 0.0]),
+        make_transform(np.eye(3), [2.0, 4.0, 6.0]),
+        make_transform(np.eye(3), [100.0, 100.0, 100.0]),
+    ]
+    weights = [1.0, 3.0, 0.0]
+
+    mean_pose = weighted_se3_mean(poses, weights)
+
+    np.testing.assert_allclose(mean_pose[:3, :3], np.eye(3))
+    np.testing.assert_allclose(mean_pose[:3, 3], [1.5, 3.0, 4.5])
+    np.testing.assert_allclose(mean_pose[3], [0.0, 0.0, 0.0, 1.0])
+
+
+def test_weighted_se3_mean_rejects_empty_poses_and_invalid_weights():
+    from robust_loop_verifier.geometry import weighted_se3_mean
+
+    with pytest.raises(ValueError, match="poses"):
+        weighted_se3_mean([], [])
+
+    with pytest.raises(ValueError, match="length"):
+        weighted_se3_mean([np.eye(4)], [1.0, 2.0])
+
+    with pytest.raises(ValueError, match="non-negative"):
+        weighted_se3_mean([np.eye(4)], [-1.0])
+
+    with pytest.raises(ValueError, match="positive"):
+        weighted_se3_mean([np.eye(4)], [0.0])
+
+
+@pytest.mark.parametrize("iterations", [np.nan, 0, 1.5, "bad"])
+def test_weighted_se3_mean_rejects_invalid_iterations(iterations):
+    from robust_loop_verifier.geometry import weighted_se3_mean
+
+    with pytest.raises(ValueError, match="iterations"):
+        weighted_se3_mean([np.eye(4)], [1.0], iterations=iterations)
+
+
 def test_sim3_align_points_recovers_scale_rotation_translation():
     from robust_loop_verifier.geometry import sim3_align_points
 

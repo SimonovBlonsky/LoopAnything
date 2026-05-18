@@ -195,10 +195,11 @@ def test_mock_pipeline_serializes_failed_pgo_candidates_and_finite_metrics(
     assert records
     assert all(record["pgo_converged"] is False for record in records)
     assert all(record["score_rover"] is None for record in records)
+    assert all(record["score_rover_source"] is None for record in records)
     assert all(record["pgo_failure_reason"] == "mock pgo failure" for record in records)
     assert all("pgo_error_before" in record and "pgo_error_after" in record for record in records)
-    assert all(math.isinf(record["pgo_error_before"]) for record in records)
-    assert all(math.isinf(record["pgo_error_after"]) for record in records)
+    assert all(record["pgo_error_before"] is None for record in records)
+    assert all(record["pgo_error_after"] is None for record in records)
     assert math.isfinite(result["metrics"]["da3_rover"]["AP"])
     assert math.isfinite(result["metrics"]["da3_rover"]["MR@100P"])
 
@@ -272,6 +273,7 @@ def test_run_cached_sequence_mock_writes_metrics_records_and_artifact_dirs(tmp_p
         "score_salad",
         "score_da3_sim3",
         "score_rover",
+        "score_rover_source",
         "support_idx",
         "support_rejection_reason",
         "support_baseline_m",
@@ -287,6 +289,198 @@ def test_run_cached_sequence_mock_writes_metrics_records_and_artifact_dirs(tmp_p
     assert any(record["query_idx"] == 5 and record["candidate_idx"] == 0 for record in records)
 
 
+def test_support_ensemble_mock_pipeline_emits_fields(tmp_path: Path):
+    sequence_cache = tmp_path / "cache"
+    output_root = tmp_path / "run"
+    _write_tiny_sequence_cache(sequence_cache, keyframe_count=8, positives_by_query={7: [0]})
+
+    result = run_cached_sequence(
+        _cached_config(
+            tmp_path,
+            retrieval_top_k_main=3,
+            support_ensemble={
+                "enabled": True,
+                "support_count": 4,
+            },
+        ),
+        sequence_cache=sequence_cache,
+        output_root=output_root,
+        query_limit=8,
+        backend="mock",
+    )
+
+    records = _read_candidate_records(output_root)
+    assert records
+    scored_records = [
+        record for record in records if record["score_support_ensemble"] is not None
+    ]
+    assert scored_records
+    record = scored_records[0]
+    assert record["support_ensemble_enabled"] is True
+    assert record["support_ensemble_support_count_requested"] == 4
+    assert record["support_ensemble_support_count_used"] >= 1
+    assert isinstance(record["support_ensemble_supports"], list)
+    assert any(
+        "weight" in support and "residual_norm" in support
+        for support in record["support_ensemble_supports"]
+    )
+    assert any(
+        support["weight"] is not None and support["residual_norm"] is not None
+        for support in record["support_ensemble_supports"]
+    )
+    assert len(record["support_ensemble_loop_sigmas"]) == 6
+    assert record["support_ensemble_effective_support_count"] >= 1.0
+    assert record["support_ensemble_graph_evidence_nll"] >= 0.0
+    assert record["score_rover"] is not None
+    assert record["score_rover_source"] == "support_ensemble_loop_factor"
+    assert "DA3-ROVER++ support ensemble graph evidence" in result["metrics"]
+
+
+def test_support_ensemble_calls_da3_once_per_support_triplet(tmp_path: Path):
+    from robust_loop_verifier.da3_runner import MockDa3Runner
+
+    sequence_cache = tmp_path / "cache"
+    output_root = tmp_path / "run"
+    _write_tiny_sequence_cache(sequence_cache, keyframe_count=8, positives_by_query={7: [0]})
+
+    calls = []
+
+    class RecordingRunner:
+        def run_triplet(self, triplet):
+            calls.append(
+                (
+                    tuple(triplet.view_roles),
+                    len(triplet.image_paths),
+                    len(triplet.keyframe_indices),
+                    triplet.keyframe_indices,
+                )
+            )
+            return MockDa3Runner().run_triplet(triplet)
+
+    run_cached_sequence(
+        _cached_config(
+            tmp_path,
+            retrieval_top_k_main=1,
+            support_ensemble={
+                "enabled": True,
+                "support_count": 3,
+            },
+        ),
+        sequence_cache=sequence_cache,
+        output_root=output_root,
+        query_limit=8,
+        backend=RecordingRunner(),
+    )
+
+    assert calls
+    assert all(call[:3] == (("query", "candidate", "support"), 3, 3) for call in calls)
+    assert len({call[3] for call in calls}) == len(calls)
+
+
+def test_support_ensemble_pgo_failure_serializes_sanitized_records(
+    tmp_path: Path,
+    monkeypatch,
+):
+    sequence_cache = tmp_path / "cache"
+    output_root = tmp_path / "run"
+    _write_tiny_sequence_cache(sequence_cache, keyframe_count=8, positives_by_query={7: [0]})
+
+    def fail_support_ensemble_pgo(prefix_indices, odom_poses, *args, **kwargs):
+        return PgoResult(
+            converged=False,
+            optimized_poses=[np.asarray(pose, dtype=np.float64).copy() for pose in odom_poses],
+            error_before=float("inf"),
+            error_after=float("inf"),
+            failure_reason="mock support ensemble pgo failure",
+        )
+
+    monkeypatch.setattr(
+        "robust_loop_verifier.pipeline.run_full_prefix_pgo",
+        fail_support_ensemble_pgo,
+    )
+
+    result = run_cached_sequence(
+        _cached_config(
+            tmp_path,
+            retrieval_top_k_main=3,
+            support_ensemble={
+                "enabled": True,
+                "support_count": 4,
+            },
+        ),
+        sequence_cache=sequence_cache,
+        output_root=output_root,
+        query_limit=8,
+        backend="mock",
+    )
+
+    records = _read_candidate_records(output_root)
+    assert result["candidate_count"] == len(records)
+    assert records
+    assert all(record["score_support_ensemble"] is None for record in records)
+    assert all(record["score_rover"] is None for record in records)
+    assert all(record["score_rover_source"] is None for record in records)
+    assert all(record["pgo_converged"] is False for record in records)
+    assert all(
+        record["pgo_failure_reason"] == "mock support ensemble pgo failure"
+        for record in records
+    )
+    assert all(
+        "pgo: mock support ensemble pgo failure" in record["failure_reasons"]
+        for record in records
+    )
+    assert all(record["pgo_error_before"] is None for record in records)
+    assert all(record["pgo_error_after"] is None for record in records)
+
+
+def test_support_ensemble_disabled_records_keep_default_fields_and_metrics(
+    tmp_path: Path,
+):
+    sequence_cache = tmp_path / "cache"
+    output_root = tmp_path / "run"
+    _write_tiny_sequence_cache(sequence_cache, positives_by_query={5: [1]})
+
+    result = run_cached_sequence(
+        _cached_config(tmp_path),
+        sequence_cache=sequence_cache,
+        output_root=output_root,
+        query_limit=6,
+        backend="mock",
+    )
+
+    records = _read_candidate_records(output_root)
+    assert records
+    record = records[0]
+    assert record["support_ensemble_enabled"] is False
+    assert record["support_ensemble_support_count_requested"] == 1
+    assert record["support_ensemble_support_count_used"] == 0
+    assert record["support_ensemble_supports"] == []
+    assert record["support_ensemble_effective_support_count"] is None
+    assert record["support_ensemble_loop_sigmas"] is None
+    assert record["support_ensemble_sigma_rot"] is None
+    assert record["support_ensemble_sigma_trans"] is None
+    assert record["support_ensemble_uncertainty_logdet_penalty"] is None
+    assert record["support_ensemble_loop_chi2_after"] is None
+    assert record["support_ensemble_odom_strain_chi2_after"] is None
+    assert record["support_ensemble_graph_evidence_nll"] is None
+    assert record["score_support_ensemble"] is None
+    assert any(
+        item["score_rover_source"] == "single_support_loop_factor"
+        for item in records
+        if item["score_rover"] is not None
+    )
+    assert all(
+        item["score_rover_source"] is None
+        for item in records
+        if item["score_rover"] is None
+    )
+    assert set(result["metrics"]) == {
+        "SALAD score only",
+        "SALAD + DA3/Sim3 self-consistency score",
+        "SALAD + DA3-ROVER full-prefix trajectory score",
+    }
+
+
 def test_run_cached_sequence_invalid_backend_fails_before_writing(tmp_path: Path):
     sequence_cache = tmp_path / "cache"
     output_root = tmp_path / "run"
@@ -298,7 +492,7 @@ def test_run_cached_sequence_invalid_backend_fails_before_writing(tmp_path: Path
             sequence_cache=sequence_cache,
             output_root=output_root,
             query_limit=6,
-            backend="legacy",
+            backend="invalid",
         )
 
     assert not output_root.exists()

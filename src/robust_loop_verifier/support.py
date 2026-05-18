@@ -14,6 +14,20 @@ class SupportSelection:
     rejection_reason: str | None = None
 
 
+@dataclass(frozen=True)
+class SupportCandidate:
+    support_idx: int
+    support_baseline_m: float
+
+
+@dataclass(frozen=True)
+class MultiSupportSelection:
+    query_idx: int
+    candidate_idx: int
+    supports: list[SupportCandidate]
+    rejection_reason: str | None = None
+
+
 def _pose_translation(pose) -> np.ndarray:
     pose_array = np.asarray(pose, dtype=np.float64)
     if pose_array.shape != (4, 4):
@@ -23,7 +37,7 @@ def _pose_translation(pose) -> np.ndarray:
     return pose_array[:3, 3]
 
 
-def select_support(
+def select_supports(
     query_idx: int,
     candidate_idx: int,
     available_indices,
@@ -32,13 +46,16 @@ def select_support(
     support_window: int,
     recent_exclusion_keyframes: int,
     min_support_baseline_m: float,
-) -> SupportSelection:
+    support_count: int,
+) -> MultiSupportSelection:
+    if support_count <= 0:
+        raise ValueError("support_count must be positive")
+
     if candidate_idx not in camera_poses:
-        return SupportSelection(
+        return MultiSupportSelection(
             query_idx=query_idx,
             candidate_idx=candidate_idx,
-            support_idx=None,
-            support_baseline_m=None,
+            supports=[],
             rejection_reason="missing_candidate_pose",
         )
 
@@ -46,11 +63,10 @@ def select_support(
     try:
         candidate_translation = _pose_translation(camera_poses[candidate_idx])
     except ValueError:
-        return SupportSelection(
+        return MultiSupportSelection(
             query_idx=query_idx,
             candidate_idx=candidate_idx,
-            support_idx=None,
-            support_baseline_m=None,
+            supports=[],
             rejection_reason="invalid_candidate_pose",
         )
     valid_supports = []
@@ -75,24 +91,63 @@ def select_support(
         if baseline_m < min_support_baseline_m:
             continue
 
-        valid_supports.append((support_idx, baseline_m))
+        valid_supports.append(
+            SupportCandidate(support_idx=support_idx, support_baseline_m=baseline_m)
+        )
 
     if not valid_supports:
-        return SupportSelection(
+        return MultiSupportSelection(
             query_idx=query_idx,
             candidate_idx=candidate_idx,
-            support_idx=None,
-            support_baseline_m=None,
+            supports=[],
             rejection_reason="no_valid_support",
         )
 
-    support_idx, baseline_m = min(
+    ordered_supports = sorted(
         valid_supports,
-        key=lambda support: (abs(support[0] - candidate_idx), support[0]),
+        key=lambda support: (abs(support.support_idx - candidate_idx), support.support_idx),
     )
-    return SupportSelection(
+    return MultiSupportSelection(
         query_idx=query_idx,
         candidate_idx=candidate_idx,
-        support_idx=support_idx,
-        support_baseline_m=baseline_m,
+        supports=ordered_supports[:support_count],
+    )
+
+
+def select_support(
+    query_idx: int,
+    candidate_idx: int,
+    available_indices,
+    image_indices,
+    camera_poses,
+    support_window: int,
+    recent_exclusion_keyframes: int,
+    min_support_baseline_m: float,
+) -> SupportSelection:
+    result = select_supports(
+        query_idx=query_idx,
+        candidate_idx=candidate_idx,
+        available_indices=available_indices,
+        image_indices=image_indices,
+        camera_poses=camera_poses,
+        support_window=support_window,
+        recent_exclusion_keyframes=recent_exclusion_keyframes,
+        min_support_baseline_m=min_support_baseline_m,
+        support_count=1,
+    )
+    if not result.supports:
+        return SupportSelection(
+            query_idx=result.query_idx,
+            candidate_idx=result.candidate_idx,
+            support_idx=None,
+            support_baseline_m=None,
+            rejection_reason=result.rejection_reason,
+        )
+
+    support = result.supports[0]
+    return SupportSelection(
+        query_idx=result.query_idx,
+        candidate_idx=result.candidate_idx,
+        support_idx=support.support_idx,
+        support_baseline_m=support.support_baseline_m,
     )

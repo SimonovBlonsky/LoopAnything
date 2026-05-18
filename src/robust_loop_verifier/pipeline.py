@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -35,12 +36,19 @@ from robust_loop_verifier.retrieval import (
 )
 from robust_loop_verifier.schema import RobustLoopVerifierConfig
 from robust_loop_verifier.sim3_factor import align_triplet_to_candidate_support
-from robust_loop_verifier.support import select_support
+from robust_loop_verifier.support import select_support, select_supports
+from robust_loop_verifier.support_ensemble import (
+    SupportEnsembleConfig,
+    SupportLoopFactor,
+    aggregate_support_loop_factors,
+    graph_evidence_nll,
+)
 
 
 METHOD_SALAD = "SALAD score only"
 METHOD_DA3_SIM3 = "SALAD + DA3/Sim3 self-consistency score"
 METHOD_ROVER = "SALAD + DA3-ROVER full-prefix trajectory score"
+METHOD_SUPPORT_ENSEMBLE = "DA3-ROVER++ support ensemble graph evidence"
 
 
 def run_mock_sequence_evaluation(run_root: Path) -> dict[str, Any]:
@@ -83,11 +91,16 @@ def run_cached_sequence(
     sequence_cache: Path,
     output_root: Path,
     query_limit: int = 20,
-    backend: str = "real",
+    backend: str | Any = "real",
 ) -> dict[str, Any]:
-    """Run the offline verifier against a preprocessed sequence cache."""
+    """Run the offline verifier against a preprocessed sequence cache.
 
-    if backend not in {"mock", "real"}:
+    Non-string ``backend`` values with ``run_triplet`` are a narrow test seam for
+    DA3 runner injection; descriptors still use the deterministic mock backend.
+    """
+
+    injected_da3_runner = _is_da3_runner_injection(backend)
+    if not injected_da3_runner and backend not in {"mock", "real"}:
         raise ValueError("backend must be one of {'mock', 'real'}")
     if query_limit < 0:
         raise ValueError("query_limit must be non-negative")
@@ -120,7 +133,10 @@ def run_cached_sequence(
     ):
         return _write_zero_candidate_run(output_root, config)
 
-    descriptor_backend, da3_runner = _make_backends(config, backend)
+    if injected_da3_runner:
+        descriptor_backend, da3_runner = _MockDescriptorBackend(), backend
+    else:
+        descriptor_backend, da3_runner = _make_backends(config, backend)
     descriptor_set = descriptor_backend.compute(
         [str(keyframe["image_path"]) for keyframe in descriptor_rows],
         image_indices,
@@ -163,14 +179,18 @@ def run_cached_sequence(
             labels.append(label)
             records.append(record)
 
-    metrics = _compute_method_metrics(
-        labels,
-        {
-            METHOD_SALAD: [record["score_salad"] for record in records],
-            METHOD_DA3_SIM3: [record["score_da3_sim3"] for record in records],
-            METHOD_ROVER: [record["score_rover"] for record in records],
-        },
-    )
+    method_scores = {
+        METHOD_SALAD: [record["score_salad"] for record in records],
+        METHOD_DA3_SIM3: [record["score_da3_sim3"] for record in records],
+        METHOD_ROVER: [record["score_rover"] for record in records],
+    }
+    if config.support_ensemble.enabled or any(
+        record["support_ensemble_enabled"] for record in records
+    ):
+        method_scores[METHOD_SUPPORT_ENSEMBLE] = [
+            record["score_support_ensemble"] for record in records
+        ]
+    metrics = _compute_method_metrics(labels, method_scores)
     _write_run_artifacts(output_root, config, records, metrics)
 
     return {
@@ -241,6 +261,7 @@ def _evaluate_candidates(
                 prefix_poses,
                 pgo_result.optimized_poses,
             )
+            score_rover = _score_rover(deformation_rmse, pgo_result.converged)
             records.append(
                 {
                     "query_idx": candidate.query_idx,
@@ -249,7 +270,10 @@ def _evaluate_candidates(
                     "label": label,
                     "salad_score": candidate.score,
                     "trajectory_deformation_rmse": deformation_rmse,
-                    "score_rover": _score_rover(deformation_rmse, pgo_result.converged),
+                    "score_rover": score_rover,
+                    "score_rover_source": (
+                        "single_support_loop_factor" if score_rover is not None else None
+                    ),
                     "pgo_converged": pgo_result.converged,
                     "pgo_error_before": pgo_result.error_before,
                     "pgo_error_after": pgo_result.error_after,
@@ -307,6 +331,7 @@ def _score_candidate(
         "score_salad": float(candidate.score),
         "score_da3_sim3": None,
         "score_rover": None,
+        "score_rover_source": None,
         "support_idx": None,
         "support_rejection_reason": None,
         "support_baseline_m": None,
@@ -320,8 +345,36 @@ def _score_candidate(
         "pgo_error_before": None,
         "pgo_error_after": None,
         "pgo_failure_reason": None,
+        "support_ensemble_enabled": bool(config.support_ensemble.enabled),
+        "support_ensemble_support_count_requested": int(
+            config.support_ensemble.support_count
+        ),
+        "support_ensemble_support_count_used": 0,
+        "support_ensemble_supports": [],
+        "support_ensemble_effective_support_count": None,
+        "support_ensemble_loop_sigmas": None,
+        "support_ensemble_sigma_rot": None,
+        "support_ensemble_sigma_trans": None,
+        "support_ensemble_uncertainty_logdet_penalty": None,
+        "support_ensemble_loop_chi2_after": None,
+        "support_ensemble_odom_strain_chi2_after": None,
+        "support_ensemble_graph_evidence_nll": None,
+        "score_support_ensemble": None,
         "failure_reasons": failure_reasons,
     }
+
+    if config.support_ensemble.enabled:
+        return _score_candidate_with_support_ensemble(
+            config=config,
+            query_idx=query_idx,
+            candidate_idx=candidate_idx,
+            image_by_idx=image_by_idx,
+            odom_by_idx=odom_by_idx,
+            cache_order=cache_order,
+            da3_runner=da3_runner,
+            record=record,
+            failure_reasons=failure_reasons,
+        )
 
     support = select_support(
         query_idx=query_idx,
@@ -401,6 +454,193 @@ def _score_candidate(
         return record
     record["trajectory_deformation_rmse"] = float(deformation_rmse)
     record["score_rover"] = -float(deformation_rmse)
+    record["score_rover_source"] = "single_support_loop_factor"
+    return record
+
+
+def _score_candidate_with_support_ensemble(
+    config: RobustLoopVerifierConfig,
+    query_idx: int,
+    candidate_idx: int,
+    image_by_idx: Mapping[int, Path],
+    odom_by_idx: Mapping[int, np.ndarray],
+    cache_order: Sequence[int],
+    da3_runner,
+    record: dict[str, Any],
+    failure_reasons: list[str],
+) -> dict[str, Any]:
+    support_selection = select_supports(
+        query_idx=query_idx,
+        candidate_idx=candidate_idx,
+        available_indices=cache_order,
+        image_indices=list(image_by_idx),
+        camera_poses=odom_by_idx,
+        support_window=config.support_window,
+        recent_exclusion_keyframes=config.recent_exclusion_keyframes,
+        min_support_baseline_m=config.min_support_baseline_m,
+        support_count=config.support_ensemble.support_count,
+    )
+    if not support_selection.supports:
+        reason = support_selection.rejection_reason or "unknown"
+        record["support_rejection_reason"] = reason
+        failure_reasons.append(f"support_ensemble: {reason}")
+        return record
+
+    first_support = support_selection.supports[0]
+    record["support_idx"] = first_support.support_idx
+    record["support_baseline_m"] = first_support.support_baseline_m
+    record["support_ensemble_support_count_used"] = len(support_selection.supports)
+    support_records = [
+        {
+            "support_idx": support.support_idx,
+            "support_baseline_m": support.support_baseline_m,
+            "sim3_scale": None,
+            "support_alignment_residual_m": None,
+            "direction_error_deg": None,
+        }
+        for support in support_selection.supports
+    ]
+    support_record_by_idx = {
+        support_record["support_idx"]: support_record for support_record in support_records
+    }
+    record["support_ensemble_supports"] = support_records
+
+    valid_factors: list[SupportLoopFactor] = []
+    valid_sim3_results = []
+    for support in support_selection.supports:
+        try:
+            triplet = build_da3_triplet(
+                image_by_idx[query_idx],
+                image_by_idx[candidate_idx],
+                image_by_idx[support.support_idx],
+                query_idx=query_idx,
+                candidate_idx=candidate_idx,
+                support_idx=support.support_idx,
+            )
+            da3_result = da3_runner.run_triplet(triplet)
+        except Exception as exc:
+            failure_reasons.append(
+                f"support_ensemble da3 support {support.support_idx}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            continue
+
+        try:
+            sim3 = align_triplet_to_candidate_support(
+                da3_result.predicted_c2w,
+                odom_by_idx[candidate_idx],
+                odom_by_idx[support.support_idx],
+            )
+        except Exception as exc:
+            failure_reasons.append(
+                f"support_ensemble sim3 support {support.support_idx}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            continue
+
+        support_record = support_record_by_idx[support.support_idx]
+        support_record["sim3_scale"] = sim3.sim3_scale
+        support_record["support_alignment_residual_m"] = sim3.support_alignment_residual_m
+        support_record["direction_error_deg"] = sim3.direction_error_deg
+        if not sim3.valid or sim3.loop_factor is None:
+            reason = sim3.rejection_reason or "unknown"
+            failure_reasons.append(
+                f"support_ensemble sim3 support {support.support_idx}: {reason}"
+            )
+            continue
+
+        valid_factors.append(
+            SupportLoopFactor(
+                support_idx=support.support_idx,
+                loop_factor=sim3.loop_factor,
+                support_alignment_residual_m=float(sim3.support_alignment_residual_m),
+                direction_error_deg=float(sim3.direction_error_deg),
+                candidate_support_baseline_m=float(support.support_baseline_m),
+            )
+        )
+        valid_sim3_results.append((support, sim3))
+
+    if not valid_factors:
+        failure_reasons.append("support_ensemble: no_valid_support_loop_factors")
+        return record
+
+    best_support, best_sim3 = min(
+        valid_sim3_results,
+        key=lambda item: float(item[1].support_alignment_residual_m),
+    )
+    record["support_idx"] = best_support.support_idx
+    record["support_baseline_m"] = best_support.support_baseline_m
+    record["sim3_valid"] = bool(best_sim3.valid)
+    record["sim3_scale"] = best_sim3.sim3_scale
+    record["sim3_support_alignment_residual_m"] = (
+        best_sim3.support_alignment_residual_m
+    )
+    record["sim3_direction_error_deg"] = best_sim3.direction_error_deg
+    record["sim3_rejection_reason"] = best_sim3.rejection_reason
+    record["score_da3_sim3"] = -float(best_sim3.support_alignment_residual_m)
+
+    ensemble = aggregate_support_loop_factors(
+        valid_factors,
+        _support_ensemble_config_from_settings(config),
+    )
+    for support_record in support_records:
+        support_idx = support_record["support_idx"]
+        support_record["weight"] = ensemble.support_weights.get(support_idx)
+        support_record["residual_norm"] = ensemble.support_residual_norms.get(support_idx)
+    if not ensemble.valid or ensemble.loop_factor_mean is None:
+        reason = ensemble.rejection_reason or "unknown"
+        failure_reasons.append(f"support_ensemble: {reason}")
+        return record
+
+    prefix_indices = _prefix_indices_through_query(cache_order, query_idx)
+    prefix_poses = [odom_by_idx[index] for index in prefix_indices]
+    pgo_result = run_full_prefix_pgo(
+        prefix_indices=prefix_indices,
+        odom_poses=prefix_poses,
+        loop_from_idx=query_idx,
+        loop_to_idx=candidate_idx,
+        loop_factor=ensemble.loop_factor_mean,
+        noise=_pgo_noise_from_config(config),
+        loop_sigmas_override=ensemble.loop_sigmas,
+    )
+    record["pgo_converged"] = pgo_result.converged
+    record["pgo_error_before"] = pgo_result.error_before
+    record["pgo_error_after"] = pgo_result.error_after
+    record["pgo_failure_reason"] = pgo_result.failure_reason
+    record["support_ensemble_loop_chi2_after"] = pgo_result.loop_chi2_after
+    record["support_ensemble_odom_strain_chi2_after"] = (
+        pgo_result.odom_strain_chi2_after
+    )
+    record["support_ensemble_effective_support_count"] = (
+        ensemble.effective_support_count
+    )
+    record["support_ensemble_loop_sigmas"] = list(ensemble.loop_sigmas)
+    record["support_ensemble_sigma_rot"] = ensemble.sigma_rot
+    record["support_ensemble_sigma_trans"] = ensemble.sigma_trans
+    record["support_ensemble_uncertainty_logdet_penalty"] = (
+        ensemble.uncertainty_logdet_penalty
+    )
+    if not pgo_result.converged:
+        reason = pgo_result.failure_reason or "unknown"
+        failure_reasons.append(f"pgo: {reason}")
+        return record
+
+    try:
+        deformation_rmse = trajectory_deformation_rmse(prefix_poses, pgo_result.optimized_poses)
+    except ValueError as exc:
+        failure_reasons.append(f"trajectory: {exc}")
+        return record
+    record["trajectory_deformation_rmse"] = float(deformation_rmse)
+    record["score_rover"] = -float(deformation_rmse)
+    record["score_rover_source"] = "support_ensemble_loop_factor"
+
+    graph_nll = graph_evidence_nll(
+        pgo_result.loop_chi2_after,
+        pgo_result.odom_strain_chi2_after,
+        ensemble.uncertainty_logdet_penalty,
+    )
+    record["support_ensemble_graph_evidence_nll"] = graph_nll
+    record["score_support_ensemble"] = -graph_nll if np.isfinite(graph_nll) else None
     return record
 
 
@@ -438,14 +678,14 @@ def _write_zero_candidate_run(
     output_root: Path,
     config: RobustLoopVerifierConfig,
 ) -> dict[str, Any]:
-    metrics = _compute_method_metrics(
-        [],
-        {
-            METHOD_SALAD: [],
-            METHOD_DA3_SIM3: [],
-            METHOD_ROVER: [],
-        },
-    )
+    method_scores = {
+        METHOD_SALAD: [],
+        METHOD_DA3_SIM3: [],
+        METHOD_ROVER: [],
+    }
+    if config.support_ensemble.enabled:
+        method_scores[METHOD_SUPPORT_ENSEMBLE] = []
+    metrics = _compute_method_metrics([], method_scores)
     _write_run_artifacts(output_root, config, [], metrics)
     return {
         "candidate_count": 0,
@@ -490,6 +730,10 @@ def _make_backends(config: RobustLoopVerifierConfig, backend: str):
             ),
         )
     raise ValueError("backend must be one of {'mock', 'real'}")
+
+
+def _is_da3_runner_injection(backend: Any) -> bool:
+    return not isinstance(backend, str) and callable(getattr(backend, "run_triplet", None))
 
 
 class _MockDescriptorBackend:
@@ -567,11 +811,31 @@ def _pgo_noise_from_config(config: RobustLoopVerifierConfig) -> PgoNoise:
     )
 
 
+def _support_ensemble_config_from_settings(
+    config: RobustLoopVerifierConfig,
+) -> SupportEnsembleConfig:
+    settings = config.support_ensemble
+    return SupportEnsembleConfig(
+        sigma_rot_floor=settings.sigma_rot_floor,
+        sigma_trans_floor=settings.sigma_trans_floor,
+        covariance_scale=settings.covariance_scale,
+        c_align=settings.c_align,
+        c_consensus=settings.c_consensus,
+        lambda_dir=settings.lambda_dir,
+        robust_iterations=settings.robust_iterations,
+    )
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, np.ndarray):
-        return value.tolist()
+        return _jsonable(value.tolist())
+    if isinstance(value, np.floating):
+        scalar = float(value)
+        return scalar if math.isfinite(scalar) else None
     if isinstance(value, np.generic):
         return value.item()
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
     if isinstance(value, Mapping):
         return {str(key): _jsonable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -583,4 +847,4 @@ def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as file:
         for row in rows:
-            file.write(json.dumps(row, sort_keys=True) + "\n")
+            file.write(json.dumps(_jsonable(row), allow_nan=False, sort_keys=True) + "\n")
