@@ -15,6 +15,22 @@ from robust_loop_verifier.metrics import (
 
 DEFAULT_GRAPH_WEIGHTS = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0)
 DEFAULT_FUSION_WEIGHTS = (0.0, 0.25, 0.5, 1.0, 2.0, 4.0)
+RANK_PRODUCT_METHODS = (
+    ("rank_product:res,def", ("residual", "deformation")),
+    ("rank_product:salad,def", ("salad", "deformation")),
+    ("rank_product:salad,res", ("salad", "residual")),
+    ("rank_product:salad,res,def", ("salad", "residual", "deformation")),
+)
+PERCENTILE_PRODUCT_METHODS = (
+    ("percentile_product:res,def", ("residual", "deformation")),
+    ("percentile_product:salad,def", ("salad", "deformation")),
+    ("percentile_product:salad,res", ("salad", "residual")),
+    ("percentile_product:salad,res,def", ("salad", "residual", "deformation")),
+)
+PERCENTILE_MIN_METHODS = (
+    ("percentile_min:salad,res,def", ("salad", "residual", "deformation")),
+)
+PERCENTILE_EPS = 1e-6
 
 
 def read_candidate_records(path: Path) -> list[Mapping[str, Any]]:
@@ -58,6 +74,19 @@ def compute_score_sweep(
                 labels,
                 support_ensemble_scores,
             )
+        )
+
+    for name, signal_names in RANK_PRODUCT_METHODS:
+        score_rows.append(
+            _metrics_row(name, labels, _rank_product_scores(records, signal_names))
+        )
+    for name, signal_names in PERCENTILE_PRODUCT_METHODS:
+        score_rows.append(
+            _metrics_row(name, labels, _percentile_product_scores(records, signal_names))
+        )
+    for name, signal_names in PERCENTILE_MIN_METHODS:
+        score_rows.append(
+            _metrics_row(name, labels, _percentile_min_scores(records, signal_names))
         )
 
     graph_weights = _validated_weights(graph_weights, "graph_weights")
@@ -201,6 +230,153 @@ def _salad_scores(records: Sequence[Mapping[str, Any]]) -> list[float | None]:
         value = record.get("score_salad", record.get("salad_score"))
         scores.append(_finite_float_or_none(value))
     return scores
+
+
+def _counterfactual_signals(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, list[float | None]]:
+    return {
+        "salad": _salad_scores(records),
+        "residual": [
+            _negative(_log1p_or_none(record.get("pgo_error_after"))) for record in records
+        ],
+        "deformation": [
+            _negative(_finite_float_or_none(record.get("trajectory_deformation_rmse")))
+            for record in records
+        ],
+    }
+
+
+def _signal_larger_is_better(signal_name: str) -> bool:
+    if signal_name in {"salad", "residual", "deformation"}:
+        return True
+    raise ValueError(f"unknown signal name: {signal_name}")
+
+
+def _rank_product_scores(
+    records: Sequence[Mapping[str, Any]],
+    signal_names: Sequence[str],
+) -> list[float | None]:
+    signals = _counterfactual_signals(records)
+    groups = _query_groups(records)
+    scores: list[float | None] = [None for _ in records]
+    for indices in groups:
+        query_size = len(indices)
+        ranks_by_signal = {
+            signal_name: _query_signal_ranks(
+                [signals[signal_name][index] for index in indices],
+                larger_is_better=_signal_larger_is_better(signal_name),
+                invalid_rank=query_size + 1,
+            )
+            for signal_name in signal_names
+        }
+        for local_offset, record_index in enumerate(indices):
+            rank_sum = 0.0
+            for signal_name in signal_names:
+                rank_sum += math.log(float(ranks_by_signal[signal_name][local_offset]))
+            scores[record_index] = -rank_sum
+    return scores
+
+
+def _percentile_product_scores(
+    records: Sequence[Mapping[str, Any]],
+    signal_names: Sequence[str],
+) -> list[float | None]:
+    percentiles = _percentile_features(records)
+    scores: list[float | None] = []
+    for index in range(len(records)):
+        value = 0.0
+        for signal_name in signal_names:
+            value += math.log(PERCENTILE_EPS + percentiles[signal_name][index])
+        scores.append(value)
+    return scores
+
+
+def _percentile_min_scores(
+    records: Sequence[Mapping[str, Any]],
+    signal_names: Sequence[str],
+) -> list[float | None]:
+    percentiles = _percentile_features(records)
+    scores: list[float | None] = []
+    for index in range(len(records)):
+        scores.append(min(percentiles[signal_name][index] for signal_name in signal_names))
+    return scores
+
+
+def _percentile_features(
+    records: Sequence[Mapping[str, Any]],
+) -> dict[str, list[float]]:
+    signals = _counterfactual_signals(records)
+    return {
+        signal_name: _empirical_percentiles(values)
+        for signal_name, values in signals.items()
+    }
+
+
+def _empirical_percentiles(values: Sequence[float | None]) -> list[float]:
+    valid = sorted(
+        float(value)
+        for value in values
+        if value is not None and math.isfinite(float(value))
+    )
+    if not valid:
+        return [0.0 for _ in values]
+    denominator = float(len(valid))
+    percentiles: list[float] = []
+    for value in values:
+        if value is None or not math.isfinite(float(value)):
+            percentiles.append(0.0)
+            continue
+        count_less_equal = _count_less_equal(valid, float(value))
+        percentiles.append(count_less_equal / denominator)
+    return percentiles
+
+
+def _count_less_equal(sorted_values: Sequence[float], value: float) -> int:
+    left = 0
+    right = len(sorted_values)
+    while left < right:
+        middle = (left + right) // 2
+        if sorted_values[middle] <= value:
+            left = middle + 1
+        else:
+            right = middle
+    return left
+
+
+def _query_groups(records: Sequence[Mapping[str, Any]]) -> list[list[int]]:
+    groups_by_query: dict[int, list[int]] = {}
+    fallback_query = -1
+    for index, record in enumerate(records):
+        query_idx = record.get("query_idx")
+        if query_idx is None:
+            query_idx = fallback_query
+            fallback_query -= 1
+        groups_by_query.setdefault(int(query_idx), []).append(index)
+    return list(groups_by_query.values())
+
+
+def _query_signal_ranks(
+    values: Sequence[float | None],
+    *,
+    larger_is_better: bool,
+    invalid_rank: int,
+) -> list[int]:
+    valid = [
+        (index, float(value))
+        for index, value in enumerate(values)
+        if value is not None and math.isfinite(float(value))
+    ]
+    valid.sort(key=lambda item: item[1], reverse=larger_is_better)
+    ranks = [invalid_rank for _ in values]
+    current_rank = 1
+    previous_value: float | None = None
+    for offset, (index, value) in enumerate(valid):
+        if previous_value is None or value != previous_value:
+            current_rank = offset + 1
+            previous_value = value
+        ranks[index] = current_rank
+    return ranks
 
 
 def _z_scores(values: Sequence[float | None]) -> list[float | None]:

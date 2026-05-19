@@ -57,7 +57,7 @@ def test_residual_aware_sweep_finds_graph_score_above_salad():
     assert metrics_by_name["SALAD score only"]["AP"] < 1.0
     assert metrics_by_name["raw_graph:def=1,res=1"]["AP"] == 1.0
     assert metrics_by_name["raw_graph:def=1,res=1"]["MR@100P"] == 1.0
-    assert result["best_by_ap"]["name"] == "raw_graph:def=1,res=1"
+    assert result["best_by_ap"]["AP"] == 1.0
     assert result["best_by_mr"]["MR@100P"] == 1.0
 
 
@@ -115,6 +115,98 @@ def test_score_sweep_reports_support_ensemble_score_when_present():
     support_ensemble_row = rows_by_name["DA3-ROVER++ support ensemble graph evidence"]
     assert math.isfinite(support_ensemble_row["AP"])
     assert math.isfinite(support_ensemble_row["MR@100P"])
+
+
+def test_rank_product_res_def_reranks_within_each_query():
+    from robust_loop_verifier.score_sweep import compute_score_sweep
+
+    records = [
+        {
+            "query_idx": 10,
+            "candidate_idx": 1,
+            "label": False,
+            "score_salad": 0.99,
+            "trajectory_deformation_rmse": 2.0,
+            "pgo_error_after": 6.0,
+        },
+        {
+            "query_idx": 10,
+            "candidate_idx": 2,
+            "label": True,
+            "score_salad": 0.70,
+            "trajectory_deformation_rmse": 0.1,
+            "pgo_error_after": 0.1,
+        },
+        {
+            "query_idx": 11,
+            "candidate_idx": 3,
+            "label": False,
+            "score_salad": 0.95,
+            "trajectory_deformation_rmse": 1.5,
+            "pgo_error_after": 4.0,
+        },
+        {
+            "query_idx": 11,
+            "candidate_idx": 4,
+            "label": True,
+            "score_salad": 0.60,
+            "trajectory_deformation_rmse": 0.2,
+            "pgo_error_after": 0.2,
+        },
+    ]
+
+    result = compute_score_sweep(records, graph_weights=(1.0,), fusion_weights=(1.0,))
+    rows = {row["name"]: row for row in result["scores"]}
+
+    assert rows["SALAD score only"]["AP"] < 1.0
+    assert rows["rank_product:res,def"]["AP"] == 1.0
+    assert rows["rank_product:res,def"]["MR@100P"] == 1.0
+
+
+def test_percentile_product_scores_global_candidate_distribution():
+    from robust_loop_verifier.score_sweep import compute_score_sweep
+
+    records = [
+        {
+            "query_idx": 10,
+            "candidate_idx": 1,
+            "label": False,
+            "score_salad": 0.99,
+            "trajectory_deformation_rmse": 2.0,
+            "pgo_error_after": 6.0,
+        },
+        {
+            "query_idx": 10,
+            "candidate_idx": 2,
+            "label": True,
+            "score_salad": 0.70,
+            "trajectory_deformation_rmse": 0.1,
+            "pgo_error_after": 0.1,
+        },
+        {
+            "query_idx": 11,
+            "candidate_idx": 3,
+            "label": False,
+            "score_salad": 0.95,
+            "trajectory_deformation_rmse": 1.5,
+            "pgo_error_after": 4.0,
+        },
+        {
+            "query_idx": 11,
+            "candidate_idx": 4,
+            "label": True,
+            "score_salad": 0.60,
+            "trajectory_deformation_rmse": 0.2,
+            "pgo_error_after": 0.2,
+        },
+    ]
+
+    result = compute_score_sweep(records, graph_weights=(1.0,), fusion_weights=(1.0,))
+    rows = {row["name"]: row for row in result["scores"]}
+
+    assert rows["percentile_product:res,def"]["AP"] == 1.0
+    assert rows["percentile_product:res,def"]["MR@100P"] == 1.0
+    assert rows["percentile_min:salad,res,def"]["AP"] < 1.0
 
 
 def test_score_sweep_omits_support_ensemble_score_when_absent_or_all_none():
@@ -180,5 +272,8 @@ def test_sweep_scores_cli_writes_json_and_markdown(tmp_path):
     assert sweep_json.is_file()
     assert sweep_md.is_file()
     payload = json.loads(sweep_json.read_text(encoding="utf-8"))
-    assert payload["best_by_ap"]["name"] == "raw_graph:def=1,res=1"
-    assert "| raw_graph:def=1,res=1 |" in sweep_md.read_text(encoding="utf-8")
+    assert payload["best_by_ap"]["AP"] == 1.0
+    markdown = sweep_md.read_text(encoding="utf-8")
+    assert "| raw_graph:def=1,res=1 |" in markdown
+    assert "| rank_product:res,def |" in markdown
+    assert "| percentile_product:res,def |" in markdown

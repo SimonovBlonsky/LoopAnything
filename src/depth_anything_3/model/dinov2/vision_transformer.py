@@ -324,7 +324,7 @@ class DinoVisionTransformer(nn.Module):
                 # 在进入 camera token / cross-view attention 之前先选参考视角，
                 # 这样后续的“第 0 个视角”就有了稳定语义。
                 strategy = kwargs.get("ref_view_strategy", "saddle_balanced")
-                logger.info(f"Selecting reference view using strategy: {strategy}")
+                # logger.info(f"Selecting reference view using strategy: {strategy}")
                 b_idx = select_reference_view(x, strategy=strategy)
                 # 把选中的参考视角换到最前面，其余视角保持原相对顺序。
                 x = reorder_by_reference(x, b_idx)
