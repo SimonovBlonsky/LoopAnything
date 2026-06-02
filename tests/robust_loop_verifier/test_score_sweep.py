@@ -209,6 +209,174 @@ def test_percentile_product_scores_global_candidate_distribution():
     assert rows["percentile_min:salad,res,def"]["AP"] < 1.0
 
 
+def test_query_percentile_product_scores_within_each_query():
+    from robust_loop_verifier.score_sweep import compute_score_sweep
+
+    records = [
+        {
+            "query_idx": 10,
+            "candidate_idx": 1,
+            "label": False,
+            "score_salad": 0.99,
+            "trajectory_deformation_rmse": 2.0,
+            "pgo_error_after": 6.0,
+        },
+        {
+            "query_idx": 10,
+            "candidate_idx": 2,
+            "label": True,
+            "score_salad": 0.70,
+            "trajectory_deformation_rmse": 0.1,
+            "pgo_error_after": 0.1,
+        },
+        {
+            "query_idx": 11,
+            "candidate_idx": 3,
+            "label": False,
+            "score_salad": 0.95,
+            "trajectory_deformation_rmse": 1.5,
+            "pgo_error_after": 4.0,
+        },
+        {
+            "query_idx": 11,
+            "candidate_idx": 4,
+            "label": True,
+            "score_salad": 0.60,
+            "trajectory_deformation_rmse": 0.2,
+            "pgo_error_after": 0.2,
+        },
+    ]
+
+    result = compute_score_sweep(records, graph_weights=(1.0,), fusion_weights=(1.0,))
+    rows = {row["name"]: row for row in result["scores"]}
+
+    assert rows["SALAD score only"]["AP"] < 1.0
+    assert rows["query_percentile_product:res,def"]["AP"] == 1.0
+    assert rows["query_percentile_product:res,def"]["MR@100P"] == 1.0
+
+
+def test_absolute_graph_score_is_causal_residual_deformation_evidence():
+    from robust_loop_verifier.score_sweep import compute_score_sweep
+
+    records = [
+        {
+            "query_idx": 10,
+            "candidate_idx": 1,
+            "label": False,
+            "score_salad": 0.99,
+            "trajectory_deformation_rmse": 2.0,
+            "pgo_error_after": 6.0,
+        },
+        {
+            "query_idx": 10,
+            "candidate_idx": 2,
+            "label": True,
+            "score_salad": 0.70,
+            "trajectory_deformation_rmse": 0.1,
+            "pgo_error_after": 0.1,
+        },
+    ]
+
+    result = compute_score_sweep(records, graph_weights=(1.0,), fusion_weights=(1.0,))
+    rows = {row["name"]: row for row in result["scores"]}
+
+    assert rows["absolute_graph:def=1,res=1"]["AP"] == 1.0
+    assert rows["absolute_graph:def=1,res=1"]["MR@100P"] == 1.0
+
+
+def test_history_calibrated_scores_use_past_queries_only():
+    from robust_loop_verifier.score_sweep import _history_robust_z_fusion_scores
+
+    current_query = [
+        {
+            "query_idx": 10,
+            "candidate_idx": 1,
+            "label": False,
+            "score_salad": 0.50,
+            "trajectory_deformation_rmse": 1.0,
+            "pgo_error_after": 1.0,
+        },
+        {
+            "query_idx": 10,
+            "candidate_idx": 2,
+            "label": True,
+            "score_salad": 0.60,
+            "trajectory_deformation_rmse": 0.5,
+            "pgo_error_after": 0.5,
+        },
+    ]
+    future_query = [
+        {
+            "query_idx": 11,
+            "candidate_idx": 3,
+            "label": False,
+            "score_salad": 0.10,
+            "trajectory_deformation_rmse": 100.0,
+            "pgo_error_after": 100.0,
+        },
+    ]
+
+    scores_without_future = _history_robust_z_fusion_scores(
+        current_query,
+        salad_weight=0.0,
+        deformation_weight=1.0,
+        residual_weight=1.0,
+    )
+    scores_with_future = _history_robust_z_fusion_scores(
+        current_query + future_query,
+        salad_weight=0.0,
+        deformation_weight=1.0,
+        residual_weight=1.0,
+    )
+
+    assert scores_with_future[:2] == scores_without_future
+
+
+def test_query_gate_graph_score_lowers_no_loop_queries():
+    from robust_loop_verifier.score_sweep import compute_score_sweep
+
+    records = [
+        {
+            "query_idx": 10,
+            "candidate_idx": 1,
+            "label": True,
+            "score_salad": 0.70,
+            "trajectory_deformation_rmse": 0.1,
+            "pgo_error_after": 0.1,
+        },
+        {
+            "query_idx": 10,
+            "candidate_idx": 2,
+            "label": False,
+            "score_salad": 0.99,
+            "trajectory_deformation_rmse": 2.0,
+            "pgo_error_after": 6.0,
+        },
+        {
+            "query_idx": 11,
+            "candidate_idx": 3,
+            "label": False,
+            "score_salad": 0.95,
+            "trajectory_deformation_rmse": 1.5,
+            "pgo_error_after": 4.0,
+        },
+        {
+            "query_idx": 11,
+            "candidate_idx": 4,
+            "label": False,
+            "score_salad": 0.94,
+            "trajectory_deformation_rmse": 1.6,
+            "pgo_error_after": 4.5,
+        },
+    ]
+
+    result = compute_score_sweep(records, graph_weights=(1.0,), fusion_weights=(1.0,))
+    rows = {row["name"]: row for row in result["scores"]}
+
+    assert rows["query_gate_graph:def=1,res=1,margin=1"]["AP"] == 1.0
+    assert rows["query_gate_graph:def=1,res=1,margin=1"]["MR@100P"] == 1.0
+
+
 def test_score_sweep_omits_support_ensemble_score_when_absent_or_all_none():
     from robust_loop_verifier.score_sweep import compute_score_sweep
 
@@ -276,4 +444,5 @@ def test_sweep_scores_cli_writes_json_and_markdown(tmp_path):
     markdown = sweep_md.read_text(encoding="utf-8")
     assert "| raw_graph:def=1,res=1 |" in markdown
     assert "| rank_product:res,def |" in markdown
+    assert "| query_percentile_product:res,def |" in markdown
     assert "| percentile_product:res,def |" in markdown
