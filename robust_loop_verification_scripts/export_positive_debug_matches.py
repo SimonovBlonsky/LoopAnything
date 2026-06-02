@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import shutil
 from pathlib import Path
@@ -120,12 +121,20 @@ def _read_jsonl(path: Path):
 
 def _match_dir_name(query_idx: int, candidate_indices: list[int]) -> str:
     candidates = "-".join(f"{candidate_idx:06d}" for candidate_idx in candidate_indices)
-    return f"q{query_idx:06d}__c{candidates}"
+    name = f"q{query_idx:06d}__c{candidates}"
+    if len(name) <= 120:
+        return name
+
+    digest = hashlib.sha1(candidates.encode("ascii")).hexdigest()[:10]
+    preview = "-".join(f"{candidate_idx:06d}" for candidate_idx in candidate_indices[:8])
+    return f"q{query_idx:06d}__n{len(candidate_indices):03d}__c{preview}__h{digest}"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Export query/candidate images for each positive label row in a sequence cache."
+        description=(
+            "Export query/candidate images for each positive label row in a sequence cache."
+        )
     )
     parser.add_argument(
         "sequence_cache",
