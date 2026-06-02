@@ -91,6 +91,49 @@ def test_fusionportablev2_defaults_include_requested_platform_sequences(tmp_path
     assert specs[0].sequence == "handheld_escalator00"
 
 
+def test_defaults_include_geode_and_ntu_viral_main_experiment_sequences(tmp_path):
+    module = _load_module()
+
+    geode_cache = _write_sequence_cache(tmp_path, "Offroad", "Offroad02_beta")
+    ntu_cache = _write_sequence_cache(tmp_path, "NTU-VIRAL", "eee_02")
+
+    geode_specs = module.resolve_sequence_specs(
+        dataset="geode",
+        cache_root=tmp_path,
+        platforms=["Offroad"],
+        strict=True,
+    )
+    ntu_specs = module.resolve_sequence_specs(
+        dataset="ntu_viral",
+        cache_root=tmp_path,
+        platforms=["NTU-VIRAL"],
+        strict=False,
+    )
+
+    assert [spec.sequence_cache for spec in geode_specs] == [geode_cache]
+    assert [spec.sequence_cache for spec in ntu_specs] == [ntu_cache]
+
+
+def test_evaluate_sequence_specs_keep_going_records_failed_sequence(tmp_path):
+    module = _load_module()
+    specs = [
+        module.SequenceSpec("handheld", "bad", tmp_path / "bad"),
+        module.SequenceSpec("handheld", "good", tmp_path / "good"),
+    ]
+
+    def evaluate(spec):
+        if spec.sequence == "bad":
+            raise RuntimeError("broken sequence")
+        return spec.sequence
+
+    results, failures = module.evaluate_sequence_specs(specs, evaluate, keep_going=True)
+
+    assert results == ["good"]
+    assert failures == [
+        {"platform": "handheld", "sequence": "bad", "error": "broken sequence"}
+    ]
+
+
 def test_evaluate_sequence_uses_causal_netvlad_topk_and_main_metrics(tmp_path):
     module = _load_module()
     sequence_cache = _write_sequence_cache(tmp_path, "handheld", "handheld_escalator00")

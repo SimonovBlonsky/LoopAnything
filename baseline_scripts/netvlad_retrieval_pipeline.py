@@ -33,6 +33,8 @@ DEFAULT_CACHE_ROOTS = {
     "fusionportablev2": Path(
         "/data/datasets/FusionPortable/robust_loop_verifier_cache/FusionPortableV2"
     ),
+    "geode": Path("/data/datasets/GEODE/robust_loop_verifier_cache/GEODE"),
+    "ntu_viral": Path("/data/datasets/NTU-VIRAL/robust_loop_verifier_cache/NTU-VIRAL"),
 }
 
 DEFAULT_SEQUENCES_BY_PLATFORM = {
@@ -51,9 +53,22 @@ DEFAULT_SEQUENCES_BY_PLATFORM = {
         "ugv_parking03",
     ],
 }
+DEFAULT_SEQUENCES_BY_DATASET = {
+    "fusionportablev2": DEFAULT_SEQUENCES_BY_PLATFORM,
+    "geode": {"Offroad": ["Offroad02_beta"]},
+    "ntu_viral": {
+        "NTU-VIRAL": ["eee_01", "eee_02", "nya_01", "nya_02", "nya_03"],
+    },
+}
 
 DATASET_CHOICES = tuple(DEFAULT_CACHE_ROOTS)
-PLATFORM_CHOICES = tuple(DEFAULT_SEQUENCES_BY_PLATFORM)
+PLATFORM_CHOICES = tuple(
+    dict.fromkeys(
+        platform
+        for sequences_by_platform in DEFAULT_SEQUENCES_BY_DATASET.values()
+        for platform in sequences_by_platform
+    )
+)
 METHOD_NAME = "NetVLAD score only"
 
 
@@ -138,10 +153,11 @@ def resolve_sequence_specs(
 
     specs: list[SequenceSpec] = []
     missing: list[Path] = []
+    sequences_by_platform = DEFAULT_SEQUENCES_BY_DATASET[dataset]
     for platform in platforms:
-        if platform not in DEFAULT_SEQUENCES_BY_PLATFORM:
-            raise ValueError(f"Unsupported platform: {platform}")
-        sequence_names = list(sequences) if sequences else DEFAULT_SEQUENCES_BY_PLATFORM[platform]
+        if platform not in sequences_by_platform:
+            raise ValueError(f"Unsupported platform for {dataset}: {platform}")
+        sequence_names = list(sequences) if sequences else sequences_by_platform[platform]
         for sequence in sequence_names:
             sequence_cache = Path(cache_root) / platform / sequence
             required_files = [
@@ -304,7 +320,28 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--run-name", default=None)
     parser.add_argument("--strict", action="store_true")
+    parser.add_argument("--keep-going", action="store_true")
     return parser
+
+
+def evaluate_sequence_specs(sequence_specs, evaluate, *, keep_going: bool):
+    results = []
+    failures = []
+    for spec in sequence_specs:
+        print(f"[run] {spec.platform}/{spec.sequence}")
+        try:
+            results.append(evaluate(spec))
+        except Exception as error:
+            if not keep_going:
+                raise
+            failure = {
+                "platform": spec.platform,
+                "sequence": spec.sequence,
+                "error": str(error),
+            }
+            failures.append(failure)
+            print(f"[error] {spec.platform}/{spec.sequence}: {error}", file=sys.stderr)
+    return results, failures
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -315,7 +352,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("--recent-exclusion-keyframes must be non-negative")
 
     cache_root = Path(args.cache_root or DEFAULT_CACHE_ROOTS[args.dataset])
-    platforms = list(args.platform or PLATFORM_CHOICES)
+    platforms = list(args.platform or DEFAULT_SEQUENCES_BY_DATASET[args.dataset])
     sequence_specs = resolve_sequence_specs(
         dataset=args.dataset,
         cache_root=cache_root,
@@ -327,24 +364,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise FileNotFoundError(f"No valid sequence caches found under {cache_root}")
 
     descriptor_backend = NetVladDescriptorBackend(args.netvlad_root, args.device)
-    results = []
-    for spec in sequence_specs:
-        print(f"[run] {spec.platform}/{spec.sequence}")
-        results.append(
-            evaluate_sequence(
-                spec,
-                descriptor_backend=descriptor_backend,
-                top_k=args.top_k,
-                recent_exclusion_keyframes=args.recent_exclusion_keyframes,
-            )
-        )
+    results, failures = evaluate_sequence_specs(
+        sequence_specs,
+        lambda spec: evaluate_sequence(
+            spec,
+            descriptor_backend=descriptor_backend,
+            top_k=args.top_k,
+            recent_exclusion_keyframes=args.recent_exclusion_keyframes,
+        ),
+        keep_going=args.keep_going,
+    )
 
     summary = summarize_results(results)
+    summary["failures"] = failures
     run_name = args.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = Path(args.output_root) / args.dataset / run_name
     write_outputs(output_dir, summary)
     _print_summary(summary, output_dir)
-    return 0
+    return 1 if failures else 0
 
 
 def _read_keyframes(sequence_cache: Path) -> list[tuple[int, Path]]:
