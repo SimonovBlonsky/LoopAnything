@@ -28,3 +28,4 @@ pgo_noise:
 da3:
   process_res: 504
   ref_view_strategy: first
+  triplet_batch_size: 4

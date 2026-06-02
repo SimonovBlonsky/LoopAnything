@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -92,6 +93,7 @@ def run_cached_sequence(
     output_root: Path,
     query_limit: int = 20,
     backend: str | Any = "real",
+    collect_timing: bool = False,
 ) -> dict[str, Any]:
     """Run the offline verifier against a preprocessed sequence cache.
 
@@ -104,6 +106,7 @@ def run_cached_sequence(
         raise ValueError("backend must be one of {'mock', 'real'}")
     if query_limit < 0:
         raise ValueError("query_limit must be non-negative")
+    timing = _new_timing_accumulator() if collect_timing else None
 
     output_root = Path(output_root)
     _prepare_run_root(output_root)
@@ -118,7 +121,7 @@ def run_cached_sequence(
     descriptor_rows = [keyframe for keyframe in keyframes if keyframe["image_path"] is not None]
 
     if not selected_keyframes or not descriptor_rows:
-        return _write_zero_candidate_run(output_root, config)
+        return _write_zero_candidate_run(output_root, config, timing=timing)
 
     image_indices = [int(keyframe["idx"]) for keyframe in descriptor_rows]
     selected_query_indices = [
@@ -131,16 +134,18 @@ def run_cached_sequence(
         image_indices,
         config.recent_exclusion_keyframes,
     ):
-        return _write_zero_candidate_run(output_root, config)
+        return _write_zero_candidate_run(output_root, config, timing=timing)
 
     if injected_da3_runner:
         descriptor_backend, da3_runner = _MockDescriptorBackend(), backend
     else:
         descriptor_backend, da3_runner = _make_backends(config, backend)
+    descriptor_start = _timing_start(timing)
     descriptor_set = descriptor_backend.compute(
         [str(keyframe["image_path"]) for keyframe in descriptor_rows],
         image_indices,
     )
+    _record_timing(timing, "descriptor_compute", descriptor_start)
 
     image_by_idx = {
         int(keyframe["idx"]): Path(keyframe["image_path"])
@@ -158,26 +163,45 @@ def run_cached_sequence(
         query_idx = int(query["idx"])
         if query_idx not in descriptor_set.keyframe_indices:
             continue
+        retrieval_start = _timing_start(timing)
         retrieval = retrieve_historical_topk(
             query_idx=query_idx,
             descriptors=descriptor_set,
             top_k=config.retrieval_top_k_main,
             recent_exclusion_keyframes=config.recent_exclusion_keyframes,
         )
+        _record_timing(timing, "retrieval_search", retrieval_start)
         positive_indices = positives_by_query.get(query_idx, set())
-        for candidate in retrieval.candidates:
-            label = candidate.candidate_idx in positive_indices
-            record = _score_candidate(
-                config=config,
-                candidate=candidate,
-                label=label,
-                image_by_idx=image_by_idx,
-                odom_by_idx=odom_by_idx,
-                cache_order=cache_order,
-                da3_runner=da3_runner,
-            )
-            labels.append(label)
-            records.append(record)
+        candidates = list(retrieval.candidates)
+        if config.support_ensemble.enabled:
+            for candidate in candidates:
+                label = candidate.candidate_idx in positive_indices
+                record = _score_candidate(
+                    config=config,
+                    candidate=candidate,
+                    label=label,
+                    image_by_idx=image_by_idx,
+                    odom_by_idx=odom_by_idx,
+                    cache_order=cache_order,
+                    da3_runner=da3_runner,
+                    timing=timing,
+                )
+                labels.append(label)
+                records.append(record)
+            continue
+
+        query_records = _score_candidates_with_batched_triplets(
+            config=config,
+            candidates=candidates,
+            positive_indices=positive_indices,
+            image_by_idx=image_by_idx,
+            odom_by_idx=odom_by_idx,
+            cache_order=cache_order,
+            da3_runner=da3_runner,
+            timing=timing,
+        )
+        records.extend(query_records)
+        labels.extend(bool(record["label"]) for record in query_records)
 
     method_scores = {
         METHOD_SALAD: [record["score_salad"] for record in records],
@@ -190,13 +214,23 @@ def run_cached_sequence(
         method_scores[METHOD_SUPPORT_ENSEMBLE] = [
             record["score_support_ensemble"] for record in records
         ]
+    metrics_start = _timing_start(timing)
     metrics = _compute_method_metrics(labels, method_scores)
-    _write_run_artifacts(output_root, config, records, metrics)
+    _record_timing(timing, "metrics", metrics_start)
+    timing_summary = _timing_summary(
+        timing,
+        query_count=len(selected_query_indices),
+        candidate_count=len(records),
+    )
+    _write_run_artifacts(output_root, config, records, metrics, timing_summary=timing_summary)
 
-    return {
+    result = {
         "candidate_count": len(records),
         "metrics": metrics,
     }
+    if timing_summary is not None:
+        result["timing"] = timing_summary
+    return result
 
 
 def _synthetic_bent_poses() -> list[np.ndarray]:
@@ -310,21 +344,15 @@ def _score_rover(deformation_rmse: float, pgo_converged: bool) -> float | None:
     return -float(deformation_rmse)
 
 
-def _score_candidate(
+def _new_candidate_record(
     config: RobustLoopVerifierConfig,
     candidate,
     label: bool,
-    image_by_idx: Mapping[int, Path],
-    odom_by_idx: Mapping[int, np.ndarray],
-    cache_order: Sequence[int],
-    da3_runner,
+    failure_reasons: list[str],
 ) -> dict[str, Any]:
-    query_idx = int(candidate.query_idx)
-    candidate_idx = int(candidate.candidate_idx)
-    failure_reasons: list[str] = []
-    record = {
-        "query_idx": query_idx,
-        "candidate_idx": candidate_idx,
+    return {
+        "query_idx": int(candidate.query_idx),
+        "candidate_idx": int(candidate.candidate_idx),
         "rank": int(candidate.rank),
         "label": bool(label),
         "salad_score": float(candidate.score),
@@ -363,8 +391,26 @@ def _score_candidate(
         "failure_reasons": failure_reasons,
     }
 
+
+def _score_candidate(
+    config: RobustLoopVerifierConfig,
+    candidate,
+    label: bool,
+    image_by_idx: Mapping[int, Path],
+    odom_by_idx: Mapping[int, np.ndarray],
+    cache_order: Sequence[int],
+    da3_runner,
+    timing: dict[str, list[float]] | None = None,
+) -> dict[str, Any]:
+    query_idx = int(candidate.query_idx)
+    candidate_idx = int(candidate.candidate_idx)
+    failure_reasons: list[str] = []
+    candidate_start = _timing_start(timing)
+    record = _new_candidate_record(config, candidate, label, failure_reasons)
+    _init_record_timing(record, timing)
+
     if config.support_ensemble.enabled:
-        return _score_candidate_with_support_ensemble(
+        record = _score_candidate_with_support_ensemble(
             config=config,
             query_idx=query_idx,
             candidate_idx=candidate_idx,
@@ -374,8 +420,11 @@ def _score_candidate(
             da3_runner=da3_runner,
             record=record,
             failure_reasons=failure_reasons,
+            timing=timing,
         )
+        return _finish_candidate_timing(record, timing, candidate_start)
 
+    support_start = _timing_start(timing)
     support = select_support(
         query_idx=query_idx,
         candidate_idx=candidate_idx,
@@ -386,15 +435,17 @@ def _score_candidate(
         recent_exclusion_keyframes=config.recent_exclusion_keyframes,
         min_support_baseline_m=config.min_support_baseline_m,
     )
+    _record_record_timing(record, timing, "support_selection", support_start)
     record["support_idx"] = support.support_idx
     record["support_baseline_m"] = support.support_baseline_m
     record["support_rejection_reason"] = support.rejection_reason
     if support.support_idx is None:
         reason = support.rejection_reason or "unknown"
         failure_reasons.append(f"support: {reason}")
-        return record
+        return _finish_candidate_timing(record, timing, candidate_start)
 
     try:
+        da3_start = _timing_start(timing)
         triplet = build_da3_triplet(
             image_by_idx[query_idx],
             image_by_idx[candidate_idx],
@@ -404,19 +455,52 @@ def _score_candidate(
             support_idx=support.support_idx,
         )
         da3_result = da3_runner.run_triplet(triplet)
+        _record_record_timing(record, timing, "da3_triplet", da3_start)
     except Exception as exc:
+        _record_record_timing(record, timing, "da3_triplet", da3_start)
         failure_reasons.append(f"da3: {type(exc).__name__}: {exc}")
-        return record
+        return _finish_candidate_timing(record, timing, candidate_start)
 
+    return _score_single_support_candidate_after_da3(
+        config=config,
+        query_idx=query_idx,
+        candidate_idx=candidate_idx,
+        support_idx=support.support_idx,
+        odom_by_idx=odom_by_idx,
+        cache_order=cache_order,
+        da3_result=da3_result,
+        record=record,
+        failure_reasons=failure_reasons,
+        timing=timing,
+        candidate_start=candidate_start,
+    )
+
+
+def _score_single_support_candidate_after_da3(
+    config: RobustLoopVerifierConfig,
+    query_idx: int,
+    candidate_idx: int,
+    support_idx: int,
+    odom_by_idx: Mapping[int, np.ndarray],
+    cache_order: Sequence[int],
+    da3_result,
+    record: dict[str, Any],
+    failure_reasons: list[str],
+    timing: dict[str, list[float]] | None,
+    candidate_start: float | None,
+) -> dict[str, Any]:
     try:
+        sim3_start = _timing_start(timing)
         sim3 = align_triplet_to_candidate_support(
             da3_result.predicted_c2w,
             odom_by_idx[candidate_idx],
-            odom_by_idx[support.support_idx],
+            odom_by_idx[support_idx],
         )
+        _record_record_timing(record, timing, "sim3_alignment", sim3_start)
     except Exception as exc:
+        _record_record_timing(record, timing, "sim3_alignment", sim3_start)
         failure_reasons.append(f"sim3: {type(exc).__name__}: {exc}")
-        return record
+        return _finish_candidate_timing(record, timing, candidate_start)
     record["sim3_valid"] = bool(sim3.valid)
     record["sim3_scale"] = sim3.sim3_scale
     record["sim3_support_alignment_residual_m"] = sim3.support_alignment_residual_m
@@ -425,11 +509,12 @@ def _score_candidate(
     if not sim3.valid or sim3.loop_factor is None:
         reason = sim3.rejection_reason or "unknown"
         failure_reasons.append(f"sim3: {reason}")
-        return record
+        return _finish_candidate_timing(record, timing, candidate_start)
     record["score_da3_sim3"] = -float(sim3.support_alignment_residual_m)
 
     prefix_indices = _prefix_indices_through_query(cache_order, query_idx)
     prefix_poses = [odom_by_idx[index] for index in prefix_indices]
+    pgo_start = _timing_start(timing)
     pgo_result = run_full_prefix_pgo(
         prefix_indices=prefix_indices,
         odom_poses=prefix_poses,
@@ -438,6 +523,7 @@ def _score_candidate(
         loop_factor=sim3.loop_factor,
         noise=_pgo_noise_from_config(config),
     )
+    _record_record_timing(record, timing, "pgo", pgo_start)
     record["pgo_converged"] = pgo_result.converged
     record["pgo_error_before"] = pgo_result.error_before
     record["pgo_error_after"] = pgo_result.error_after
@@ -445,17 +531,140 @@ def _score_candidate(
     if not pgo_result.converged:
         reason = pgo_result.failure_reason or "unknown"
         failure_reasons.append(f"pgo: {reason}")
-        return record
+        return _finish_candidate_timing(record, timing, candidate_start)
 
     try:
         deformation_rmse = trajectory_deformation_rmse(prefix_poses, pgo_result.optimized_poses)
     except ValueError as exc:
         failure_reasons.append(f"trajectory: {exc}")
-        return record
+        return _finish_candidate_timing(record, timing, candidate_start)
     record["trajectory_deformation_rmse"] = float(deformation_rmse)
     record["score_rover"] = -float(deformation_rmse)
     record["score_rover_source"] = "single_support_loop_factor"
-    return record
+    return _finish_candidate_timing(record, timing, candidate_start)
+
+
+def _score_candidates_with_batched_triplets(
+    config: RobustLoopVerifierConfig,
+    candidates: Sequence[Any],
+    positive_indices: set[int],
+    image_by_idx: Mapping[int, Path],
+    odom_by_idx: Mapping[int, np.ndarray],
+    cache_order: Sequence[int],
+    da3_runner,
+    timing: dict[str, list[float]] | None = None,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any] | None] = [None for _ in candidates]
+    pending: list[dict[str, Any]] = []
+
+    for position, candidate in enumerate(candidates):
+        query_idx = int(candidate.query_idx)
+        candidate_idx = int(candidate.candidate_idx)
+        failure_reasons: list[str] = []
+        candidate_start = _timing_start(timing)
+        record = _new_candidate_record(
+            config,
+            candidate,
+            candidate_idx in positive_indices,
+            failure_reasons,
+        )
+        _init_record_timing(record, timing)
+
+        support_start = _timing_start(timing)
+        support = select_support(
+            query_idx=query_idx,
+            candidate_idx=candidate_idx,
+            available_indices=cache_order,
+            image_indices=list(image_by_idx),
+            camera_poses=odom_by_idx,
+            support_window=config.support_window,
+            recent_exclusion_keyframes=config.recent_exclusion_keyframes,
+            min_support_baseline_m=config.min_support_baseline_m,
+        )
+        _record_record_timing(record, timing, "support_selection", support_start)
+        record["support_idx"] = support.support_idx
+        record["support_baseline_m"] = support.support_baseline_m
+        record["support_rejection_reason"] = support.rejection_reason
+        if support.support_idx is None:
+            reason = support.rejection_reason or "unknown"
+            failure_reasons.append(f"support: {reason}")
+            records[position] = _finish_candidate_timing(record, timing, candidate_start)
+            continue
+
+        triplet = build_da3_triplet(
+            image_by_idx[query_idx],
+            image_by_idx[candidate_idx],
+            image_by_idx[support.support_idx],
+            query_idx=query_idx,
+            candidate_idx=candidate_idx,
+            support_idx=support.support_idx,
+        )
+        pending.append(
+            {
+                "position": position,
+                "query_idx": query_idx,
+                "candidate_idx": candidate_idx,
+                "support_idx": support.support_idx,
+                "triplet": triplet,
+                "record": record,
+                "failure_reasons": failure_reasons,
+                "candidate_start": candidate_start,
+            }
+        )
+
+    batch_size = max(1, int(config.da3.triplet_batch_size))
+    for chunk_start in range(0, len(pending), batch_size):
+        chunk = pending[chunk_start : chunk_start + batch_size]
+        triplets = [item["triplet"] for item in chunk]
+        da3_start = _timing_start(timing)
+        try:
+            da3_results = _run_da3_triplets(da3_runner, triplets)
+            if len(da3_results) != len(triplets):
+                raise ValueError("DA3 batched result count must match triplet count")
+            _record_batch_record_timing(
+                [item["record"] for item in chunk],
+                timing,
+                "da3_triplet",
+                da3_start,
+            )
+        except Exception as exc:
+            _record_batch_record_timing(
+                [item["record"] for item in chunk],
+                timing,
+                "da3_triplet",
+                da3_start,
+            )
+            for item in chunk:
+                item["failure_reasons"].append(f"da3: {type(exc).__name__}: {exc}")
+                records[item["position"]] = _finish_candidate_timing(
+                    item["record"],
+                    timing,
+                    item["candidate_start"],
+                )
+            continue
+
+        for item, da3_result in zip(chunk, da3_results):
+            records[item["position"]] = _score_single_support_candidate_after_da3(
+                config=config,
+                query_idx=item["query_idx"],
+                candidate_idx=item["candidate_idx"],
+                support_idx=item["support_idx"],
+                odom_by_idx=odom_by_idx,
+                cache_order=cache_order,
+                da3_result=da3_result,
+                record=item["record"],
+                failure_reasons=item["failure_reasons"],
+                timing=timing,
+                candidate_start=item["candidate_start"],
+            )
+
+    return [record for record in records if record is not None]
+
+
+def _run_da3_triplets(da3_runner, triplets):
+    if callable(getattr(da3_runner, "run_triplets", None)):
+        return list(da3_runner.run_triplets(triplets))
+    return [da3_runner.run_triplet(triplet) for triplet in triplets]
 
 
 def _score_candidate_with_support_ensemble(
@@ -468,7 +677,9 @@ def _score_candidate_with_support_ensemble(
     da3_runner,
     record: dict[str, Any],
     failure_reasons: list[str],
+    timing: dict[str, list[float]] | None = None,
 ) -> dict[str, Any]:
+    support_start = _timing_start(timing)
     support_selection = select_supports(
         query_idx=query_idx,
         candidate_idx=candidate_idx,
@@ -480,6 +691,7 @@ def _score_candidate_with_support_ensemble(
         min_support_baseline_m=config.min_support_baseline_m,
         support_count=config.support_ensemble.support_count,
     )
+    _record_record_timing(record, timing, "support_selection", support_start)
     if not support_selection.supports:
         reason = support_selection.rejection_reason or "unknown"
         record["support_rejection_reason"] = reason
@@ -509,6 +721,7 @@ def _score_candidate_with_support_ensemble(
     valid_sim3_results = []
     for support in support_selection.supports:
         try:
+            da3_start = _timing_start(timing)
             triplet = build_da3_triplet(
                 image_by_idx[query_idx],
                 image_by_idx[candidate_idx],
@@ -518,7 +731,9 @@ def _score_candidate_with_support_ensemble(
                 support_idx=support.support_idx,
             )
             da3_result = da3_runner.run_triplet(triplet)
+            _record_record_timing(record, timing, "da3_triplet", da3_start)
         except Exception as exc:
+            _record_record_timing(record, timing, "da3_triplet", da3_start)
             failure_reasons.append(
                 f"support_ensemble da3 support {support.support_idx}: "
                 f"{type(exc).__name__}: {exc}"
@@ -526,12 +741,15 @@ def _score_candidate_with_support_ensemble(
             continue
 
         try:
+            sim3_start = _timing_start(timing)
             sim3 = align_triplet_to_candidate_support(
                 da3_result.predicted_c2w,
                 odom_by_idx[candidate_idx],
                 odom_by_idx[support.support_idx],
             )
+            _record_record_timing(record, timing, "sim3_alignment", sim3_start)
         except Exception as exc:
+            _record_record_timing(record, timing, "sim3_alignment", sim3_start)
             failure_reasons.append(
                 f"support_ensemble sim3 support {support.support_idx}: "
                 f"{type(exc).__name__}: {exc}"
@@ -594,6 +812,7 @@ def _score_candidate_with_support_ensemble(
 
     prefix_indices = _prefix_indices_through_query(cache_order, query_idx)
     prefix_poses = [odom_by_idx[index] for index in prefix_indices]
+    pgo_start = _timing_start(timing)
     pgo_result = run_full_prefix_pgo(
         prefix_indices=prefix_indices,
         odom_poses=prefix_poses,
@@ -603,6 +822,7 @@ def _score_candidate_with_support_ensemble(
         noise=_pgo_noise_from_config(config),
         loop_sigmas_override=ensemble.loop_sigmas,
     )
+    _record_record_timing(record, timing, "pgo", pgo_start)
     record["pgo_converged"] = pgo_result.converged
     record["pgo_error_before"] = pgo_result.error_before
     record["pgo_error_after"] = pgo_result.error_after
@@ -644,6 +864,164 @@ def _score_candidate_with_support_ensemble(
     return record
 
 
+TIMING_COMPONENTS = (
+    "descriptor_compute",
+    "retrieval_search",
+    "support_selection",
+    "da3_triplet",
+    "sim3_alignment",
+    "pgo",
+    "metrics",
+    "total_candidate",
+)
+
+
+def _new_timing_accumulator() -> dict[str, list[float]]:
+    return {component: [] for component in TIMING_COMPONENTS}
+
+
+def _timing_start(timing: dict[str, list[float]] | None) -> float | None:
+    if timing is None:
+        return None
+    return time.perf_counter()
+
+
+def _record_timing(
+    timing: dict[str, list[float]] | None,
+    component: str,
+    start: float | None,
+) -> float:
+    if timing is None or start is None:
+        return 0.0
+    elapsed = max(0.0, time.perf_counter() - start)
+    timing.setdefault(component, []).append(elapsed)
+    return elapsed
+
+
+def _init_record_timing(
+    record: dict[str, Any],
+    timing: dict[str, list[float]] | None,
+) -> None:
+    if timing is None:
+        return
+    for component in (
+        "support_selection",
+        "da3_triplet",
+        "sim3_alignment",
+        "pgo",
+    ):
+        record[f"timing_{component}_sec"] = 0.0
+    record["timing_total_candidate_sec"] = 0.0
+
+
+def _record_record_timing(
+    record: dict[str, Any],
+    timing: dict[str, list[float]] | None,
+    component: str,
+    start: float | None,
+) -> None:
+    elapsed = _record_timing(timing, component, start)
+    if timing is None:
+        return
+    key = f"timing_{component}_sec"
+    record[key] = float(record.get(key, 0.0)) + elapsed
+
+
+def _record_batch_record_timing(
+    records: Sequence[dict[str, Any]],
+    timing: dict[str, list[float]] | None,
+    component: str,
+    start: float | None,
+) -> None:
+    if timing is None or start is None:
+        return
+    elapsed = max(0.0, time.perf_counter() - start)
+    if not records:
+        timing.setdefault(component, []).append(elapsed)
+        return
+    per_record_elapsed = elapsed / float(len(records))
+    timing.setdefault(component, []).extend(per_record_elapsed for _ in records)
+    key = f"timing_{component}_sec"
+    for record in records:
+        record[key] = float(record.get(key, 0.0)) + per_record_elapsed
+
+
+def _finish_candidate_timing(
+    record: dict[str, Any],
+    timing: dict[str, list[float]] | None,
+    start: float | None,
+) -> dict[str, Any]:
+    if timing is None or start is None:
+        return record
+    elapsed = max(0.0, time.perf_counter() - start)
+    record["timing_total_candidate_sec"] = elapsed
+    timing.setdefault("total_candidate", []).append(elapsed)
+    return record
+
+
+def _timing_summary(
+    timing: dict[str, list[float]] | None,
+    *,
+    query_count: int,
+    candidate_count: int,
+) -> dict[str, Any] | None:
+    if timing is None:
+        return None
+    component_totals = {
+        component: float(sum(timing.get(component, [])))
+        for component in TIMING_COMPONENTS
+        if component != "total_candidate"
+    }
+    return {
+        "query_count": int(query_count),
+        "candidate_count": int(candidate_count),
+        "component_totals_sec": component_totals,
+        "per_component_sec": {
+            component: _duration_stats(timing.get(component, []))
+            for component in TIMING_COMPONENTS
+            if component != "total_candidate"
+        },
+        "per_query_sec": {
+            "retrieval_search": _duration_stats(timing.get("retrieval_search", [])),
+        },
+        "per_candidate_sec": {
+            "total": _duration_stats(timing.get("total_candidate", [])),
+            "support_selection": _duration_stats(timing.get("support_selection", [])),
+            "da3_triplet": _duration_stats(timing.get("da3_triplet", [])),
+            "sim3_alignment": _duration_stats(timing.get("sim3_alignment", [])),
+            "pgo": _duration_stats(timing.get("pgo", [])),
+        },
+    }
+
+
+def _duration_stats(values: Sequence[float]) -> dict[str, float | int]:
+    finite = np.asarray(
+        [float(value) for value in values if np.isfinite(float(value))],
+        dtype=np.float64,
+    )
+    if finite.size == 0:
+        return {
+            "count": 0,
+            "total": 0.0,
+            "mean": 0.0,
+            "p50": 0.0,
+            "p90": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+            "max": 0.0,
+        }
+    return {
+        "count": int(finite.size),
+        "total": float(finite.sum()),
+        "mean": float(finite.mean()),
+        "p50": float(np.percentile(finite, 50)),
+        "p90": float(np.percentile(finite, 90)),
+        "p95": float(np.percentile(finite, 95)),
+        "p99": float(np.percentile(finite, 99)),
+        "max": float(finite.max()),
+    }
+
+
 def _compute_method_metrics(
     labels: Sequence[bool],
     method_scores: Mapping[str, Sequence[float | None]],
@@ -663,6 +1041,7 @@ def _write_run_artifacts(
     config: RobustLoopVerifierConfig,
     records: Sequence[Mapping[str, Any]],
     metrics: Mapping[str, Mapping[str, float]],
+    timing_summary: Mapping[str, Any] | None = None,
 ) -> None:
     _write_jsonl(
         output_root / "candidate_records.jsonl",
@@ -670,6 +1049,8 @@ def _write_run_artifacts(
     )
     write_json(output_root / "metrics.json", _jsonable(metrics))
     write_metrics_markdown(output_root / "metrics.md", metrics)
+    if timing_summary is not None:
+        write_json(output_root / "efficiency_timing.json", _jsonable(timing_summary))
     for dirname in ("pr_curves", "visual_records", "trajectory_plots"):
         (output_root / dirname).mkdir(parents=True, exist_ok=True)
 
@@ -677,6 +1058,7 @@ def _write_run_artifacts(
 def _write_zero_candidate_run(
     output_root: Path,
     config: RobustLoopVerifierConfig,
+    timing: dict[str, list[float]] | None = None,
 ) -> dict[str, Any]:
     method_scores = {
         METHOD_SALAD: [],
@@ -686,11 +1068,15 @@ def _write_zero_candidate_run(
     if config.support_ensemble.enabled:
         method_scores[METHOD_SUPPORT_ENSEMBLE] = []
     metrics = _compute_method_metrics([], method_scores)
-    _write_run_artifacts(output_root, config, [], metrics)
-    return {
+    timing_summary = _timing_summary(timing, query_count=0, candidate_count=0)
+    _write_run_artifacts(output_root, config, [], metrics, timing_summary=timing_summary)
+    result = {
         "candidate_count": 0,
         "metrics": metrics,
     }
+    if timing_summary is not None:
+        result["timing"] = timing_summary
+    return result
 
 
 def _has_legal_historical_image_candidate(
@@ -726,6 +1112,7 @@ def _make_backends(config: RobustLoopVerifierConfig, backend: str):
                 RealDa3RunnerConfig(
                     process_res=config.da3.process_res,
                     ref_view_strategy=config.da3.ref_view_strategy,
+                    triplet_batch_size=config.da3.triplet_batch_size,
                 )
             ),
         )
@@ -733,7 +1120,10 @@ def _make_backends(config: RobustLoopVerifierConfig, backend: str):
 
 
 def _is_da3_runner_injection(backend: Any) -> bool:
-    return not isinstance(backend, str) and callable(getattr(backend, "run_triplet", None))
+    return not isinstance(backend, str) and (
+        callable(getattr(backend, "run_triplet", None))
+        or callable(getattr(backend, "run_triplets", None))
+    )
 
 
 class _MockDescriptorBackend:

@@ -28,6 +28,7 @@ class PgoNoiseConfig:
 class Da3RuntimeConfig:
     process_res: int
     ref_view_strategy: str
+    triplet_batch_size: int = 4
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> "Da3RuntimeConfig":
@@ -39,7 +40,15 @@ class Da3RuntimeConfig:
         if ref_view_strategy != "first":
             raise ValueError("ref_view_strategy must be 'first'")
 
-        return cls(process_res=process_res, ref_view_strategy=ref_view_strategy)
+        triplet_batch_size = _positive_int(
+            data.get("triplet_batch_size", 4), "triplet_batch_size"
+        )
+
+        return cls(
+            process_res=process_res,
+            ref_view_strategy=ref_view_strategy,
+            triplet_batch_size=triplet_batch_size,
+        )
 
 
 @dataclass(frozen=True)

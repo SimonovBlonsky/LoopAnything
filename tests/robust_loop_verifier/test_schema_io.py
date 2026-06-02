@@ -77,6 +77,15 @@ def test_config_defaults_positive_max_rotation_to_45_degrees(tmp_path: Path):
     assert config.positive_max_rotation_deg == 45.0
 
 
+def test_config_defaults_da3_triplet_batch_size_to_four(tmp_path: Path):
+    path = tmp_path / "config.yaml"
+    write_yaml(path, _valid_config(tmp_path))
+
+    config = RobustLoopVerifierConfig.from_yaml(path)
+
+    assert config.da3.triplet_batch_size == 4
+
+
 def test_config_rejects_invalid_positive_max_rotation(tmp_path: Path):
     path = tmp_path / "config.yaml"
     data = _valid_config(tmp_path)
@@ -84,6 +93,16 @@ def test_config_rejects_invalid_positive_max_rotation(tmp_path: Path):
     write_yaml(path, data)
 
     with pytest.raises(ValueError, match="positive_max_rotation_deg"):
+        RobustLoopVerifierConfig.from_yaml(path)
+
+
+def test_config_rejects_non_positive_da3_triplet_batch_size(tmp_path: Path):
+    path = tmp_path / "config.yaml"
+    data = _valid_config(tmp_path)
+    data["da3"]["triplet_batch_size"] = 0
+    write_yaml(path, data)
+
+    with pytest.raises(ValueError, match="triplet_batch_size"):
         RobustLoopVerifierConfig.from_yaml(path)
 
 

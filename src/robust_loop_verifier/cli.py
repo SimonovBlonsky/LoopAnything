@@ -74,6 +74,7 @@ def run_cache(
     output_root: Path = typer.Option(..., file_okay=False, dir_okay=True),
     query_limit: int = typer.Option(20),
     backend: str = typer.Option("real"),
+    collect_timing: bool = typer.Option(False),
 ) -> None:
     try:
         cfg = RobustLoopVerifierConfig.from_yaml(config)
@@ -83,6 +84,7 @@ def run_cache(
             output_root=output_root,
             query_limit=query_limit,
             backend=backend,
+            collect_timing=collect_timing,
         )
     except (OSError, ValueError) as error:
         _raise_cli_error(error)

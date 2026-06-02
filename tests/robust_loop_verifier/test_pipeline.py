@@ -289,6 +289,89 @@ def test_run_cached_sequence_mock_writes_metrics_records_and_artifact_dirs(tmp_p
     assert any(record["query_idx"] == 5 and record["candidate_idx"] == 0 for record in records)
 
 
+def test_run_cached_sequence_batches_single_support_candidates_by_query(tmp_path: Path):
+    from robust_loop_verifier.da3_runner import MockDa3Runner
+
+    sequence_cache = tmp_path / "cache"
+    output_root = tmp_path / "run"
+    _write_tiny_sequence_cache(sequence_cache, keyframe_count=8, positives_by_query={7: [0]})
+
+    class BatchOnlyRunner:
+        def __init__(self):
+            self.batch_sizes = []
+            self.single_triplet_calls = 0
+
+        def run_triplet(self, triplet):
+            self.single_triplet_calls += 1
+            raise AssertionError("single triplet inference should not be used")
+
+        def run_triplets(self, triplets):
+            self.batch_sizes.append(len(triplets))
+            return [MockDa3Runner().run_triplet(triplet) for triplet in triplets]
+
+    runner = BatchOnlyRunner()
+
+    result = run_cached_sequence(
+        _cached_config(
+            tmp_path,
+            retrieval_top_k_main=3,
+            da3={
+                "process_res": 504,
+                "ref_view_strategy": "first",
+                "triplet_batch_size": 4,
+            },
+        ),
+        sequence_cache=sequence_cache,
+        output_root=output_root,
+        query_limit=8,
+        backend=runner,
+    )
+
+    records = _read_candidate_records(output_root)
+    assert result["candidate_count"] == len(records)
+    assert records
+    assert runner.single_triplet_calls == 0
+    assert runner.batch_sizes
+    assert max(runner.batch_sizes) > 1
+    assert all(size <= 4 for size in runner.batch_sizes)
+    assert all(record["sim3_valid"] for record in records if record["support_idx"] is not None)
+
+
+def test_run_cached_sequence_collect_timing_writes_efficiency_artifact(tmp_path: Path):
+    sequence_cache = tmp_path / "cache"
+    output_root = tmp_path / "run"
+    _write_tiny_sequence_cache(sequence_cache, positives_by_query={5: [1]})
+
+    result = run_cached_sequence(
+        _cached_config(tmp_path),
+        sequence_cache=sequence_cache,
+        output_root=output_root,
+        query_limit=6,
+        backend="mock",
+        collect_timing=True,
+    )
+
+    timing = json.loads((output_root / "efficiency_timing.json").read_text(encoding="utf-8"))
+    records = _read_candidate_records(output_root)
+    assert result["timing"] == timing
+    assert timing["candidate_count"] == len(records)
+    assert timing["query_count"] > 0
+    assert timing["component_totals_sec"]["descriptor_compute"] >= 0.0
+    assert timing["component_totals_sec"]["retrieval_search"] >= 0.0
+    assert timing["component_totals_sec"]["da3_triplet"] >= 0.0
+    assert timing["component_totals_sec"]["sim3_alignment"] >= 0.0
+    assert timing["component_totals_sec"]["pgo"] >= 0.0
+    assert timing["component_totals_sec"]["metrics"] >= 0.0
+    assert timing["per_candidate_sec"]["total"]["count"] == len(records)
+    assert {
+        "timing_total_candidate_sec",
+        "timing_support_selection_sec",
+        "timing_da3_triplet_sec",
+        "timing_sim3_alignment_sec",
+        "timing_pgo_sec",
+    } <= set(records[0])
+
+
 def test_support_ensemble_mock_pipeline_emits_fields(tmp_path: Path):
     sequence_cache = tmp_path / "cache"
     output_root = tmp_path / "run"

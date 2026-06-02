@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
-from typing import Any, Tuple
+from typing import Any, Sequence, Tuple
 
 import numpy as np
 
@@ -35,6 +35,7 @@ class RealDa3RunnerConfig:
     process_res: int = 504
     process_res_method: str = "upper_bound_resize"
     ref_view_strategy: str = "first"
+    triplet_batch_size: int = 4
     extrinsics_are_c2w: bool = False
     local_files_only: bool = True
     cache_dir: Path | None = None
@@ -44,6 +45,8 @@ class RealDa3RunnerConfig:
             raise ValueError("process_res must be at least 224")
         if self.ref_view_strategy != "first":
             raise ValueError("RealDa3Runner requires ref_view_strategy='first'")
+        if self.triplet_batch_size <= 0:
+            raise ValueError("triplet_batch_size must be positive")
         if self.cache_dir is not None:
             object.__setattr__(self, "cache_dir", Path(self.cache_dir).expanduser())
 
@@ -77,31 +80,66 @@ def _to_numpy(value: Any) -> np.ndarray:
     return np.asarray(value, dtype=np.float64)
 
 
-def _as_4x4_batch(extrinsics) -> np.ndarray:
+def _as_4x4_pose_array(extrinsics) -> np.ndarray:
     poses = _to_numpy(extrinsics)
-    if poses.ndim == 4 and poses.shape[0] == 1:
-        poses = poses[0]
-    if poses.ndim != 3 or poses.shape[1] not in (3, 4) or poses.shape[2] != 4:
+    if poses.ndim < 3 or poses.shape[-2] not in (3, 4) or poses.shape[-1] != 4:
+        raise ValueError(
+            "DA3 extrinsics must have trailing shape (3,4) or (4,4)"
+        )
+
+    if poses.shape[-2] == 4:
+        batch = poses.copy()
+    else:
+        batch = np.broadcast_to(
+            np.eye(4, dtype=np.float64),
+            poses.shape[:-2] + (4, 4),
+        ).copy()
+        batch[..., :3, :] = poses
+
+    if not np.all(np.isfinite(batch)):
+        raise ValueError("DA3 extrinsics must contain only finite values")
+    if not np.allclose(batch[..., 3, :], np.array([0.0, 0.0, 0.0, 1.0]), atol=1e-7):
+        raise ValueError("DA3 extrinsics bottom row must be [0, 0, 0, 1]")
+    rotations = batch[..., :3, :3].reshape(-1, 3, 3)
+    batch[..., :3, :3] = np.stack(
+        [_project_rotation_to_so3(rotation) for rotation in rotations],
+        axis=0,
+    ).reshape(batch.shape[:-2] + (3, 3))
+    return batch
+
+
+def _as_4x4_batch(extrinsics) -> np.ndarray:
+    batch = _as_4x4_pose_array(extrinsics)
+    if batch.ndim == 4 and batch.shape[0] == 1:
+        batch = batch[0]
+    if batch.ndim != 3:
         raise ValueError(
             "DA3 extrinsics must have shape (N,3,4), (N,4,4), "
             "(1,N,3,4), or (1,N,4,4)"
         )
+    return batch
 
-    if poses.shape[1] == 4:
-        batch = poses.copy()
-    else:
-        batch = np.repeat(np.eye(4, dtype=np.float64)[None, :, :], poses.shape[0], axis=0)
-        batch[:, :3, :] = poses
 
-    if not np.all(np.isfinite(batch)):
-        raise ValueError("DA3 extrinsics must contain only finite values")
-    if not np.allclose(batch[:, 3, :], np.array([0.0, 0.0, 0.0, 1.0]), atol=1e-7):
-        raise ValueError("DA3 extrinsics bottom row must be [0, 0, 0, 1]")
-    batch[:, :3, :3] = np.stack(
-        [_project_rotation_to_so3(rotation) for rotation in batch[:, :3, :3]],
+def convert_da3_batched_extrinsics_to_c2w(
+    extrinsics,
+    extrinsics_are_c2w: bool,
+) -> np.ndarray:
+    pose_batches = _as_4x4_pose_array(extrinsics)
+    if pose_batches.ndim == 3:
+        pose_batches = pose_batches[None]
+    if pose_batches.ndim != 4:
+        raise ValueError(
+            "DA3 batched extrinsics must have shape (B,N,3,4) or (B,N,4,4)"
+        )
+    if extrinsics_are_c2w:
+        return pose_batches
+    return np.stack(
+        [
+            np.stack([invert_transform(pose) for pose in pose_batch], axis=0)
+            for pose_batch in pose_batches
+        ],
         axis=0,
     )
-    return batch
 
 
 def convert_da3_extrinsics_to_c2w(extrinsics, extrinsics_are_c2w: bool) -> np.ndarray:
@@ -134,6 +172,9 @@ class MockDa3Runner:
             view_roles=triplet.view_roles,
         )
 
+    def run_triplets(self, triplets: Sequence[Da3Triplet]) -> list[Da3TripletResult]:
+        return [self.run_triplet(triplet) for triplet in triplets]
+
 
 class RealDa3Runner:
     """Lazy real Depth Anything 3 triplet runner returning camera-to-world poses."""
@@ -162,33 +203,44 @@ class RealDa3Runner:
         return self._model
 
     def run_triplet(self, triplet: Da3Triplet) -> Da3TripletResult:
+        return self.run_triplets([triplet])[0]
+
+    def run_triplets(self, triplets: Sequence[Da3Triplet]) -> list[Da3TripletResult]:
         from PIL import Image
+        import torch
 
+        triplets = list(triplets)
+        if not triplets:
+            return []
         model = self._load_model()
-        images = []
-        for image_path in triplet.image_paths:
-            with Image.open(image_path) as image:
-                images.append(image.convert("RGB").copy())
+        preprocessed_triplets = []
+        for triplet in triplets:
+            images = []
+            for image_path in triplet.image_paths:
+                with Image.open(image_path) as image:
+                    images.append(image.convert("RGB").copy())
 
-        imgs_cpu, _, _ = model.input_processor(
-            images,
-            extrinsics=None,
-            intrinsics=None,
-            process_res=self.config.process_res,
-            process_res_method=self.config.process_res_method,
-            num_workers=1,
-            print_progress=False,
-            sequential=True,
-            desc=None,
-        )
-        if imgs_cpu.ndim == 4:
-            image_batch = imgs_cpu[None].to(self.config.device, non_blocking=True).float()
-        elif imgs_cpu.ndim == 5 and imgs_cpu.shape[0] == 1:
-            image_batch = imgs_cpu.to(self.config.device, non_blocking=True).float()
-        else:
-            raise ValueError(
-                "DA3 preprocessed images must have shape (N,C,H,W) or (1,N,C,H,W)"
+            imgs_cpu, _, _ = model.input_processor(
+                images,
+                extrinsics=None,
+                intrinsics=None,
+                process_res=self.config.process_res,
+                process_res_method=self.config.process_res_method,
+                num_workers=1,
+                print_progress=False,
+                sequential=True,
+                desc=None,
             )
+            if imgs_cpu.ndim == 5 and imgs_cpu.shape[0] == 1:
+                imgs_cpu = imgs_cpu[0]
+            if imgs_cpu.ndim != 4 or imgs_cpu.shape[0] != len(triplet.image_paths):
+                raise ValueError("DA3 preprocessed triplet must have shape (3,C,H,W)")
+            preprocessed_triplets.append(imgs_cpu)
+
+        image_batch = torch.stack(preprocessed_triplets, dim=0).to(
+            self.config.device,
+            non_blocking=True,
+        ).float()
 
         output = model.forward(
             image_batch,
@@ -199,20 +251,23 @@ class RealDa3Runner:
             use_ray_pose=False,
             ref_view_strategy=self.config.ref_view_strategy,
         )
-        predicted_c2w = convert_da3_extrinsics_to_c2w(
+        predicted_c2w_batches = convert_da3_batched_extrinsics_to_c2w(
             _field(output, "extrinsics"),
             extrinsics_are_c2w=self.config.extrinsics_are_c2w,
         )
-        if predicted_c2w.shape[0] != len(triplet.image_paths):
-            raise ValueError("DA3 extrinsics count must match triplet image count")
-        if not np.all(np.isfinite(predicted_c2w)):
+        if predicted_c2w_batches.shape != (len(triplets), 3, 4, 4):
+            raise ValueError("DA3 batched c2w poses must have shape (B,3,4,4)")
+        if not np.all(np.isfinite(predicted_c2w_batches)):
             raise ValueError("DA3 c2w poses must contain only finite values")
 
-        return Da3TripletResult(
-            predicted_c2w=predicted_c2w,
-            keyframe_indices=triplet.keyframe_indices,
-            view_roles=triplet.view_roles,
-        )
+        return [
+            Da3TripletResult(
+                predicted_c2w=predicted_c2w,
+                keyframe_indices=triplet.keyframe_indices,
+                view_roles=triplet.view_roles,
+            )
+            for triplet, predicted_c2w in zip(triplets, predicted_c2w_batches)
+        ]
 
 
 def resolve_local_da3_model_name_or_path(
