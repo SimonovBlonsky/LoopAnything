@@ -44,6 +44,7 @@ tests/loop_policy/*.py[cod]
 log*.md
 logs/
 .worktrees/
+/.superpowers/
 
 checkpoints
 data/
