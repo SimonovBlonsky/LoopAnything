@@ -164,6 +164,51 @@ def test_preprocess_fusionportable_sequence_writes_online_causal_cache(tmp_path)
     assert (out_dir / "images" / "000005.png").exists()
 
 
+def test_preprocess_fusionportable_skips_external_gt_timestamp_gaps(tmp_path):
+    from robust_loop_verifier.fusionportable import preprocess_fusionportable_sequence
+    from robust_loop_verifier.io import read_json, read_jsonl
+
+    raw_dir, gt_file = _write_fusionportable_raw_fixture(
+        tmp_path,
+        keyframe_rows=[
+            {
+                "keyframe_idx": idx,
+                "timestamp": float(idx),
+                "has_image": True,
+                "image_path": "keyframe_images/{:06d}.png".format(idx),
+            }
+            for idx in range(4)
+        ],
+    )
+    gt_file.write_text(
+        "1.0 1 0 0 0 0 0 1\n"
+        "2.0 2 0 0 0 0 0 1\n"
+        "3.0 3 0 0 0 0 0 1\n",
+        encoding="utf-8",
+    )
+    config = _fusionportable_config(tmp_path, platform="ugv")
+
+    out_dir = preprocess_fusionportable_sequence(
+        raw_dir=raw_dir,
+        gt_trajectory_file=gt_file,
+        sequence_name="ugv_test",
+        config=config,
+        max_gt_delta_sec=0.01,
+    )
+
+    keyframes = list(read_jsonl(out_dir / "keyframes.jsonl"))
+    manifest = read_json(out_dir / "manifest.json")
+
+    assert [row["idx"] for row in keyframes] == [1, 2, 3]
+    assert manifest["keyframe_count"] == 3
+    assert manifest["keyframe_count_before_gt_filter"] == 4
+    assert manifest["skipped_gt_association_count"] == 1
+    assert manifest["skipped_gt_association_indices"] == [0]
+    assert manifest["max_gt_delta_sec"] == 0.01
+    assert not (out_dir / "images" / "000000.png").exists()
+    assert (out_dir / "images" / "000001.png").exists()
+
+
 def test_preprocess_fusionportable_handheld_uses_aster_slam_trajectory_as_gt_by_default(
     tmp_path,
 ):
@@ -212,6 +257,47 @@ def test_preprocess_fusionportable_handheld_uses_aster_slam_trajectory_as_gt_by_
     assert keyframes[0]["gt_pose"][3] == 0.0
     assert keyframes[3]["gt_pose"][3] == 0.2
     assert positives[-1]["positive_indices"] == [0]
+    assert manifest["gt_label_source"] == "aster_slam_trajectory_keyframes"
+    assert manifest["gt_trajectory_file"] == str(raw_dir / "trajectory_keyframes.txt")
+
+
+def test_preprocess_fusionportable_ntu_viral_uses_aster_slam_trajectory_as_gt_by_default(
+    tmp_path,
+):
+    from robust_loop_verifier.fusionportable import preprocess_fusionportable_sequence
+    from robust_loop_verifier.io import read_json, read_jsonl
+
+    raw_dir, gt_file = _write_fusionportable_raw_fixture(tmp_path)
+    (raw_dir / "trajectory_keyframes.txt").write_text(
+        "0.0 0 0 0 0 0 0 1\n"
+        "1.0 1 0 0 0 0 0 1\n"
+        "2.0 0.2 0 0 0 0 0 1\n",
+        encoding="utf-8",
+    )
+    gt_file.write_text(
+        "0.0 100 0 0 0 0 0 1\n"
+        "1.0 101 0 0 0 0 0 1\n"
+        "2.0 102 0 0 0 0 0 1\n",
+        encoding="utf-8",
+    )
+
+    out_dir = preprocess_fusionportable_sequence(
+        raw_dir=raw_dir,
+        gt_trajectory_file=gt_file,
+        sequence_name="eee_01",
+        config=_fusionportable_config(
+            tmp_path,
+            dataset_name="NTU-VIRAL",
+            platform="NTU-VIRAL",
+            positive_radius_m=0.5,
+        ),
+        max_gt_delta_sec=0.01,
+    )
+
+    keyframes = list(read_jsonl(out_dir / "keyframes.jsonl"))
+    manifest = read_json(out_dir / "manifest.json")
+
+    assert keyframes[2]["gt_pose"][3] == 0.2
     assert manifest["gt_label_source"] == "aster_slam_trajectory_keyframes"
     assert manifest["gt_trajectory_file"] == str(raw_dir / "trajectory_keyframes.txt")
 

@@ -52,13 +52,20 @@ def preprocess_fusionportable_sequence(
     )
 
     keyframes = []
+    skipped_gt_association_indices: list[int] = []
     for row, odom_record in zip(keyframe_rows, odom_records):
         idx = int(row["keyframe_idx"])
         timestamp = float(row["timestamp"])
         if gt_label_source == "aster_slam_trajectory_keyframes":
             gt_record = odom_record
         else:
-            gt_record = associate_tum_by_timestamp(gt_records, timestamp, max_gt_delta_sec)
+            try:
+                gt_record = associate_tum_by_timestamp(gt_records, timestamp, max_gt_delta_sec)
+            except ValueError as error:
+                if str(error) != "Nearest TUM timestamp exceeds max_delta_sec":
+                    raise
+                skipped_gt_association_indices.append(idx)
+                continue
         image_path = _link_image(raw_dir, image_out_dir, idx, row)
 
         keyframes.append(
@@ -73,6 +80,9 @@ def preprocess_fusionportable_sequence(
                 "gt_label_source": gt_label_source,
             }
         )
+
+    if not keyframes:
+        raise ValueError("No keyframes remain after GT timestamp association")
 
     positives = _build_online_causal_positives(
         keyframes,
@@ -96,6 +106,10 @@ def preprocess_fusionportable_sequence(
             "positive_radius_m": config.positive_radius_m,
             "positive_max_rotation_deg": config.positive_max_rotation_deg,
             "recent_exclusion_keyframes": config.recent_exclusion_keyframes,
+            "keyframe_count_before_gt_filter": len(keyframe_rows),
+            "skipped_gt_association_count": len(skipped_gt_association_indices),
+            "skipped_gt_association_indices": skipped_gt_association_indices,
+            "max_gt_delta_sec": max_gt_delta_sec,
         },
     )
 
@@ -103,7 +117,7 @@ def preprocess_fusionportable_sequence(
 
 
 def _uses_aster_slam_label_trajectory(platform: str) -> bool:
-    return platform.lower() in {"handheld", "legged"}
+    return platform.lower() in {"handheld", "legged", "ntu-viral", "ntu_viral"}
 
 
 def _build_online_causal_positives(

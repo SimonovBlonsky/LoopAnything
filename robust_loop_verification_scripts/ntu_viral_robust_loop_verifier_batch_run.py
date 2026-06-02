@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Batch preprocess and run GEODE robust loop verifier experiments."""
+"""Batch preprocess and run NTU-VIRAL robust loop verifier experiments."""
 
 from __future__ import annotations
 
 import argparse
 import os
-import re
 import shlex
 import subprocess
 import sys
@@ -27,8 +26,13 @@ from robust_loop_verifier.score_sweep import (
 )
 
 
-# Edit this list when more GEODE raw exports are ready for the main table.
-GEODE_SEQUENCE_NAMES: tuple[str, ...] = ("Offroad05_beta",)
+NTU_VIRAL_SEQUENCE_NAMES: tuple[str, ...] = (
+    "eee_01",
+    "eee_02",
+    "nya_01",
+    "nya_02",
+    "nya_03",
+)
 SELECTED_SCORE_SWEEP_METHODS: tuple[str, ...] = (
     "absolute_graph:def=0.5,res=0.25",
     "query_gate_graph:def=0.5,res=0.25,margin=0",
@@ -54,7 +58,7 @@ def main() -> int:
     run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
     output_base = Path(args.output_base).resolve()
     batch_root = Path(
-        args.batch_output_root or output_base / args.dataset_name / f"geode_batch_{run_id}"
+        args.batch_output_root or output_base / args.dataset_name / f"ntu_viral_batch_{run_id}"
     ).resolve()
 
     plans = _select_sequences(args, run_id, output_base)
@@ -117,21 +121,21 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--repo-root", default=str(repo_root))
     parser.add_argument(
         "--loop-dataset-root",
-        default="/data/datasets/GEODE/geode_loop_dataset",
+        default="/data/datasets/NTU-VIRAL/ntu_viral_loop_dataset",
     )
-    parser.add_argument("--gt-data-root", default="/data/datasets/GEODE/data/offroad")
+    parser.add_argument("--gt-data-root", default="/data/datasets/NTU-VIRAL/processed_gt_tum")
     parser.add_argument(
         "--cache-root",
-        default="/data/datasets/GEODE/robust_loop_verifier_cache",
+        default="/data/datasets/NTU-VIRAL/robust_loop_verifier_cache",
     )
     parser.add_argument(
         "--output-base",
         default=str(repo_root / "workspace" / "robust_loop_verifier_runs"),
     )
     parser.add_argument("--batch-output-root", default=None)
-    parser.add_argument("--dataset-name", default="GEODE")
-    parser.add_argument("--platform", default="Offroad")
-    parser.add_argument("--sequences", default=",".join(GEODE_SEQUENCE_NAMES))
+    parser.add_argument("--dataset-name", default="NTU-VIRAL")
+    parser.add_argument("--platform", default="NTU-VIRAL")
+    parser.add_argument("--sequences", default=",".join(NTU_VIRAL_SEQUENCE_NAMES))
     parser.add_argument("--backend", default=os.environ.get("BACKEND", "real"))
     parser.add_argument("--query-limit", type=int, default=_optional_int_env("QUERY_LIMIT"))
     parser.add_argument("--run-id", default=os.environ.get("RUN_ID"))
@@ -139,21 +143,8 @@ def _parse_args() -> argparse.Namespace:
         "--config",
         default=os.environ.get(
             "CONFIG",
-            str(repo_root / "configs" / "robust_loop_verifier" / "geode_offroad.yaml"),
+            str(repo_root / "configs" / "robust_loop_verifier" / "ntu_viral.yaml"),
         ),
-    )
-    parser.set_defaults(support_ensemble=True)
-    parser.add_argument(
-        "--support-ensemble",
-        dest="support_ensemble",
-        action="store_true",
-        help="Use the GEODE support-ensemble config. This is the default.",
-    )
-    parser.add_argument(
-        "--no-support-ensemble",
-        dest="support_ensemble",
-        action="store_false",
-        help="Disable support ensemble and use the base GEODE config.",
     )
     parser.add_argument("--python-bin", default=os.environ.get("PYTHON_BIN", sys.executable))
     parser.add_argument("--max-gt-delta-sec", type=float, default=0.1)
@@ -175,11 +166,12 @@ def _select_sequences(
                 platform=args.platform,
                 sequence_name=sequence_name,
                 raw_dir=Path(args.loop_dataset_root) / args.platform / sequence_name / "raw",
-                gt_trajectory_file=_gt_path_for_sequence(
-                    Path(args.gt_data_root),
-                    sequence_name,
-                ),
-                gt_label_source="external_gt_trajectory",
+                gt_trajectory_file=Path(args.loop_dataset_root)
+                / args.platform
+                / sequence_name
+                / "raw"
+                / "trajectory_keyframes.txt",
+                gt_label_source="aster_slam_trajectory_keyframes",
                 cache_root=Path(args.cache_root),
                 output_base=output_base,
                 dataset_name=args.dataset_name,
@@ -277,6 +269,7 @@ def _write_preprocess_config(
     data["input_root"] = str(Path(args.loop_dataset_root))
     data["gt_root"] = str(Path(args.gt_data_root))
     data["output_root"] = str(Path(args.cache_root))
+    data.setdefault("support_ensemble", {})["enabled"] = False
     write_yaml(path, data)
     return path
 
@@ -293,6 +286,7 @@ def _write_run_config(
     data["input_root"] = str(Path(args.loop_dataset_root))
     data["gt_root"] = str(Path(args.gt_data_root))
     data["output_root"] = str(batch_root)
+    data.setdefault("support_ensemble", {})["enabled"] = False
     write_yaml(path, data)
     return path
 
@@ -304,18 +298,7 @@ def _config_output_path(plan: SequencePlan, batch_root: Path, kind: str) -> Path
 
 
 def _base_config(args: argparse.Namespace) -> dict[str, Any]:
-    return dict(read_yaml(_selected_config_path(args)))
-
-
-def _selected_config_path(args: argparse.Namespace) -> Path:
-    if args.support_ensemble:
-        return (
-            Path(args.repo_root)
-            / "configs"
-            / "robust_loop_verifier"
-            / "geode_offroad_support_ensemble.yaml"
-        )
-    return Path(args.config)
+    return dict(read_yaml(Path(args.config)))
 
 
 def _run_command(command: list[str], repo_root: Path) -> None:
@@ -448,8 +431,8 @@ def _write_outputs(
         "run_id": run_id,
         "backend": args.backend,
         "overwrite_dataset": bool(args.overwrite_dataset),
-        "support_ensemble": bool(args.support_ensemble),
-        "config": str(_selected_config_path(args)),
+        "support_ensemble": False,
+        "config": str(Path(args.config)),
         "max_gt_delta_sec": float(args.max_gt_delta_sec),
         "sequences": summary_rows,
     }
@@ -504,30 +487,6 @@ def _write_outputs(
         average_rows,
         columns=["method", "sequence_count", "average_AP", "average_MR@100P"],
     )
-
-
-def _offroad_number_for_sequence(sequence_name: str) -> int:
-    match = re.fullmatch(r"Offroad0*(\d+)_[A-Za-z]+", sequence_name)
-    if match is None:
-        raise ValueError(
-            "Cannot infer GEODE GT file from sequence name "
-            f"{sequence_name!r}; expected e.g. Offroad05_beta"
-        )
-    return int(match.group(1))
-
-
-def _gt_filename_for_sequence(sequence_name: str) -> str:
-    return f"Offroad{_offroad_number_for_sequence(sequence_name)}.txt"
-
-
-def _gt_path_for_sequence(gt_root: Path, sequence_name: str) -> Path:
-    filename = _gt_filename_for_sequence(sequence_name)
-    direct = gt_root / filename
-    if direct.is_file():
-        return direct
-
-    nested = gt_root / f"Offroad{_offroad_number_for_sequence(sequence_name)}" / filename
-    return nested
 
 
 def _parse_csv(value: str) -> tuple[str, ...]:
