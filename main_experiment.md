@@ -4,8 +4,11 @@
 > computed from automatic distance-and-rotation positive labels. Failure-case
 > review found that this label definition rejects visually and geometrically
 > valid loop factors. These numbers must not be used as paper-facing results.
-> The replacement protocol is specified in
-> `docs/superpowers/specs/2026-06-02-handheld-escalator00-safe-loop-oracle-prototype-design.md`.
+> The replacement benchmark follows the ROVER protocol: fixed causal DBoW2
+> top-10 candidates, 40 queries sampled uniformly by eligible keyframe index
+> per sequence, binary manual loop labels, and common AP/MR@100P evaluation
+> across all methods. The frozen design is documented in
+> `docs/superpowers/specs/2026-06-10-rover-aligned-loop-verification-benchmark-design.md`.
 
 This table summarizes the current FusionPortableV2 handheld and UGV loop-verifier
 experiments, with GEODE and NTU-VIRAL reference experiments appended separately.
