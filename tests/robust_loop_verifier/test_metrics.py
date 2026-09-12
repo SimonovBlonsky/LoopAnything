@@ -17,6 +17,16 @@ def test_average_precision_larger_score_is_better():
     assert math.isclose(average_precision(labels, scores), (1.0 + 2.0 / 3.0) / 2.0)
 
 
+def test_average_precision_treats_equal_scores_as_one_threshold_group():
+    labels_a = [True, False, True]
+    labels_b = [False, True, True]
+    scores = [0.5, 0.5, 0.1]
+
+    expected = 7.0 / 12.0
+    assert math.isclose(average_precision(labels_a, scores), expected)
+    assert math.isclose(average_precision(labels_b, scores), expected)
+
+
 def test_max_recall_at_100_precision_stops_before_false_positive():
     labels = [True, True, False, True]
     scores = [0.9, 0.8, 0.7, 0.1]
@@ -70,11 +80,11 @@ def test_failure_assignment_rejects_impossible_score_below_lowest_finite_float()
         assign_failure_worst_scores([-sys.float_info.max, None])
 
 
-def test_equal_scores_preserve_input_order_for_average_precision():
+def test_equal_scores_are_grouped_for_average_precision():
     labels = [False, True, True]
     scores = [0.5, 0.5, 0.1]
 
-    assert math.isclose(average_precision(labels, scores), (1.0 / 2.0 + 2.0 / 3.0) / 2.0)
+    assert math.isclose(average_precision(labels, scores), 7.0 / 12.0)
 
 
 def test_tied_positive_and_negative_do_not_temporarily_count_as_100_precision():

@@ -5,8 +5,10 @@ from typing import Any, Dict, List, Mapping, Optional
 
 import numpy as np
 
+from robust_loop_verifier.geometry import invert_transform
 from robust_loop_verifier.io import (
     associate_tum_by_timestamp,
+    read_json,
     read_jsonl,
     read_tum_trajectory,
     write_json,
@@ -27,6 +29,8 @@ def preprocess_fusionportable_sequence(
     odom_trajectory_file = raw_dir / "trajectory_keyframes.txt"
     keyframe_rows = list(read_jsonl(raw_dir / "keyframes_with_images.jsonl"))
     odom_records = read_tum_trajectory(odom_trajectory_file)
+    t_camera_lidar = _read_camera_lidar_extrinsic(raw_dir / "sequence_meta.json")
+    t_lidar_camera = invert_transform(t_camera_lidar)
 
     _validate_keyframe_stream_order(keyframe_rows)
     _validate_odom_keyframe_alignment(keyframe_rows, odom_records)
@@ -67,14 +71,16 @@ def preprocess_fusionportable_sequence(
                 skipped_gt_association_indices.append(idx)
                 continue
         image_path = _link_image(raw_dir, image_out_dir, idx, row)
+        odom_camera_pose = odom_record.pose @ t_lidar_camera
+        gt_camera_pose = gt_record.pose @ t_lidar_camera
 
         keyframes.append(
             {
                 "idx": idx,
                 "timestamp": timestamp,
                 "image_path": image_path,
-                "odom_pose": _flatten_pose(odom_record.pose),
-                "gt_pose": _flatten_pose(gt_record.pose),
+                "odom_pose": _flatten_pose(odom_camera_pose),
+                "gt_pose": _flatten_pose(gt_camera_pose),
                 "source_raw_dir": str(raw_dir),
                 "source_gt_trajectory_file": str(gt_trajectory_file),
                 "gt_label_source": gt_label_source,
@@ -103,6 +109,9 @@ def preprocess_fusionportable_sequence(
             "raw_dir": str(raw_dir),
             "gt_trajectory_file": str(gt_trajectory_file),
             "gt_label_source": gt_label_source,
+            "pose_frame": "camera",
+            "source_trajectory_pose_frame": "lidar",
+            "T_camera_lidar": t_camera_lidar.reshape(-1).tolist(),
             "positive_radius_m": config.positive_radius_m,
             "positive_max_rotation_deg": config.positive_max_rotation_deg,
             "recent_exclusion_keyframes": config.recent_exclusion_keyframes,
@@ -116,8 +125,47 @@ def preprocess_fusionportable_sequence(
     return out_dir
 
 
+def _read_camera_lidar_extrinsic(sequence_meta_path: Path) -> np.ndarray:
+    meta = read_json(sequence_meta_path)
+    if "T_camera_lidar" not in meta:
+        raise ValueError("sequence_meta.json must contain T_camera_lidar")
+
+    transform = np.asarray(meta["T_camera_lidar"], dtype=np.float64)
+    if transform.size != 16:
+        raise ValueError("T_camera_lidar must contain 16 values")
+    transform = transform.reshape(4, 4)
+    if not np.all(np.isfinite(transform)):
+        raise ValueError("T_camera_lidar must contain only finite values")
+    if not np.allclose(transform[3], [0.0, 0.0, 0.0, 1.0], atol=1e-7, rtol=0.0):
+        raise ValueError("T_camera_lidar bottom row must be [0, 0, 0, 1]")
+
+    rotation = transform[:3, :3]
+    u, _, vt = np.linalg.svd(rotation)
+    projected_rotation = u @ vt
+    if np.linalg.det(projected_rotation) < 0.0:
+        u[:, -1] *= -1.0
+        projected_rotation = u @ vt
+    if np.max(np.abs(projected_rotation - rotation)) > 1e-3:
+        raise ValueError("T_camera_lidar rotation is not sufficiently close to SO(3)")
+
+    projected_transform = transform.copy()
+    projected_transform[:3, :3] = projected_rotation
+    try:
+        invert_transform(projected_transform)
+    except ValueError as error:
+        raise ValueError(f"invalid T_camera_lidar: {error}") from error
+    return projected_transform
+
+
 def _uses_aster_slam_label_trajectory(platform: str) -> bool:
-    return platform.lower() in {"handheld", "legged", "ntu-viral", "ntu_viral"}
+    return platform.lower() in {
+        "handheld",
+        "legged",
+        "ntu-viral",
+        "ntu_viral",
+        "ugv",
+        "offroad",
+    }
 
 
 def _build_online_causal_positives(
@@ -128,8 +176,7 @@ def _build_online_causal_positives(
 ) -> List[Dict[str, Any]]:
     positives = []
     gt_poses = [
-        np.asarray(keyframe["gt_pose"], dtype=np.float64).reshape(4, 4)
-        for keyframe in keyframes
+        np.asarray(keyframe["gt_pose"], dtype=np.float64).reshape(4, 4) for keyframe in keyframes
     ]
 
     for query_pose, query_keyframe in zip(gt_poses, keyframes):

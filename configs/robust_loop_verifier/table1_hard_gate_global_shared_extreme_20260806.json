@@ -1,0 +1,112 @@
+{
+  "name": "table1_hard_gate_global_shared_extreme_20260806",
+  "sharing_scope": "global",
+  "score": {
+    "acceptance_threshold": -1.0,
+    "larger_is_better": true,
+    "type": "negative_max_normalized_gate_violation"
+  },
+  "benchmark": {
+    "review_root": "workspace/rover_aligned_benchmark/benchmark_v1_da3_auto_labels_v4_asterslam_main8_full_manual_review_20260701_013214_positive_recheck_main8_20260701_115646",
+    "candidate_scores": "workspace/rover_aligned_benchmark/benchmark_v1_da3_auto_labels_v4_asterslam_main8_full_manual_review_20260701_013214_positive_recheck_main8_20260701_115646/metrics/aster_hard_gate_max_violation_20260804/candidate_scores.jsonl",
+    "positive_count": 601,
+    "record_count": 3200,
+    "sequence_count": 8
+  },
+  "search": {
+    "seed": 20260806,
+    "global_samples": 200000,
+    "local_samples": 200000,
+    "local_rounds": 3,
+    "local_sigmas_log2": [2.0, 0.7071067811865476, 0.25],
+    "log2_bounds": [-12.0, 12.0],
+    "approximate_parameter_sets": 800592,
+    "exact_finalists": 317,
+    "mr_tolerance": 0.01,
+    "variable_gates": [
+      "sim3_alignment_rmse",
+      "sim3_direction_error",
+      "translation_norm",
+      "trajectory_deformation",
+      "pgo_error_per_factor",
+      "odom_strain_chi2",
+      "loop_chi2"
+    ],
+    "canonicalization": "inactive gates are replaced by the smallest listed threshold that preserves exact AP, MR@100P, TP@100P, and per-sequence metrics"
+  },
+  "solutions": {
+    "balanced": {
+      "macro_AP": 0.8021138774995012,
+      "macro_MR@100P": 0.4920908310333753,
+      "TP@100P": 259,
+      "thresholds": {
+        "salad_min_score": 0.8,
+        "support_min_baseline": 0.3,
+        "sim3_min_scale": 0.8,
+        "sim3_max_scale": 80.0,
+        "sim3_alignment_rmse": 0.11994959613985008,
+        "sim3_direction_error": 25.0,
+        "translation_norm": 2.1209394657684633,
+        "trajectory_deformation": 0.050433311544403996,
+        "pgo_error_per_factor": 1.0,
+        "odom_strain_chi2": 50.0,
+        "loop_chi2": 0.07388857725028568
+      }
+    },
+    "best_ap": {
+      "macro_AP": 0.8256262609869376,
+      "macro_MR@100P": 0.36736252230739247,
+      "TP@100P": 177,
+      "thresholds": {
+        "salad_min_score": 0.8,
+        "support_min_baseline": 0.3,
+        "sim3_min_scale": 0.8,
+        "sim3_max_scale": 80.0,
+        "sim3_alignment_rmse": 0.3721261,
+        "sim3_direction_error": 60.0,
+        "translation_norm": 5.4498769,
+        "trajectory_deformation": 0.17762041,
+        "pgo_error_per_factor": 1.0,
+        "odom_strain_chi2": 50.0,
+        "loop_chi2": 0.0034283927
+      }
+    },
+    "best_mr": {
+      "macro_AP": 0.7866047347441911,
+      "macro_MR@100P": 0.5018662178470878,
+      "TP@100P": 272,
+      "thresholds": {
+        "salad_min_score": 0.8,
+        "support_min_baseline": 0.3,
+        "sim3_min_scale": 0.8,
+        "sim3_max_scale": 80.0,
+        "sim3_alignment_rmse": 0.20042572,
+        "sim3_direction_error": 45.0,
+        "translation_norm": 2.1914687,
+        "trajectory_deformation": 0.044968636,
+        "pgo_error_per_factor": 0.0029979408,
+        "odom_strain_chi2": 0.1953125,
+        "loop_chi2": 195.15035
+      }
+    },
+    "best_tp": {
+      "macro_AP": 0.7922910757348288,
+      "macro_MR@100P": 0.4988200542405794,
+      "TP@100P": 274,
+      "thresholds": {
+        "salad_min_score": 0.8,
+        "support_min_baseline": 0.3,
+        "sim3_min_scale": 0.8,
+        "sim3_max_scale": 80.0,
+        "sim3_alignment_rmse": 0.20152626,
+        "sim3_direction_error": 45.0,
+        "translation_norm": 2.3757519,
+        "trajectory_deformation": 0.11834756,
+        "pgo_error_per_factor": 0.0048641197,
+        "odom_strain_chi2": 50.0,
+        "loop_chi2": 0.27801782
+      }
+    }
+  },
+  "result_directory": "workspace/rover_aligned_benchmark/benchmark_v1_da3_auto_labels_v4_asterslam_main8_full_manual_review_20260701_013214_positive_recheck_main8_20260701_115646/metrics/hard_gate_global_shared_extreme_sweep_20260806_v2"
+}

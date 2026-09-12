@@ -123,8 +123,12 @@ def test_fusionportablev2_batch_run_dry_run_selects_handheld_and_ugv(tmp_path):
     assert handheld["gt_label_source"] == "aster_slam_trajectory_keyframes"
     assert handheld["preprocess_status"] == "skipped_existing"
     assert handheld["query_limit"] == 12
-    assert rows[1]["gt_label_source"] == "external_gt_trajectory"
+    assert rows[1]["gt_label_source"] == "aster_slam_trajectory_keyframes"
+    assert rows[1]["gt_trajectory_file"].endswith(
+        "fusionportable_loop_dataset/ugv/ugv_campus00/raw/trajectory_keyframes.txt"
+    )
     assert rows[1]["preprocess_status"] == "pending"
+    assert rows[2]["gt_label_source"] == "aster_slam_trajectory_keyframes"
     assert rows[2]["preprocess_status"] == "pending"
     assert summary["overwrite_dataset"] is False
     assert summary["support_ensemble"] is False

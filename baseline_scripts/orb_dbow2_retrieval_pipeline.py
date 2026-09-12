@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import shlex
 import subprocess
@@ -171,12 +172,57 @@ class OrbDbow2RetrievalBackend:
         self.helper_build_dir.mkdir(parents=True, exist_ok=True)
         source_path = self.helper_build_dir / "orb_dbow2_retrieval_helper.cpp"
         binary_path = self.helper_build_dir / "orb_dbow2_retrieval_helper"
+        metadata_path = self.helper_build_dir / "orb_dbow2_retrieval_helper.build.json"
         source_text = _helper_source()
-        if self.rebuild_helper or not source_path.is_file() or source_path.read_text() != source_text:
+        source_hash = _sha256_text(source_text)
+        orb_commit = _git_commit_best_effort(self.orb_slam3_root)
+        expected_metadata = {
+            "helper_source_sha256": source_hash,
+            "orb_slam3_git_commit": orb_commit,
+        }
+        existing_metadata = _read_helper_build_metadata(metadata_path)
+        source_changed = (
+            not source_path.is_file()
+            or source_path.read_text(encoding="utf-8") != source_text
+        )
+        if self.rebuild_helper or source_changed:
             source_path.write_text(source_text, encoding="utf-8")
-        if self.rebuild_helper or not binary_path.is_file():
+        metadata_changed = existing_metadata != expected_metadata
+        should_compile = (
+            self.rebuild_helper
+            or source_changed
+            or metadata_changed
+            or not binary_path.is_file()
+        )
+        if should_compile and binary_path.exists():
+            binary_path.unlink()
+        if should_compile:
             self._compile_helper(source_path, binary_path)
+            if not binary_path.is_file():
+                raise FileNotFoundError(f"helper compile did not create binary: {binary_path}")
+            _write_helper_build_metadata(metadata_path, expected_metadata)
         return binary_path
+
+    def helper_source_path(self) -> Path:
+        return self.helper_build_dir / "orb_dbow2_retrieval_helper.cpp"
+
+    def helper_binary_path(self) -> Path:
+        return self.helper_build_dir / "orb_dbow2_retrieval_helper"
+
+    def helper_fingerprints(self) -> dict[str, str]:
+        helper_binary = self.ensure_helper_built()
+        dbow2_path = _resolve_ldd_library(helper_binary, "libDBoW2.so")
+        return {
+            "helper_source_path": str(self.helper_source_path().resolve()),
+            "helper_source_sha256": _sha256_file(self.helper_source_path()),
+            "helper_binary_path": str(helper_binary.resolve()),
+            "helper_binary_sha256": _sha256_file(helper_binary),
+            "orb_slam3_git_commit": _git_commit(self.orb_slam3_root),
+            "vocabulary_path": str(self.vocabulary_path.resolve()),
+            "vocabulary_sha256": _sha256_file(self.vocabulary_path),
+            "dbow2_shared_library_path": str(dbow2_path.resolve()),
+            "dbow2_shared_library_sha256": _sha256_file(dbow2_path),
+        }
 
     def _compile_helper(self, source_path: Path, binary_path: Path) -> None:
         opencv_flags = _opencv_pkg_config_flags()
@@ -532,6 +578,80 @@ def _opencv_pkg_config_flags() -> list[str]:
     raise RuntimeError("OpenCV pkg-config package was not found: tried opencv4 and opencv")
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _git_commit(repo_root: Path) -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"failed to resolve git commit for {repo_root}") from exc
+
+
+def _git_commit_best_effort(repo_root: Path) -> str | None:
+    try:
+        return _git_commit(repo_root)
+    except RuntimeError:
+        return None
+
+
+def _read_helper_build_metadata(path: Path) -> dict[str, str | None] | None:
+    if not Path(path).is_file():
+        return None
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return {
+        "helper_source_sha256": data.get("helper_source_sha256"),
+        "orb_slam3_git_commit": data.get("orb_slam3_git_commit"),
+    }
+
+
+def _write_helper_build_metadata(path: Path, metadata: dict[str, str | None]) -> None:
+    Path(path).write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _resolve_ldd_library(binary_path: Path, library_name: str) -> Path:
+    output = subprocess.check_output(["ldd", str(binary_path)], text=True)
+    for line in output.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(library_name):
+            continue
+        fields = stripped.split("=>", maxsplit=1)
+        if len(fields) != 2:
+            continue
+        resolved_text = fields[1].strip()
+        if resolved_text.startswith("not found"):
+            raise FileNotFoundError(f"{library_name} was reported as not found by ldd")
+        path_text = resolved_text.split()[0]
+        resolved = Path(path_text)
+        if not resolved.is_file():
+            raise FileNotFoundError(
+                f"{library_name} resolved by ldd but does not exist: {resolved}"
+            )
+        return resolved
+    raise FileNotFoundError(f"{library_name} was not found in ldd output for {binary_path}")
+
+
 def _write_markdown(path: Path, summary: dict[str, object]) -> None:
     lines = [
         "| platform | sequence | method | AP | MR@100P |",
@@ -576,6 +696,7 @@ def _helper_source() -> str:
 #include <algorithm>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
@@ -706,7 +827,7 @@ int main(int argc, char** argv) {
         std::cout << query.keyframe_idx << '\t'
                   << scored[i].second << '\t'
                   << (i + 1) << '\t'
-                  << scored[i].first << '\n';
+                  << std::setprecision(17) << scored[i].first << '\n';
       }
     }
   } catch (const std::exception& error) {

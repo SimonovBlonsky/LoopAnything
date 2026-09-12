@@ -35,21 +35,26 @@ def assign_failure_worst_scores(scores: Iterable[float | None]) -> List[float]:
 
 
 def average_precision(labels: Sequence[bool], scores: Sequence[float]) -> float:
-    """Compute candidate-level average precision over larger-is-better scores."""
+    """Compute tie-safe average precision over larger-is-better scores."""
 
     labels, scores = _validate_labels_and_scores(labels, scores)
     total_positives = sum(labels)
     if total_positives == 0:
         return 0.0
 
-    precision_sum = 0.0
     positives_seen = 0
-    for rank, (label, _) in enumerate(_stable_score_order(labels, scores), start=1):
-        if label:
-            positives_seen += 1
-            precision_sum += positives_seen / rank
+    candidates_seen = 0
+    previous_recall = 0.0
+    result = 0.0
+    for group in _score_threshold_groups(labels, scores):
+        candidates_seen += len(group)
+        positives_seen += sum(label for label, _ in group)
+        recall = positives_seen / total_positives
+        precision = positives_seen / candidates_seen
+        result += (recall - previous_recall) * precision
+        previous_recall = recall
 
-    return precision_sum / total_positives
+    return result
 
 
 def max_recall_at_100_precision(labels: Sequence[bool], scores: Sequence[float]) -> float:

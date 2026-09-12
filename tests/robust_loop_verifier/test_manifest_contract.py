@@ -47,6 +47,32 @@ def test_preprocessed_cache_manifest_keyframes_and_positives_contract(tmp_path: 
     for idx in range(5):
         Image.new("RGB", (8, 8), color=(idx, 0, 0)).save(image_dir / f"{idx:06d}.png")
 
+    (raw_dir / "sequence_meta.json").write_text(
+        json.dumps(
+            {
+                "sequence_name": "handheld_test",
+                "T_camera_lidar": [
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
     (raw_dir / "keyframes_with_images.jsonl").write_text(
         "".join(
             json.dumps(

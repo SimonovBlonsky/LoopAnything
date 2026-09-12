@@ -1,0 +1,114 @@
+{
+  "name": "table1_hard_gate_platform_shared_20260804",
+  "score": {
+    "acceptance_threshold": -1.0,
+    "larger_is_better": true,
+    "type": "negative_max_normalized_gate_violation"
+  },
+  "benchmark": {
+    "annotations": "workspace/rover_aligned_benchmark/benchmark_v1_da3_auto_labels_v4_asterslam_main8_full_manual_review_20260701_013214_positive_recheck_main8_20260701_115646/annotations.jsonl",
+    "candidate_scores": "workspace/rover_aligned_benchmark/benchmark_v1_da3_auto_labels_v4_asterslam_main8_full_manual_review_20260701_013214_positive_recheck_main8_20260701_115646/metrics/aster_hard_gate_max_violation_20260804/candidate_scores.jsonl",
+    "positive_count": 601,
+    "record_count": 3200
+  },
+  "selection": {
+    "coordinate_refinement_passes": 3,
+    "mr_tolerance": 0.01,
+    "primary_grid_gates": [
+      "sim3_max_scale",
+      "sim3_direction_error",
+      "trajectory_deformation",
+      "loop_chi2"
+    ],
+    "rule": "retain settings within mr_tolerance macro MR@100P of the group-best MR@100P, then maximize macro AP",
+    "threshold_multipliers": [
+      0.0625,
+      0.125,
+      0.25,
+      0.5,
+      1.0,
+      2.0,
+      4.0,
+      8.0,
+      16.0
+    ]
+  },
+  "platform_groups": {
+    "handheld": [
+      "FusionPortableV2/handheld/handheld_escalator00",
+      "FusionPortableV2/handheld/handheld_room00"
+    ],
+    "ugv": [
+      "FusionPortableV2/ugv/ugv_campus01",
+      "FusionPortableV2/ugv/ugv_parking01"
+    ],
+    "geode": [
+      "GEODE/Offroad/Offroad02_beta",
+      "GEODE/Offroad/Offroad05_beta"
+    ],
+    "ntu": [
+      "NTU-VIRAL/NTU-VIRAL/eee_01",
+      "NTU-VIRAL/NTU-VIRAL/nya_02"
+    ]
+  },
+  "thresholds_by_group": {
+    "handheld": {
+      "salad_min_score": 0.51,
+      "support_min_baseline": 0.3,
+      "sim3_min_scale": 0.8,
+      "sim3_max_scale": 80.0,
+      "sim3_alignment_rmse": 6.0,
+      "sim3_direction_error": 40.0,
+      "translation_norm": 5.0,
+      "trajectory_deformation": 0.32,
+      "pgo_error_per_factor": 8.0,
+      "odom_strain_chi2": 800.0,
+      "loop_chi2": 1.5625
+    },
+    "ugv": {
+      "salad_min_score": 0.8,
+      "support_min_baseline": 0.3,
+      "sim3_min_scale": 0.8,
+      "sim3_max_scale": 80.0,
+      "sim3_alignment_rmse": 6.4,
+      "sim3_direction_error": 20.0,
+      "translation_norm": 10.0,
+      "trajectory_deformation": 0.4,
+      "pgo_error_per_factor": 8.0,
+      "odom_strain_chi2": 800.0,
+      "loop_chi2": 1.5625
+    },
+    "geode": {
+      "salad_min_score": 0.84,
+      "support_min_baseline": 0.3,
+      "sim3_min_scale": 0.8,
+      "sim3_max_scale": 80.0,
+      "sim3_alignment_rmse": 0.1375,
+      "sim3_direction_error": 32.0,
+      "translation_norm": 5.0,
+      "trajectory_deformation": 0.0275,
+      "pgo_error_per_factor": 8.0,
+      "odom_strain_chi2": 800.0,
+      "loop_chi2": 6.25
+    },
+    "ntu": {
+      "salad_min_score": 0.62,
+      "support_min_baseline": 0.3,
+      "sim3_min_scale": 0.8,
+      "sim3_max_scale": 320.0,
+      "sim3_alignment_rmse": 8.0,
+      "sim3_direction_error": 160.0,
+      "translation_norm": 5.0,
+      "trajectory_deformation": 0.0075,
+      "pgo_error_per_factor": 8.0,
+      "odom_strain_chi2": 800.0,
+      "loop_chi2": 6.25
+    }
+  },
+  "selected_results": {
+    "macro_AP": 0.8338157422223978,
+    "macro_MR@100P": 0.4438600147401779,
+    "TP@100P": 205,
+    "positive_count": 601
+  }
+}

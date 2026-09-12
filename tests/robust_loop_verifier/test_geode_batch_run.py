@@ -139,8 +139,10 @@ def test_geode_batch_run_dry_run_defaults_to_offroad05_beta_with_support_ensembl
     row = rows[0]
     assert row["platform"] == "Offroad"
     assert row["sequence_name"] == "Offroad05_beta"
-    assert row["gt_trajectory_file"].endswith("Offroad5.txt")
-    assert row["gt_label_source"] == "external_gt_trajectory"
+    assert row["gt_trajectory_file"].endswith(
+        "geode_loop_dataset/Offroad/Offroad05_beta/raw/trajectory_keyframes.txt"
+    )
+    assert row["gt_label_source"] == "aster_slam_trajectory_keyframes"
     assert row["preprocess_status"] == "skipped_existing"
     assert row["query_limit"] == 12
 
@@ -231,7 +233,10 @@ def test_geode_batch_run_resolves_nested_gt_layout(tmp_path):
     summary = json.loads((batch_root / "batch_summary.json").read_text(encoding="utf-8"))
     row = summary["sequences"][0]
     assert row["sequence_name"] == "Offroad01_beta"
-    assert row["gt_trajectory_file"].endswith("Offroad1/Offroad1.txt")
+    assert row["gt_trajectory_file"].endswith(
+        "geode_loop_dataset/Offroad/Offroad01_beta/raw/trajectory_keyframes.txt"
+    )
+    assert row["gt_label_source"] == "aster_slam_trajectory_keyframes"
 
 
 def test_geode_batch_merges_selected_score_sweep_metrics(tmp_path):

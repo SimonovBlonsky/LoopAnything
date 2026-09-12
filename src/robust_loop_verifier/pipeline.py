@@ -31,6 +31,7 @@ from robust_loop_verifier.pgo import (
 )
 from robust_loop_verifier.retrieval import (
     DescriptorSet,
+    RetrievalCandidate,
     SaladDescriptorBackend,
     SaladDescriptorBackendConfig,
     retrieve_historical_topk,
@@ -190,18 +191,35 @@ def run_cached_sequence(
                 records.append(record)
             continue
 
-        query_records = _score_candidates_with_batched_triplets(
+        frozen_candidates = [
+            {
+                "pair_id": (
+                    f"runtime_q{query_idx:06d}_c{int(candidate.candidate_idx):06d}"
+                ),
+                "candidate_idx": int(candidate.candidate_idx),
+                "rank": int(candidate.rank),
+                "score": float(candidate.score),
+            }
+            for candidate in candidates
+        ]
+        query_records = score_frozen_query_candidates(
             config=config,
-            candidates=candidates,
-            positive_indices=positive_indices,
+            query_idx=query_idx,
+            frozen_candidates=frozen_candidates,
             image_by_idx=image_by_idx,
             odom_by_idx=odom_by_idx,
             cache_order=cache_order,
             da3_runner=da3_runner,
             timing=timing,
         )
+        for record in query_records:
+            label = int(record["candidate_idx"]) in positive_indices
+            record["label"] = label
         records.extend(query_records)
         labels.extend(bool(record["label"]) for record in query_records)
+
+    for record in records:
+        record.pop("pair_id", None)
 
     method_scores = {
         METHOD_SALAD: [record["score_salad"] for record in records],
@@ -231,6 +249,107 @@ def run_cached_sequence(
     if timing_summary is not None:
         result["timing"] = timing_summary
     return result
+
+
+def score_frozen_query_candidates(
+    *,
+    config,
+    query_idx: int,
+    frozen_candidates: Sequence[Mapping[str, Any]],
+    image_by_idx: Mapping[int, Path],
+    odom_by_idx: Mapping[int, np.ndarray],
+    cache_order: Sequence[int],
+    da3_runner,
+    timing: dict[str, list[float]] | None = None,
+    run_pgo: bool = True,
+) -> list[dict[str, Any]]:
+    """Score caller-supplied candidates without retrieval or labels."""
+
+    candidates = [
+        RetrievalCandidate(
+            query_idx=int(query_idx),
+            candidate_idx=int(candidate["candidate_idx"]),
+            rank=int(candidate["rank"]),
+            score=float(candidate.get("score", candidate.get("salad_score", 0.0))),
+        )
+        for candidate in frozen_candidates
+    ]
+    pair_ids = [str(candidate["pair_id"]) for candidate in frozen_candidates]
+
+    if config.support_ensemble.enabled and run_pgo:
+        records = []
+        for pair_id, candidate in zip(pair_ids, candidates):
+            record = _score_candidate(
+                config=config,
+                candidate=candidate,
+                label=False,
+                image_by_idx=image_by_idx,
+                odom_by_idx=odom_by_idx,
+                cache_order=cache_order,
+                da3_runner=da3_runner,
+                timing=timing,
+            )
+            record["pair_id"] = pair_id
+            record.pop("label", None)
+            records.append(record)
+        return _finalize_frozen_candidate_records(
+            records,
+            pair_ids,
+            run_pgo=run_pgo,
+        )
+
+    records = _score_candidates_with_batched_triplets(
+        config=config,
+        candidates=candidates,
+        positive_indices=set(),
+        image_by_idx=image_by_idx,
+        odom_by_idx=odom_by_idx,
+        cache_order=cache_order,
+        da3_runner=da3_runner,
+        timing=timing,
+        run_pgo=run_pgo,
+    )
+    return _finalize_frozen_candidate_records(
+        records,
+        pair_ids,
+        run_pgo=run_pgo,
+    )
+
+
+def _finalize_frozen_candidate_records(
+    records: Sequence[dict[str, Any]],
+    pair_ids: Sequence[str],
+    *,
+    run_pgo: bool,
+) -> list[dict[str, Any]]:
+    if len(records) != len(pair_ids):
+        raise ValueError(
+            f"scored record count mismatch: expected {len(pair_ids)}, got {len(records)}"
+        )
+    for pair_id, record in zip(pair_ids, records):
+        record["pair_id"] = pair_id
+        record.pop("label", None)
+        if not run_pgo:
+            _clear_pose_only_verifier_fields(record)
+    return [_jsonable(record) for record in records]
+
+
+def _clear_pose_only_verifier_fields(record: dict[str, Any]) -> None:
+    for field in (
+        "pgo_converged",
+        "pgo_error_before",
+        "pgo_error_after",
+        "pgo_failure_reason",
+        "trajectory_deformation_rmse",
+        "score_rover",
+        "score_rover_source",
+        "support_ensemble_loop_chi2_after",
+        "support_ensemble_odom_strain_chi2_after",
+        "support_ensemble_graph_evidence_nll",
+        "score_support_ensemble",
+    ):
+        if field in record:
+            record[field] = None
 
 
 def _synthetic_bent_poses() -> list[np.ndarray]:
@@ -358,6 +477,7 @@ def _new_candidate_record(
         "salad_score": float(candidate.score),
         "score_salad": float(candidate.score),
         "score_da3_sim3": None,
+        "loop_factor": None,
         "score_rover": None,
         "score_rover_source": None,
         "support_idx": None,
@@ -488,6 +608,7 @@ def _score_single_support_candidate_after_da3(
     failure_reasons: list[str],
     timing: dict[str, list[float]] | None,
     candidate_start: float | None,
+    run_pgo: bool = True,
 ) -> dict[str, Any]:
     try:
         sim3_start = _timing_start(timing)
@@ -510,7 +631,17 @@ def _score_single_support_candidate_after_da3(
         reason = sim3.rejection_reason or "unknown"
         failure_reasons.append(f"sim3: {reason}")
         return _finish_candidate_timing(record, timing, candidate_start)
+    loop_factor, rejection_reason = _validated_loop_factor(sim3.loop_factor)
+    if loop_factor is None:
+        record["sim3_valid"] = False
+        record["sim3_rejection_reason"] = rejection_reason
+        failure_reasons.append(f"sim3: {rejection_reason}")
+        return _finish_candidate_timing(record, timing, candidate_start)
+    record["loop_factor"] = loop_factor.reshape(-1)
     record["score_da3_sim3"] = -float(sim3.support_alignment_residual_m)
+    if not run_pgo:
+        record["pgo_converged"] = None
+        return _finish_candidate_timing(record, timing, candidate_start)
 
     prefix_indices = _prefix_indices_through_query(cache_order, query_idx)
     prefix_poses = [odom_by_idx[index] for index in prefix_indices]
@@ -520,7 +651,7 @@ def _score_single_support_candidate_after_da3(
         odom_poses=prefix_poses,
         loop_from_idx=query_idx,
         loop_to_idx=candidate_idx,
-        loop_factor=sim3.loop_factor,
+        loop_factor=loop_factor,
         noise=_pgo_noise_from_config(config),
     )
     _record_record_timing(record, timing, "pgo", pgo_start)
@@ -553,6 +684,7 @@ def _score_candidates_with_batched_triplets(
     cache_order: Sequence[int],
     da3_runner,
     timing: dict[str, list[float]] | None = None,
+    run_pgo: bool = True,
 ) -> list[dict[str, Any]]:
     records: list[dict[str, Any] | None] = [None for _ in candidates]
     pending: list[dict[str, Any]] = []
@@ -591,14 +723,19 @@ def _score_candidates_with_batched_triplets(
             records[position] = _finish_candidate_timing(record, timing, candidate_start)
             continue
 
-        triplet = build_da3_triplet(
-            image_by_idx[query_idx],
-            image_by_idx[candidate_idx],
-            image_by_idx[support.support_idx],
-            query_idx=query_idx,
-            candidate_idx=candidate_idx,
-            support_idx=support.support_idx,
-        )
+        try:
+            triplet = build_da3_triplet(
+                image_by_idx[query_idx],
+                image_by_idx[candidate_idx],
+                image_by_idx[support.support_idx],
+                query_idx=query_idx,
+                candidate_idx=candidate_idx,
+                support_idx=support.support_idx,
+            )
+        except Exception as exc:
+            failure_reasons.append(f"triplet: {type(exc).__name__}: {exc}")
+            records[position] = _finish_candidate_timing(record, timing, candidate_start)
+            continue
         pending.append(
             {
                 "position": position,
@@ -656,6 +793,7 @@ def _score_candidates_with_batched_triplets(
                 failure_reasons=item["failure_reasons"],
                 timing=timing,
                 candidate_start=item["candidate_start"],
+                run_pgo=run_pgo,
             )
 
     return [record for record in records if record is not None]
@@ -809,6 +947,11 @@ def _score_candidate_with_support_ensemble(
         reason = ensemble.rejection_reason or "unknown"
         failure_reasons.append(f"support_ensemble: {reason}")
         return record
+    loop_factor, rejection_reason = _validated_loop_factor(ensemble.loop_factor_mean)
+    if loop_factor is None:
+        failure_reasons.append(f"support_ensemble: {rejection_reason}")
+        return record
+    record["loop_factor"] = loop_factor.reshape(-1)
 
     prefix_indices = _prefix_indices_through_query(cache_order, query_idx)
     prefix_poses = [odom_by_idx[index] for index in prefix_indices]
@@ -818,7 +961,7 @@ def _score_candidate_with_support_ensemble(
         odom_poses=prefix_poses,
         loop_from_idx=query_idx,
         loop_to_idx=candidate_idx,
-        loop_factor=ensemble.loop_factor_mean,
+        loop_factor=loop_factor,
         noise=_pgo_noise_from_config(config),
         loop_sigmas_override=ensemble.loop_sigmas,
     )
@@ -1183,6 +1326,18 @@ def _parse_flat_pose(value: Any, field_name: str) -> np.ndarray:
     if not np.all(np.isfinite(pose)):
         raise ValueError(f"{field_name} must contain only finite values")
     return pose
+
+
+def _validated_loop_factor(value: Any) -> tuple[np.ndarray | None, str | None]:
+    try:
+        loop_factor = np.asarray(value, dtype=np.float64)
+    except (OverflowError, TypeError, ValueError):
+        return None, "invalid_loop_factor"
+    if loop_factor.shape != (4, 4):
+        return None, "invalid_loop_factor"
+    if not np.all(np.isfinite(loop_factor)):
+        return None, "invalid_loop_factor"
+    return loop_factor, None
 
 
 def _prefix_indices_through_query(cache_order: Sequence[int], query_idx: int) -> list[int]:

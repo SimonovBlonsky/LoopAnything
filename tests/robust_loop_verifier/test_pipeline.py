@@ -1,12 +1,18 @@
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from robust_loop_verifier.pgo import PgoResult
-from robust_loop_verifier.pipeline import run_cached_sequence, run_mock_sequence_evaluation
+from robust_loop_verifier.pipeline import (
+    run_cached_sequence,
+    run_mock_sequence_evaluation,
+    score_frozen_query_candidates,
+)
+from robust_loop_verifier.sim3_factor import Sim3LoopFactorResult
 
 
 def _cached_config(tmp_path: Path, **overrides):
@@ -289,6 +295,350 @@ def test_run_cached_sequence_mock_writes_metrics_records_and_artifact_dirs(tmp_p
     assert any(record["query_idx"] == 5 and record["candidate_idx"] == 0 for record in records)
 
 
+def test_run_cached_sequence_does_not_emit_internal_pair_ids(tmp_path: Path):
+    sequence_cache = tmp_path / "cache"
+    output_root = tmp_path / "run"
+    _write_tiny_sequence_cache(sequence_cache, positives_by_query={5: [1]})
+
+    run_cached_sequence(
+        _cached_config(tmp_path),
+        sequence_cache=sequence_cache,
+        output_root=output_root,
+        query_limit=6,
+        backend="mock",
+    )
+
+    records = _read_candidate_records(output_root)
+    assert records
+    assert all("pair_id" not in record for record in records)
+
+
+def test_score_frozen_query_candidates_preserves_caller_pair_id(tmp_path, monkeypatch):
+    def fake_score_candidates_with_batched_triplets(**kwargs):
+        assert kwargs["candidates"][0].score == 0.42
+        return [
+            {
+                "query_idx": 3,
+                "candidate_idx": 0,
+                "rank": 1,
+                "label": False,
+            }
+        ]
+
+    monkeypatch.setattr(
+        "robust_loop_verifier.pipeline._score_candidates_with_batched_triplets",
+        fake_score_candidates_with_batched_triplets,
+    )
+
+    records = score_frozen_query_candidates(
+        config=_cached_config(tmp_path),
+        query_idx=3,
+        frozen_candidates=[
+            {
+                "pair_id": "caller-pair",
+                "candidate_idx": 0,
+                "rank": 1,
+                "score": 0.42,
+            }
+        ],
+        image_by_idx={},
+        odom_by_idx={},
+        cache_order=[],
+        da3_runner=object(),
+    )
+
+    assert records == [
+        {
+            "pair_id": "caller-pair",
+            "query_idx": 3,
+            "candidate_idx": 0,
+            "rank": 1,
+        }
+    ]
+
+
+def test_score_frozen_query_candidates_exports_batched_loop_factors_without_pgo(
+    tmp_path,
+    monkeypatch,
+):
+    batch_sizes = []
+    alignment_calls = []
+    loop_factor = np.eye(4, dtype=np.float64)
+    loop_factor[:3, 3] = [1.0, 2.0, 3.0]
+
+    class BatchOnlyRunner:
+        def run_triplet(self, triplet):
+            raise AssertionError("single triplet inference should not be used")
+
+        def run_triplets(self, triplets):
+            batch_sizes.append(len(triplets))
+            return [SimpleNamespace(predicted_c2w=np.empty((3, 4, 4))) for _ in triplets]
+
+    def fake_align(predicted_c2w, odom_candidate, odom_support):
+        alignment_calls.append((odom_candidate.copy(), odom_support.copy()))
+        return Sim3LoopFactorResult(
+            valid=True,
+            loop_factor=loop_factor.copy(),
+            sim3_scale=2.0,
+            support_alignment_residual_m=0.25,
+            direction_error_deg=3.0,
+            rejection_reason=None,
+        )
+
+    def forbidden_pgo(*args, **kwargs):
+        raise AssertionError("run_full_prefix_pgo must not run")
+
+    monkeypatch.setattr(
+        "robust_loop_verifier.pipeline.align_triplet_to_candidate_support",
+        fake_align,
+    )
+    monkeypatch.setattr(
+        "robust_loop_verifier.pipeline.run_full_prefix_pgo",
+        forbidden_pgo,
+    )
+
+    image_by_idx = {idx: tmp_path / f"{idx}.png" for idx in range(6)}
+    odom_by_idx = {
+        idx: np.asarray(_pose_at_x(float(idx)), dtype=np.float64).reshape(4, 4) for idx in range(6)
+    }
+    records = score_frozen_query_candidates(
+        config=_cached_config(
+            tmp_path,
+            da3={
+                "process_res": 504,
+                "ref_view_strategy": "first",
+                "triplet_batch_size": 4,
+            },
+        ),
+        query_idx=5,
+        frozen_candidates=[
+            {"pair_id": "p1", "candidate_idx": 0, "rank": 1, "score": 0.9},
+            {"pair_id": "p2", "candidate_idx": 1, "rank": 2, "score": 0.8},
+        ],
+        image_by_idx=image_by_idx,
+        odom_by_idx=odom_by_idx,
+        cache_order=list(range(6)),
+        da3_runner=BatchOnlyRunner(),
+        run_pgo=False,
+    )
+
+    assert batch_sizes == [2]
+    assert len(alignment_calls) == 2
+    assert [record["pair_id"] for record in records] == ["p1", "p2"]
+    assert all(record["support_idx"] is not None for record in records)
+    assert all(record["score_da3_sim3"] == -0.25 for record in records)
+    assert all(record["loop_factor"] == loop_factor.reshape(-1).tolist() for record in records)
+    assert all(record["pgo_converged"] is None for record in records)
+    assert all(record["pgo_error_before"] is None for record in records)
+    assert all(record["pgo_error_after"] is None for record in records)
+    assert all(record["pgo_failure_reason"] is None for record in records)
+    assert all(record["trajectory_deformation_rmse"] is None for record in records)
+    assert all(record["score_rover"] is None for record in records)
+    assert all(record["score_rover_source"] is None for record in records)
+    json.dumps(records, allow_nan=False)
+
+
+def test_score_frozen_query_candidates_clears_pose_only_pgo_fields_on_failures(
+    tmp_path,
+    monkeypatch,
+):
+    image_by_idx = {idx: tmp_path / f"{idx}.png" for idx in range(4)}
+    odom_by_idx = {
+        idx: np.asarray(_pose_at_x(float(idx)), dtype=np.float64).reshape(4, 4)
+        for idx in range(4)
+    }
+    frozen_candidates = [
+        {"pair_id": "p1", "candidate_idx": 0, "rank": 1, "score": 0.9},
+    ]
+
+    class FailingDa3Runner:
+        def run_triplets(self, triplets):
+            raise RuntimeError("forced da3 failure")
+
+    class PassingDa3Runner:
+        def run_triplets(self, triplets):
+            return [SimpleNamespace(predicted_c2w=np.empty((3, 4, 4))) for _ in triplets]
+
+    def score_with(**kwargs):
+        return score_frozen_query_candidates(
+            config=kwargs.pop("config", _cached_config(tmp_path)),
+            query_idx=3,
+            frozen_candidates=frozen_candidates,
+            image_by_idx=image_by_idx,
+            odom_by_idx=odom_by_idx,
+            cache_order=list(range(4)),
+            run_pgo=False,
+            **kwargs,
+        )[0]
+
+    support_failure = score_with(
+        config=_cached_config(tmp_path, min_support_baseline_m=99.0),
+        da3_runner=PassingDa3Runner(),
+    )
+    da3_failure = score_with(da3_runner=FailingDa3Runner())
+    monkeypatch.setattr(
+        "robust_loop_verifier.pipeline.align_triplet_to_candidate_support",
+        lambda *args, **kwargs: Sim3LoopFactorResult(
+            valid=False,
+            loop_factor=None,
+            sim3_scale=None,
+            support_alignment_residual_m=None,
+            direction_error_deg=None,
+            rejection_reason="forced_sim3_failure",
+        ),
+    )
+    sim3_failure = score_with(da3_runner=PassingDa3Runner())
+
+    for record in (support_failure, da3_failure, sim3_failure):
+        assert record["pgo_converged"] is None
+        assert record["pgo_error_before"] is None
+        assert record["pgo_error_after"] is None
+        assert record["pgo_failure_reason"] is None
+        assert record["trajectory_deformation_rmse"] is None
+        assert record["score_rover"] is None
+        assert record["score_rover_source"] is None
+
+
+@pytest.mark.parametrize(
+    "bad_loop_factor",
+    [
+        np.full((4, 4), np.nan, dtype=np.float64),
+        np.eye(3, dtype=np.float64),
+        np.full((4, 4), 10**1000, dtype=object),
+    ],
+)
+def test_score_frozen_query_candidates_rejects_invalid_pose_only_loop_factor(
+    tmp_path,
+    monkeypatch,
+    bad_loop_factor,
+):
+    class PassingDa3Runner:
+        def run_triplets(self, triplets):
+            return [SimpleNamespace(predicted_c2w=np.empty((3, 4, 4))) for _ in triplets]
+
+    monkeypatch.setattr(
+        "robust_loop_verifier.pipeline.align_triplet_to_candidate_support",
+        lambda *args, **kwargs: Sim3LoopFactorResult(
+            valid=True,
+            loop_factor=bad_loop_factor,
+            sim3_scale=1.0,
+            support_alignment_residual_m=0.25,
+            direction_error_deg=0.0,
+            rejection_reason=None,
+        ),
+    )
+
+    image_by_idx = {idx: tmp_path / f"{idx}.png" for idx in range(4)}
+    odom_by_idx = {
+        idx: np.asarray(_pose_at_x(float(idx)), dtype=np.float64).reshape(4, 4)
+        for idx in range(4)
+    }
+    records = score_frozen_query_candidates(
+        config=_cached_config(tmp_path),
+        query_idx=3,
+        frozen_candidates=[
+            {"pair_id": "p1", "candidate_idx": 0, "rank": 1, "score": 0.9},
+        ],
+        image_by_idx=image_by_idx,
+        odom_by_idx=odom_by_idx,
+        cache_order=list(range(4)),
+        da3_runner=PassingDa3Runner(),
+        run_pgo=False,
+    )
+
+    assert records[0]["loop_factor"] is None
+    assert records[0]["score_da3_sim3"] is None
+    assert records[0]["sim3_valid"] is False
+    assert records[0]["sim3_rejection_reason"] == "invalid_loop_factor"
+    assert "sim3: invalid_loop_factor" in records[0]["failure_reasons"]
+    assert records[0]["pgo_converged"] is None
+
+
+def test_score_frozen_query_candidates_isolates_missing_image_triplet_failure(
+    tmp_path,
+    monkeypatch,
+):
+    loop_factor = np.eye(4, dtype=np.float64)
+
+    class PassingDa3Runner:
+        def run_triplets(self, triplets):
+            return [SimpleNamespace(predicted_c2w=np.empty((3, 4, 4))) for _ in triplets]
+
+    monkeypatch.setattr(
+        "robust_loop_verifier.pipeline.align_triplet_to_candidate_support",
+        lambda *args, **kwargs: Sim3LoopFactorResult(
+            valid=True,
+            loop_factor=loop_factor.copy(),
+            sim3_scale=1.0,
+            support_alignment_residual_m=0.0,
+            direction_error_deg=0.0,
+            rejection_reason=None,
+        ),
+    )
+
+    image_by_idx = {idx: tmp_path / f"{idx}.png" for idx in (1, 2, 3, 4)}
+    odom_by_idx = {
+        idx: np.asarray(_pose_at_x(float(idx)), dtype=np.float64).reshape(4, 4)
+        for idx in range(5)
+    }
+    records = score_frozen_query_candidates(
+        config=_cached_config(tmp_path),
+        query_idx=4,
+        frozen_candidates=[
+            {"pair_id": "missing-image", "candidate_idx": 0, "rank": 1, "score": 0.9},
+            {"pair_id": "ok", "candidate_idx": 1, "rank": 2, "score": 0.8},
+        ],
+        image_by_idx=image_by_idx,
+        odom_by_idx=odom_by_idx,
+        cache_order=list(range(5)),
+        da3_runner=PassingDa3Runner(),
+        run_pgo=False,
+    )
+
+    assert [record["pair_id"] for record in records] == ["missing-image", "ok"]
+    failed, succeeded = records
+    assert failed["loop_factor"] is None
+    assert failed["score_da3_sim3"] is None
+    assert failed["pgo_converged"] is None
+    assert any("triplet:" in reason for reason in failed["failure_reasons"])
+    assert succeeded["loop_factor"] == loop_factor.reshape(-1).tolist()
+    assert succeeded["score_da3_sim3"] == -0.0
+
+
+def test_score_frozen_query_candidates_rejects_scored_record_count_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    def fake_score_candidates_with_batched_triplets(**kwargs):
+        return [
+            {
+                "query_idx": 3,
+                "candidate_idx": 0,
+                "rank": 1,
+                "label": False,
+            }
+        ]
+
+    monkeypatch.setattr(
+        "robust_loop_verifier.pipeline._score_candidates_with_batched_triplets",
+        fake_score_candidates_with_batched_triplets,
+    )
+
+    with pytest.raises(ValueError, match="scored record count"):
+        score_frozen_query_candidates(
+            config=_cached_config(tmp_path),
+            query_idx=3,
+            frozen_candidates=[
+                {"pair_id": "p1", "candidate_idx": 0, "rank": 1, "score": 0.9},
+                {"pair_id": "p2", "candidate_idx": 1, "rank": 2, "score": 0.8},
+            ],
+            image_by_idx={},
+            odom_by_idx={},
+            cache_order=[],
+            da3_runner=object(),
+        )
+
+
 def test_run_cached_sequence_batches_single_support_candidates_by_query(tmp_path: Path):
     from robust_loop_verifier.da3_runner import MockDa3Runner
 
@@ -514,6 +864,78 @@ def test_support_ensemble_pgo_failure_serializes_sanitized_records(
     )
     assert all(record["pgo_error_before"] is None for record in records)
     assert all(record["pgo_error_after"] is None for record in records)
+
+
+def test_support_ensemble_success_exports_json_safe_loop_factor(
+    tmp_path,
+    monkeypatch,
+):
+    loop_factor = np.eye(4, dtype=np.float64)
+    loop_factor[:3, 3] = [4.0, 5.0, 6.0]
+    captured_pgo = {}
+
+    class FakeRunner:
+        def run_triplet(self, triplet):
+            return SimpleNamespace(predicted_c2w=np.empty((3, 4, 4)))
+
+    monkeypatch.setattr(
+        "robust_loop_verifier.pipeline.align_triplet_to_candidate_support",
+        lambda *args, **kwargs: Sim3LoopFactorResult(
+            valid=True,
+            loop_factor=loop_factor.copy(),
+            sim3_scale=1.0,
+            support_alignment_residual_m=0.0,
+            direction_error_deg=0.0,
+            rejection_reason=None,
+        ),
+    )
+
+    def capture_pgo(prefix_indices, odom_poses, *args, **kwargs):
+        captured_pgo["loop_factor"] = np.asarray(kwargs["loop_factor"], dtype=np.float64)
+        return PgoResult(
+            converged=True,
+            optimized_poses=[np.asarray(pose, dtype=np.float64).copy() for pose in odom_poses],
+            error_before=0.0,
+            error_after=0.0,
+            failure_reason=None,
+            loop_chi2_after=0.0,
+            odom_strain_chi2_after=0.0,
+        )
+
+    monkeypatch.setattr(
+        "robust_loop_verifier.pipeline.run_full_prefix_pgo",
+        capture_pgo,
+    )
+
+    image_by_idx = {idx: tmp_path / f"{idx}.png" for idx in range(4)}
+    odom_by_idx = {
+        idx: np.asarray(_pose_at_x(float(idx)), dtype=np.float64).reshape(4, 4)
+        for idx in range(4)
+    }
+    records = score_frozen_query_candidates(
+        config=_cached_config(
+            tmp_path,
+            support_ensemble={
+                "enabled": True,
+                "support_count": 1,
+            },
+        ),
+        query_idx=3,
+        frozen_candidates=[
+            {"pair_id": "p1", "candidate_idx": 0, "rank": 1, "score": 0.9},
+        ],
+        image_by_idx=image_by_idx,
+        odom_by_idx=odom_by_idx,
+        cache_order=list(range(4)),
+        da3_runner=FakeRunner(),
+    )
+
+    assert len(records) == 1
+    record = records[0]
+    assert record["pgo_converged"] is True, record["failure_reasons"]
+    assert np.allclose(captured_pgo["loop_factor"], loop_factor)
+    assert record["loop_factor"] == loop_factor.reshape(-1).tolist()
+    json.dumps(records, allow_nan=False)
 
 
 def test_support_ensemble_disabled_records_keep_default_fields_and_metrics(

@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 from PIL import Image
 
@@ -41,6 +42,16 @@ def _write_fusionportable_raw_fixture(tmp_path, keyframe_rows=None, raw_dir=None
     gt_dir = tmp_path / "gt"
     image_dir.mkdir(parents=True)
     gt_dir.mkdir(exist_ok=True)
+    (raw_dir / "sequence_meta.json").write_text(
+        json.dumps(
+            {
+                "sequence_name": "handheld_test",
+                "trajectory_keyframes_file": "trajectory_keyframes.txt",
+                "T_camera_lidar": np.eye(4).reshape(-1).tolist(),
+            }
+        ),
+        encoding="utf-8",
+    )
 
     if keyframe_rows is None:
         keyframe_rows = [
@@ -109,6 +120,7 @@ def test_preprocess_fusionportable_sequence_writes_online_causal_cache(tmp_path)
             {
                 "sequence_name": "handheld_test",
                 "trajectory_keyframes_file": "trajectory_keyframes.txt",
+                "T_camera_lidar": np.eye(4).reshape(-1).tolist(),
             }
         ),
         encoding="utf-8",
@@ -144,7 +156,7 @@ def test_preprocess_fusionportable_sequence_writes_online_causal_cache(tmp_path)
         encoding="utf-8",
     )
 
-    config = _fusionportable_config(tmp_path, gt_root=str(gt_dir), platform="ugv")
+    config = _fusionportable_config(tmp_path, gt_root=str(gt_dir), platform="vehicle")
 
     out_dir = preprocess_fusionportable_sequence(
         raw_dir=raw_dir,
@@ -164,6 +176,175 @@ def test_preprocess_fusionportable_sequence_writes_online_causal_cache(tmp_path)
     assert (out_dir / "images" / "000005.png").exists()
 
 
+def test_preprocess_fusionportable_ugv_uses_aster_slam_trajectory_as_gt_by_default(tmp_path):
+    from robust_loop_verifier.fusionportable import preprocess_fusionportable_sequence
+    from robust_loop_verifier.io import read_json, read_jsonl
+
+    raw_dir, gt_file = _write_fusionportable_raw_fixture(tmp_path)
+    t_camera_lidar = np.array(
+        [
+            [0.0, -1.0, 0.0, 0.5],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    (raw_dir / "sequence_meta.json").write_text(
+        json.dumps(
+            {
+                "sequence_name": "ugv_test",
+                "trajectory_keyframes_file": "trajectory_keyframes.txt",
+                "T_camera_lidar": t_camera_lidar.reshape(-1).tolist(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    (raw_dir / "trajectory_keyframes.txt").write_text(
+        "0.0 0 0 0 0 0 0 1\n"
+        "1.0 1 0 0 0 0 0 1\n"
+        "2.0 2 0 0 0 0 0 1\n",
+        encoding="utf-8",
+    )
+    gt_file.write_text(
+        "0.0 100 0 0 0 0 0 1\n"
+        "1.0 101 0 0 0 0 0 1\n"
+        "2.0 102 0 0 0 0 0 1\n",
+        encoding="utf-8",
+    )
+
+    out_dir = preprocess_fusionportable_sequence(
+        raw_dir=raw_dir,
+        gt_trajectory_file=gt_file,
+        sequence_name="ugv_test",
+        config=_fusionportable_config(tmp_path, platform="ugv"),
+        max_gt_delta_sec=0.01,
+    )
+
+    keyframes = list(read_jsonl(out_dir / "keyframes.jsonl"))
+    manifest = read_json(out_dir / "manifest.json")
+    expected_extrinsic_inverse = np.linalg.inv(t_camera_lidar)
+
+    assert np.asarray(keyframes[0]["odom_pose"]).reshape(4, 4) == pytest.approx(
+        expected_extrinsic_inverse
+    )
+    assert np.asarray(keyframes[0]["gt_pose"]).reshape(4, 4) == pytest.approx(
+        expected_extrinsic_inverse
+    )
+    assert manifest["pose_frame"] == "camera"
+    assert manifest["source_trajectory_pose_frame"] == "lidar"
+    assert manifest["gt_label_source"] == "aster_slam_trajectory_keyframes"
+    assert manifest["gt_trajectory_file"] == str(raw_dir / "trajectory_keyframes.txt")
+    assert manifest["T_camera_lidar"] == pytest.approx(t_camera_lidar.reshape(-1).tolist())
+
+
+def test_preprocess_fusionportable_offroad_uses_aster_slam_trajectory_as_gt_by_default(
+    tmp_path,
+):
+    from robust_loop_verifier.fusionportable import preprocess_fusionportable_sequence
+    from robust_loop_verifier.io import read_json, read_jsonl
+
+    raw_dir, gt_file = _write_fusionportable_raw_fixture(tmp_path)
+    (raw_dir / "trajectory_keyframes.txt").write_text(
+        "0.0 0 0 0 0 0 0 1\n" "1.0 1 0 0 0 0 0 1\n" "2.0 2 0 0 0 0 0 1\n",
+        encoding="utf-8",
+    )
+    gt_file.write_text(
+        "0.0 100 0 0 0 0 0 1\n" "1.0 101 0 0 0 0 0 1\n" "2.0 102 0 0 0 0 0 1\n",
+        encoding="utf-8",
+    )
+
+    out_dir = preprocess_fusionportable_sequence(
+        raw_dir=raw_dir,
+        gt_trajectory_file=gt_file,
+        sequence_name="Offroad05_beta",
+        config=_fusionportable_config(
+            tmp_path,
+            dataset_name="GEODE",
+            platform="Offroad",
+        ),
+        max_gt_delta_sec=0.01,
+    )
+
+    keyframes = list(read_jsonl(out_dir / "keyframes.jsonl"))
+    manifest = read_json(out_dir / "manifest.json")
+
+    assert np.asarray(keyframes[2]["gt_pose"]).reshape(4, 4)[0, 3] == pytest.approx(2.0)
+    assert manifest["gt_label_source"] == "aster_slam_trajectory_keyframes"
+    assert manifest["gt_trajectory_file"] == str(raw_dir / "trajectory_keyframes.txt")
+
+
+def test_preprocess_fusionportable_projects_rounded_extrinsic_rotation_to_so3(tmp_path):
+    from robust_loop_verifier.fusionportable import preprocess_fusionportable_sequence
+    from robust_loop_verifier.io import read_json, read_jsonl
+
+    raw_dir, gt_file = _write_fusionportable_raw_fixture(tmp_path)
+    rounded_t_camera_lidar = np.array(
+        [
+            [0.0218308, 0.99976, -0.00201407, 0.122993],
+            [-0.0131205, 0.00230088, 0.999911, 0.0398643],
+            [0.999676, -0.0218025, 0.0131676, -0.0577101],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+    )
+    assert not np.allclose(
+        rounded_t_camera_lidar[:3, :3].T @ rounded_t_camera_lidar[:3, :3],
+        np.eye(3),
+        atol=1e-7,
+        rtol=0.0,
+    )
+    (raw_dir / "sequence_meta.json").write_text(
+        json.dumps(
+            {
+                "sequence_name": "ntu_test",
+                "trajectory_keyframes_file": "trajectory_keyframes.txt",
+                "T_camera_lidar": rounded_t_camera_lidar.reshape(-1).tolist(),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    out_dir = preprocess_fusionportable_sequence(
+        raw_dir=raw_dir,
+        gt_trajectory_file=gt_file,
+        sequence_name="ntu_test",
+        config=_fusionportable_config(tmp_path, platform="NTU-VIRAL"),
+        max_gt_delta_sec=0.01,
+    )
+
+    keyframes = list(read_jsonl(out_dir / "keyframes.jsonl"))
+    manifest = read_json(out_dir / "manifest.json")
+    effective_extrinsic = np.asarray(manifest["T_camera_lidar"]).reshape(4, 4)
+
+    for pose_field in ("odom_pose", "gt_pose"):
+        rotation = np.asarray(keyframes[0][pose_field]).reshape(4, 4)[:3, :3]
+        assert rotation.T @ rotation == pytest.approx(np.eye(3), abs=1e-7)
+        assert np.linalg.det(rotation) == pytest.approx(1.0, abs=1e-7)
+    assert effective_extrinsic[:3, :3].T @ effective_extrinsic[:3, :3] == pytest.approx(
+        np.eye(3),
+        abs=1e-7,
+    )
+    assert np.linalg.det(effective_extrinsic[:3, :3]) == pytest.approx(1.0, abs=1e-7)
+
+
+def test_preprocess_fusionportable_requires_camera_lidar_extrinsic(tmp_path):
+    from robust_loop_verifier.fusionportable import preprocess_fusionportable_sequence
+
+    raw_dir, gt_file = _write_fusionportable_raw_fixture(tmp_path)
+    (raw_dir / "sequence_meta.json").write_text(
+        json.dumps({"sequence_name": "handheld_test"}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="T_camera_lidar"):
+        preprocess_fusionportable_sequence(
+            raw_dir=raw_dir,
+            gt_trajectory_file=gt_file,
+            sequence_name="handheld_test",
+            config=_fusionportable_config(tmp_path),
+            max_gt_delta_sec=0.01,
+        )
+
+
 def test_preprocess_fusionportable_skips_external_gt_timestamp_gaps(tmp_path):
     from robust_loop_verifier.fusionportable import preprocess_fusionportable_sequence
     from robust_loop_verifier.io import read_json, read_jsonl
@@ -181,12 +362,10 @@ def test_preprocess_fusionportable_skips_external_gt_timestamp_gaps(tmp_path):
         ],
     )
     gt_file.write_text(
-        "1.0 1 0 0 0 0 0 1\n"
-        "2.0 2 0 0 0 0 0 1\n"
-        "3.0 3 0 0 0 0 0 1\n",
+        "1.0 1 0 0 0 0 0 1\n" "2.0 2 0 0 0 0 0 1\n" "3.0 3 0 0 0 0 0 1\n",
         encoding="utf-8",
     )
-    config = _fusionportable_config(tmp_path, platform="ugv")
+    config = _fusionportable_config(tmp_path, platform="vehicle")
 
     out_dir = preprocess_fusionportable_sequence(
         raw_dir=raw_dir,
@@ -269,15 +448,11 @@ def test_preprocess_fusionportable_ntu_viral_uses_aster_slam_trajectory_as_gt_by
 
     raw_dir, gt_file = _write_fusionportable_raw_fixture(tmp_path)
     (raw_dir / "trajectory_keyframes.txt").write_text(
-        "0.0 0 0 0 0 0 0 1\n"
-        "1.0 1 0 0 0 0 0 1\n"
-        "2.0 0.2 0 0 0 0 0 1\n",
+        "0.0 0 0 0 0 0 0 1\n" "1.0 1 0 0 0 0 0 1\n" "2.0 0.2 0 0 0 0 0 1\n",
         encoding="utf-8",
     )
     gt_file.write_text(
-        "0.0 100 0 0 0 0 0 1\n"
-        "1.0 101 0 0 0 0 0 1\n"
-        "2.0 102 0 0 0 0 0 1\n",
+        "0.0 100 0 0 0 0 0 1\n" "1.0 101 0 0 0 0 0 1\n" "2.0 102 0 0 0 0 0 1\n",
         encoding="utf-8",
     )
 
@@ -372,7 +547,7 @@ def test_preprocess_fusionportable_positive_rotation_threshold_is_configurable(t
         sequence_name="handheld_test",
         config=_fusionportable_config(
             tmp_path,
-            platform="ugv",
+            platform="vehicle",
             positive_radius_m=0.5,
             positive_max_rotation_deg=100.0,
         ),
@@ -481,9 +656,7 @@ def test_preprocess_fusionportable_sequence_uses_odom_rows_by_export_order(tmp_p
 
     raw_dir, gt_file = _write_fusionportable_raw_fixture(tmp_path)
     (raw_dir / "trajectory_keyframes.txt").write_text(
-        "0.0 0 0 0 0 0 0 1\n"
-        "1.25 10 0 0 0 0 0 1\n"
-        "2.0 2 0 0 0 0 0 1\n",
+        "0.0 0 0 0 0 0 0 1\n" "1.25 10 0 0 0 0 0 1\n" "2.0 2 0 0 0 0 0 1\n",
         encoding="utf-8",
     )
 
@@ -506,8 +679,7 @@ def test_preprocess_fusionportable_sequence_rejects_odom_keyframe_length_mismatc
 
     raw_dir, gt_file = _write_fusionportable_raw_fixture(tmp_path)
     (raw_dir / "trajectory_keyframes.txt").write_text(
-        "0.0 0 0 0 0 0 0 1\n"
-        "1.0 1 0 0 0 0 0 1\n",
+        "0.0 0 0 0 0 0 0 1\n" "1.0 1 0 0 0 0 0 1\n",
         encoding="utf-8",
     )
 
@@ -580,7 +752,9 @@ def test_preprocess_fusionportable_sequence_rejects_symlinked_output_image_dir(t
 
     raw_dir, gt_file = _write_fusionportable_raw_fixture(tmp_path)
     config = _fusionportable_config(tmp_path)
-    output_sequence_dir = config.output_root / config.dataset_name / config.platform / "handheld_test"
+    output_sequence_dir = (
+        config.output_root / config.dataset_name / config.platform / "handheld_test"
+    )
     outside_dir = tmp_path / "outside_images"
     outside_dir.mkdir()
     output_sequence_dir.mkdir(parents=True)

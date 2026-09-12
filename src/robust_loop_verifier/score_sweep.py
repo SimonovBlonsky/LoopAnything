@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import re
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -231,7 +232,37 @@ def compute_score_sweep(
     }
 
 
-def write_score_sweep_markdown(path: Path, result: Mapping[str, Any], limit: int = 40) -> None:
+def compute_named_scores(
+    records: Sequence[Mapping[str, Any]],
+    method_name: str,
+) -> list[float | None]:
+    """Compute one label-free score vector from candidate records."""
+
+    if method_name == "ROVER deformation only":
+        return [
+            _negative(_finite_float_or_none(record.get("trajectory_deformation_rmse")))
+            for record in records
+        ]
+
+    match = re.fullmatch(
+        r"query_gate_graph:def=([^,]+),res=([^,]+),margin=([^,]+)",
+        method_name,
+    )
+    if match:
+        deformation_weight, residual_weight, margin_weight = (
+            float(value) for value in match.groups()
+        )
+        return _query_gate_graph_scores(
+            records,
+            deformation_weight,
+            residual_weight,
+            margin_weight,
+        )
+
+    raise ValueError(f"unknown named score method: {method_name}")
+
+
+def write_score_sweep_markdown(path: Path, result: Mapping[str, Any], limit: int = 80) -> None:
     scores = list(result["scores"])
     ranked = sorted(scores, key=lambda row: (-row["AP"], -row["MR@100P"], row["name"]))
     lines = [
@@ -667,15 +698,52 @@ def _median(sorted_values: Sequence[float]) -> float:
 
 
 def _query_groups(records: Sequence[Mapping[str, Any]]) -> list[list[int]]:
-    groups_by_query: dict[int, list[int]] = {}
+    groups_by_query: dict[tuple[str | None, int], list[int]] = {}
     fallback_query = -1
     for index, record in enumerate(records):
         query_idx = record.get("query_idx")
         if query_idx is None:
             query_idx = fallback_query
             fallback_query -= 1
-        groups_by_query.setdefault(int(query_idx), []).append(index)
+        sequence_key = _record_sequence_key(record)
+        groups_by_query.setdefault((sequence_key, int(query_idx)), []).append(index)
     return list(groups_by_query.values())
+
+
+def _record_sequence_key(record: Mapping[str, Any]) -> str | None:
+    sequence_key = _non_empty_string(record.get("sequence_key"))
+    if sequence_key is not None:
+        return sequence_key
+    sequence_key = _sequence_key_from_fields(record)
+    if sequence_key is not None:
+        return sequence_key
+    for field_name in ("pair_metadata", "pair", "metadata"):
+        nested = record.get(field_name)
+        if isinstance(nested, Mapping):
+            sequence_key = _non_empty_string(nested.get("sequence_key"))
+            if sequence_key is not None:
+                return sequence_key
+            sequence_key = _sequence_key_from_fields(nested)
+            if sequence_key is not None:
+                return sequence_key
+    return None
+
+
+def _sequence_key_from_fields(record: Mapping[str, Any]) -> str | None:
+    values = [
+        _non_empty_string(record.get(field))
+        for field in ("dataset", "platform", "sequence")
+    ]
+    if any(value is None for value in values):
+        return None
+    return "/".join(str(value) for value in values)
+
+
+def _non_empty_string(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value)
+    return text if text else None
 
 
 def _query_signal_ranks(

@@ -1,0 +1,89 @@
+{
+  "name": "table1_hard_gate_global_shared_extreme_20260806_v4",
+  "sharing_scope": "global",
+  "selection": {
+    "tp_is_not_an_objective": true,
+    "table1_joint_win_definition": "displayed AP and MR@100P must each reach the non-Ours maximum for that sequence",
+    "sequence_win_priority": ["joint_sequence_wins", "any_sequence_wins", "optimal_metric_cells", "macro_AP_plus_macro_MR"]
+  },
+  "search": {
+    "seed": 20260806,
+    "global_samples": 200000,
+    "local_samples": 200000,
+    "local_rounds": 3,
+    "exact_finalists": 768,
+    "batch_size": 1024,
+    "log2_bounds": [-12.0, 12.0],
+    "variable_gates": [
+      "sim3_alignment_rmse",
+      "sim3_direction_error",
+      "translation_norm",
+      "trajectory_deformation",
+      "pgo_error_per_factor",
+      "odom_strain_chi2",
+      "loop_chi2"
+    ]
+  },
+  "solutions": {
+    "best_macro_ap": {
+      "macro_AP_percent": 82.5772,
+      "macro_MR@100P_percent": 36.0705,
+      "source": "metrics/hard_gate_global_shared_extreme_sweep_20260806_v3/table1_selections.json",
+      "thresholds": {
+        "salad_min_score": 0.8,
+        "support_min_baseline": 0.3,
+        "sim3_min_scale": 0.8,
+        "sim3_max_scale": 80.0,
+        "sim3_alignment_rmse": 0.35251555,
+        "sim3_direction_error": 60.0,
+        "translation_norm": 5.1245723,
+        "trajectory_deformation": 0.12069419,
+        "pgo_error_per_factor": 1.0,
+        "odom_strain_chi2": 50.0,
+        "loop_chi2": 0.0031889596
+      }
+    },
+    "best_macro_mr": {
+      "macro_AP_percent": 79.6616,
+      "macro_MR@100P_percent": 50.1866,
+      "source": "metrics/hard_gate_global_shared_extreme_sweep_20260806_v4/table1_selections.json",
+      "thresholds": {
+        "salad_min_score": 0.8,
+        "support_min_baseline": 0.3,
+        "sim3_min_scale": 0.8,
+        "sim3_max_scale": 80.0,
+        "sim3_alignment_rmse": 0.20026696,
+        "sim3_direction_error": 45.0,
+        "translation_norm": 2.1816462,
+        "trajectory_deformation": 0.047521868,
+        "pgo_error_per_factor": 0.0045934394,
+        "odom_strain_chi2": 50.0,
+        "loop_chi2": 423.76206
+      }
+    },
+    "max_joint_sequence_wins": {
+      "macro_AP_percent": 80.5220,
+      "macro_MR@100P_percent": 43.7943,
+      "joint_sequence_wins": "6/8",
+      "optimal_metric_cells": "13/16",
+      "source": "metrics/hard_gate_global_shared_extreme_sweep_20260806_v4/table1_selections.json",
+      "thresholds": {
+        "salad_min_score": 0.8,
+        "support_min_baseline": 0.3,
+        "sim3_min_scale": 0.8,
+        "sim3_max_scale": 80.0,
+        "sim3_alignment_rmse": 0.20113819,
+        "sim3_direction_error": 30.0,
+        "translation_norm": 2.3988063,
+        "trajectory_deformation": 0.10363911,
+        "pgo_error_per_factor": 1.0,
+        "odom_strain_chi2": 0.1953125,
+        "loop_chi2": 0.0073304011
+      }
+    }
+  },
+  "result_directories": [
+    "workspace/rover_aligned_benchmark/benchmark_v1_da3_auto_labels_v4_asterslam_main8_full_manual_review_20260701_013214_positive_recheck_main8_20260701_115646/metrics/hard_gate_global_shared_extreme_sweep_20260806_v3",
+    "workspace/rover_aligned_benchmark/benchmark_v1_da3_auto_labels_v4_asterslam_main8_full_manual_review_20260701_013214_positive_recheck_main8_20260701_115646/metrics/hard_gate_global_shared_extreme_sweep_20260806_v4"
+  ]
+}

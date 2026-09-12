@@ -17,8 +17,8 @@ Environment overrides:
   CONFIG, PYTHON_BIN, MAX_GT_DELTA_SEC
 
 Note:
-  handheld and legged default to AsterSLAM raw/trajectory_keyframes.txt as
-  the GT label source; external GT paths are used only for other platforms.
+  handheld, legged, and ugv default to AsterSLAM raw/trajectory_keyframes.txt
+  as the GT label source; external GT paths are used only for other platforms.
 USAGE
 }
 
@@ -71,7 +71,7 @@ RAW_DIR="${RAW_DIR:-${LOOP_DATASET_ROOT}/${PLATFORM}/${SEQUENCE_NAME}/raw}"
 DEFAULT_GT_FILE="${GT_DATA_ROOT}/${PLATFORM}/${SEQUENCE_NAME}/${SEQUENCE_NAME}.txt"
 PROCESSED_GT_FILE="${PROCESSED_GT_ROOT}/${PLATFORM}/${SEQUENCE_NAME}/${SEQUENCE_NAME}.txt"
 
-if [[ "${PLATFORM}" == "handheld" || "${PLATFORM}" == "legged" ]]; then
+if [[ "${PLATFORM}" == "handheld" || "${PLATFORM}" == "legged" || "${PLATFORM}" == "ugv" ]]; then
   GT_TRAJECTORY_FILE="${RAW_DIR}/trajectory_keyframes.txt"
 elif [[ -z "${GT_TRAJECTORY_FILE:-}" ]]; then
   if [[ "${USE_PROCESSED_GT}" != "0" && -f "${PROCESSED_GT_FILE}" ]]; then
@@ -121,7 +121,7 @@ echo "  platform: ${PLATFORM}"
 echo "  sequence_name: ${SEQUENCE_NAME}"
 echo "  raw_dir: ${RAW_DIR}"
 echo "  gt_trajectory_file: ${GT_TRAJECTORY_FILE}"
-if [[ "${PLATFORM}" == "handheld" || "${PLATFORM}" == "legged" ]]; then
+if [[ "${PLATFORM}" == "handheld" || "${PLATFORM}" == "legged" || "${PLATFORM}" == "ugv" ]]; then
   echo "  gt_label_source: aster_slam_trajectory_keyframes"
 else
   echo "  gt_label_source: external_trajectory_timestamp_association"

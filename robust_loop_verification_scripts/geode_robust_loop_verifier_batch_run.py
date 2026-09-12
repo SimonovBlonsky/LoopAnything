@@ -175,11 +175,14 @@ def _select_sequences(
                 platform=args.platform,
                 sequence_name=sequence_name,
                 raw_dir=Path(args.loop_dataset_root) / args.platform / sequence_name / "raw",
-                gt_trajectory_file=_gt_path_for_sequence(
-                    Path(args.gt_data_root),
-                    sequence_name,
+                gt_trajectory_file=(
+                    Path(args.loop_dataset_root)
+                    / args.platform
+                    / sequence_name
+                    / "raw"
+                    / "trajectory_keyframes.txt"
                 ),
-                gt_label_source="external_gt_trajectory",
+                gt_label_source="aster_slam_trajectory_keyframes",
                 cache_root=Path(args.cache_root),
                 output_base=output_base,
                 dataset_name=args.dataset_name,

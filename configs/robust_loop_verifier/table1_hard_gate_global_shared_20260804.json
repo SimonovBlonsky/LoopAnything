@@ -1,0 +1,128 @@
+{
+  "name": "table1_hard_gate_global_shared_20260804",
+  "sharing_scope": "global",
+  "score": {
+    "acceptance_threshold": -1.0,
+    "larger_is_better": true,
+    "type": "negative_max_normalized_gate_violation"
+  },
+  "benchmark": {
+    "annotations": "workspace/rover_aligned_benchmark/benchmark_v1_da3_auto_labels_v4_asterslam_main8_full_manual_review_20260701_013214_positive_recheck_main8_20260701_115646/annotations.jsonl",
+    "candidate_scores": "workspace/rover_aligned_benchmark/benchmark_v1_da3_auto_labels_v4_asterslam_main8_full_manual_review_20260701_013214_positive_recheck_main8_20260701_115646/metrics/aster_hard_gate_max_violation_20260804/candidate_scores.jsonl",
+    "positive_count": 601,
+    "record_count": 3200,
+    "sequences": [
+      "FusionPortableV2/handheld/handheld_escalator00",
+      "FusionPortableV2/handheld/handheld_room00",
+      "FusionPortableV2/ugv/ugv_campus01",
+      "FusionPortableV2/ugv/ugv_parking01",
+      "GEODE/Offroad/Offroad02_beta",
+      "GEODE/Offroad/Offroad05_beta",
+      "NTU-VIRAL/NTU-VIRAL/eee_01",
+      "NTU-VIRAL/NTU-VIRAL/nya_02"
+    ]
+  },
+  "search": {
+    "base_profiles": [
+      "handheld",
+      "ugv",
+      "geode",
+      "ntu"
+    ],
+    "coordinate_refinement_passes": 3,
+    "evaluated_parameter_sets": 27718,
+    "mr_tolerance": 0.01,
+    "primary_grid_gates": [
+      "sim3_max_scale",
+      "sim3_direction_error",
+      "trajectory_deformation",
+      "loop_chi2"
+    ],
+    "selection_rule": "retain settings within 0.01 macro MR@100P of best MR@100P, then maximize macro AP",
+    "threshold_multipliers": [
+      0.0625,
+      0.125,
+      0.25,
+      0.5,
+      1.0,
+      2.0,
+      4.0,
+      8.0,
+      16.0
+    ]
+  },
+  "solutions": {
+    "balanced": {
+      "macro_AP": 0.7825395421727711,
+      "macro_MR@100P": 0.42242744163539864,
+      "TP@100P": 215,
+      "thresholds": {
+        "salad_min_score": 0.8,
+        "support_min_baseline": 0.3,
+        "sim3_min_scale": 0.8,
+        "sim3_max_scale": 80.0,
+        "sim3_alignment_rmse": 0.4,
+        "sim3_direction_error": 20.0,
+        "translation_norm": 5.0,
+        "trajectory_deformation": 0.2,
+        "pgo_error_per_factor": 8.0,
+        "odom_strain_chi2": 800.0,
+        "loop_chi2": 1.5625
+      }
+    },
+    "best_ap": {
+      "macro_AP": 0.7825395421727711,
+      "macro_MR@100P": 0.42242744163539864,
+      "TP@100P": 215,
+      "thresholds": {
+        "salad_min_score": 0.8,
+        "support_min_baseline": 0.3,
+        "sim3_min_scale": 0.8,
+        "sim3_max_scale": 80.0,
+        "sim3_alignment_rmse": 0.4,
+        "sim3_direction_error": 20.0,
+        "translation_norm": 5.0,
+        "trajectory_deformation": 0.2,
+        "pgo_error_per_factor": 8.0,
+        "odom_strain_chi2": 800.0,
+        "loop_chi2": 1.5625
+      }
+    },
+    "best_mr": {
+      "macro_AP": 0.7810837912465302,
+      "macro_MR@100P": 0.42908527479706937,
+      "TP@100P": 220,
+      "thresholds": {
+        "salad_min_score": 0.84,
+        "support_min_baseline": 0.3,
+        "sim3_min_scale": 0.8,
+        "sim3_max_scale": 80.0,
+        "sim3_alignment_rmse": 0.1375,
+        "sim3_direction_error": 32.0,
+        "translation_norm": 5.0,
+        "trajectory_deformation": 0.22,
+        "pgo_error_per_factor": 8.0,
+        "odom_strain_chi2": 800.0,
+        "loop_chi2": 1.5625
+      }
+    },
+    "best_tp": {
+      "macro_AP": 0.7462109989590691,
+      "macro_MR@100P": 0.40655500652999726,
+      "TP@100P": 234,
+      "thresholds": {
+        "salad_min_score": 0.51,
+        "support_min_baseline": 0.15,
+        "sim3_min_scale": 0.8,
+        "sim3_max_scale": 320.0,
+        "sim3_alignment_rmse": 6.0,
+        "sim3_direction_error": 160.0,
+        "translation_norm": 5.0,
+        "trajectory_deformation": 0.32,
+        "pgo_error_per_factor": 8.0,
+        "odom_strain_chi2": 800.0,
+        "loop_chi2": 1.5625
+      }
+    }
+  }
+}

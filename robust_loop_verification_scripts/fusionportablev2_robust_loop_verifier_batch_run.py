@@ -209,8 +209,10 @@ def _select_sequences(
                     platform="ugv",
                     sequence_name=sequence_name,
                     raw_dir=loop_root / "ugv" / sequence_name / "raw",
-                    gt_trajectory_file=gt_root / "ugv" / sequence_name / f"{sequence_name}.txt",
-                    gt_label_source="external_gt_trajectory",
+                    gt_trajectory_file=(
+                        loop_root / "ugv" / sequence_name / "raw" / "trajectory_keyframes.txt"
+                    ),
+                    gt_label_source="aster_slam_trajectory_keyframes",
                     cache_root=cache_root,
                     output_base=output_base,
                     dataset_name=args.dataset_name,

@@ -4,6 +4,7 @@ __pycache__/
 
 # Distribution / packaging
 workspace/
+/workspace
 build/
 dist/
 *.egg-info/

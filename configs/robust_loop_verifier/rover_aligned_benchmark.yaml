@@ -1,0 +1,59 @@
+benchmark_version: benchmark_v1
+query_limit_per_sequence: 40
+retrieval_top_k: 10
+annotation_shuffle_seed: 20260610
+orb_slam3_root: /home/chenguyuan/code/NeurIPS26/ORB_SLAM3
+helper_build_dir: workspace/rover_aligned_benchmark/helper_build
+netvlad_root: /home/chenguyuan/code/NeurIPS26/netvlad_image_retrieval
+verifier_configs:
+  FusionPortableV2: configs/robust_loop_verifier/fusionportablev2_handheld.yaml
+  GEODE: configs/robust_loop_verifier/geode_offroad.yaml
+  NTU-VIRAL: configs/robust_loop_verifier/ntu_viral.yaml
+orb:
+  nfeatures: 1000
+  scale_factor: 1.2
+  nlevels: 8
+  ini_fast: 20
+  min_fast: 7
+vocabulary: /home/chenguyuan/code/NeurIPS26/ORB_SLAM3/Vocabulary/ORBvoc.txt
+sequences:
+  - dataset: FusionPortableV2
+    platform: handheld
+    sequence: handheld_escalator00
+    cache: /data/datasets/FusionPortable/robust_loop_verifier_cache/FusionPortableV2/handheld/handheld_escalator00
+  - dataset: FusionPortableV2
+    platform: handheld
+    sequence: handheld_room00
+    cache: /data/datasets/FusionPortable/robust_loop_verifier_cache/FusionPortableV2/handheld/handheld_room00
+  - dataset: FusionPortableV2
+    platform: handheld
+    sequence: handheld_room01
+    cache: /data/datasets/FusionPortable/robust_loop_verifier_cache/FusionPortableV2/handheld/handheld_room01
+  - dataset: FusionPortableV2
+    platform: ugv
+    sequence: ugv_campus01
+    cache: /data/datasets/FusionPortable/robust_loop_verifier_cache/FusionPortableV2/ugv/ugv_campus01
+  - dataset: FusionPortableV2
+    platform: ugv
+    sequence: ugv_parking01
+    cache: /data/datasets/FusionPortable/robust_loop_verifier_cache/FusionPortableV2/ugv/ugv_parking01
+  - dataset: GEODE
+    platform: Offroad
+    sequence: Offroad02_beta
+    cache: /data/datasets/GEODE/robust_loop_verifier_cache/GEODE/Offroad/Offroad02_beta
+  - dataset: GEODE
+    platform: Offroad
+    sequence: Offroad05_beta
+    cache: /data/datasets/GEODE/robust_loop_verifier_cache/GEODE/Offroad/Offroad05_beta
+  - dataset: NTU-VIRAL
+    platform: NTU-VIRAL
+    sequence: eee_01
+    cache: /data/datasets/NTU-VIRAL/robust_loop_verifier_cache/NTU-VIRAL/NTU-VIRAL/eee_01
+  - dataset: NTU-VIRAL
+    platform: NTU-VIRAL
+    sequence: eee_02
+    cache: /data/datasets/NTU-VIRAL/robust_loop_verifier_cache/NTU-VIRAL/NTU-VIRAL/eee_02
+  - dataset: NTU-VIRAL
+    platform: NTU-VIRAL
+    sequence: nya_02
+    cache: /data/datasets/NTU-VIRAL/robust_loop_verifier_cache/NTU-VIRAL/NTU-VIRAL/nya_02
